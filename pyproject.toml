@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qaoa-study"
+version = "0.1.0"
+description = "Numerical core for the NCSA SPIN shallow MaxCut QAOA study"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "PennyLane==0.43.0",
+    "PennyLane-Lightning==0.43.0",
+    # 2.15.3 dropped gast/astunparse, still imported by PennyLane 0.43.0.
+    "diastatic-malt==2.15.2",
+    "numpy==2.2.6",
+    "scipy==1.16.3",
+    "networkx==3.5",
+    "pyarrow==21.0.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.2"]
+
+[tool.setuptools.packages.find]
+include = ["qaoa_study*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+junit_family = "xunit1"

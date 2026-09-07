@@ -1,0 +1,30 @@
+{
+  "purpose": "development_validation_only",
+  "dataset_namespace": "development-stage3-20260907",
+  "seed": 20260908,
+  "split_seed": 20260909,
+  "sizes": [12, 16, 20, 24],
+  "families": ["regular", "er", "ba", "sbm"],
+  "degree_bands": [3, 5],
+  "quota_per_cell": 1,
+  "max_attempts_per_cell": 40,
+  "tier2_count": 20,
+  "training_count": 12,
+  "exact_sizes": [12, 16],
+  "exact_chunk_size": 65536,
+  "formal_targets_not_executed": {
+    "tier1_approximately": 1500,
+    "quota_per_size_per_family_band": {"12": 45, "16": 46, "20": 48, "24": 49},
+    "quota_total": 1504,
+    "max_attempts_per_cell_candidate": 5000,
+    "tier2": 500,
+    "training": 300,
+    "evaluation": 200
+  },
+  "integration": {
+    "seed": 20260910,
+    "sizes_and_graph_counts": {"12": 4, "16": 1},
+    "depths": [1, 2],
+    "optimizer": {"max_evaluations": 12, "maxiter": 8, "maxls": 20, "ftol": 1e-10, "gtol": 1e-7}
+  }
+}

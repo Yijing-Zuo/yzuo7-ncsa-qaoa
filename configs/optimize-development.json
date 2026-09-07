@@ -1,0 +1,13 @@
+{
+  "purpose": "development_validation",
+  "optimizer": {
+    "max_evaluations": 48,
+    "maxiter": 30,
+    "maxls": 20,
+    "ftol": 1e-10,
+    "gtol": 1e-7
+  },
+  "bounds": null,
+  "seed": 20260907,
+  "production_settings_frozen": false
+}
