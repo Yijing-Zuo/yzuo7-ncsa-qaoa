@@ -14,19 +14,25 @@ from pennylane import numpy as pnp
 from qaoa_study.graphs import validate_graph
 
 
-def make_qaoa(graph: nx.Graph, p: int) -> qml.QNode:
+def make_qaoa(graph: nx.Graph, p: int, *, backend: str = "default.qubit") -> qml.QNode:
     """Build the study's p=1 or p=2 exact-expectation QNode once for a graph.
 
     Node insertion order determines the internal wires; graph labels may be any
     hashable objects. The edge list is captured at construction, so later graph
-    mutations do not change this circuit. Evaluations use default.qubit's
+    mutations do not change this circuit. Both supported backends use a
     complex128 state, float64 angles, Autograd and adjoint first derivatives.
-    PennyLane's single-term transform keeps one tape and scalar result while
-    avoiding a full 2**n by 2**n observable matrix during adjoint differentiation.
+    ``lightning.gpu`` requires a separately prepared GPU environment; device
+    construction errors propagate and never select a different backend.
+    The single-term transform keeps one tape and scalar result. Device VJP
+    contracts its cotangents before the adjoint sweep, so default.qubit keeps
+    one weighted bra rather than one state per edge. No dense global observable
+    or full measurement Jacobian is needed for this scalar first derivative.
     """
     validate_graph(graph)
     if p not in (1, 2):
         raise ValueError("This study implements p=1 and p=2 only.")
+    if backend not in ("default.qubit", "lightning.gpu"):
+        raise ValueError("backend must be default.qubit or lightning.gpu.")
     nodes = tuple(graph.nodes)
     if not nodes:
         raise ValueError("A QAOA circuit requires at least one node.")
@@ -35,9 +41,10 @@ def make_qaoa(graph: nx.Graph, p: int) -> qml.QNode:
     coefficients = [len(edges) / 2] + [-0.5] * len(edges)
     observables = [qml.Identity(0)] + [qml.Z(u) @ qml.Z(v) for u, v in edges]
     cut_operator = qml.Hamiltonian(coefficients, observables)
-    device = qml.device("default.qubit", wires=len(nodes), shots=None)
+    options = {"c_dtype": np.complex128} if backend == "lightning.gpu" else {}
+    device = qml.device(backend, wires=len(nodes), shots=None, **options)
 
-    @qml.qnode(device, interface="autograd", diff_method="adjoint")
+    @qml.qnode(device, interface="autograd", diff_method="adjoint", device_vjp=True)
     def circuit(theta):
         if qml.math.shape(theta) != (2 * p,):
             raise ValueError(f"Expected {2 * p} angles in [gamma..., beta...] order.")
@@ -87,7 +94,7 @@ def qaoa_loss_and_gradient(theta, circuit: qml.QNode) -> tuple[float, np.ndarray
     return float(loss), np.asarray(gradient, dtype=np.float64)
 
 
-def p1_edge_expectations(graph: nx.Graph, gamma: float, beta: float) -> dict:
+def _p1_edge_values(graph: nx.Graph, gamma, beta) -> dict:
     """Evaluate Wang et al., arXiv:1706.02998v2 Eq. (14), for every edge.
 
     a and b exclude the opposite endpoint; t counts common neighbors. The
@@ -105,7 +112,7 @@ def p1_edge_expectations(graph: nx.Graph, gamma: float, beta: float) -> dict:
     for u, v in graph.edges:
         a, b = len(neighbors[u]) - 1, len(neighbors[v]) - 1
         t = len(neighbors[u] & neighbors[v])
-        values[u, v] = float(
+        values[u, v] = (
             0.5
             + linear * (cos_gamma**a + cos_gamma**b)
             - triangle_factor
@@ -115,6 +122,25 @@ def p1_edge_expectations(graph: nx.Graph, gamma: float, beta: float) -> dict:
     return values
 
 
+def p1_edge_expectations(graph: nx.Graph, gamma: float, beta: float) -> dict:
+    """Return scalar Wang 1706.02998v2 Eq. (14) expectations for every edge."""
+    return {edge: float(value) for edge, value in _p1_edge_values(graph, gamma, beta).items()}
+
+
 def p1_expectation(graph: nx.Graph, gamma: float, beta: float) -> float:
     """Sum the corrected analytic p=1 expectations over all graph edges."""
     return float(sum(p1_edge_expectations(graph, gamma, beta).values()))
+
+
+def p1_expectation_grid(graph: nx.Graph, gamma, beta) -> np.ndarray:
+    """Evaluate the same edge formula on NumPy-broadcastable angle arrays.
+
+    For a rectangular grid pass ``gamma[:, None]`` and ``beta[None, :]``.
+    Callers choose chunk sizes; no QNode or state vector is constructed.
+    """
+    gamma, beta = np.broadcast_arrays(np.asarray(gamma, dtype=np.float64),
+                                      np.asarray(beta, dtype=np.float64))
+    result = np.zeros(gamma.shape, dtype=np.float64)
+    for value in _p1_edge_values(graph, gamma, beta).values():
+        result += value
+    return result

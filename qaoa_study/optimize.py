@@ -37,6 +37,26 @@ def random_angles(p: int, seed: int) -> np.ndarray:
     return np.concatenate((rng.uniform(0, 2 * np.pi, p), rng.uniform(0, np.pi, p)))
 
 
+def failure_record(theta0, settings: OptimizerSettings, error: Exception, *,
+                   p=None, stop_reason="program_error") -> dict:
+    """Represent a failure before objective entry, with no invented computation.
+
+    This has the same completion/endpoint/trace fields as an optimizer attempt.
+    Task identity, attempt identity and batch provenance belong to the caller.
+    """
+    return {
+        "record_version": 3, "run_completed": True, "p": p,
+        "theta0": [float(value) if np.isfinite(value) else None for value in theta0],
+        "settings": asdict(settings), "theta_final": None, "C_final": None,
+        "final_call_id": None, "best_seen": None, "best_theta": None,
+        "best_call_id": None, "trace": [],
+        "counts": {name: 0 for name in ("objective_calls", "gradient_requests",
+                                        "device_executions", "device_derivatives", "device_vjps", "iterations")},
+        "elapsed_seconds": 0.0, "stop_reason": stop_reason, "optimizer": None,
+        "error": f"{type(error).__name__}: {error}",
+    }
+
+
 class _RunStopped(Exception):
     def __init__(self, reason, detail=None):
         self.reason, self.detail = reason, detail
@@ -55,7 +75,7 @@ def _run_lbfgsb(objective, theta0, settings: OptimizerSettings, device=None) -> 
     trace = []
     accepted = None
     counts = {name: 0 for name in ("objective_calls", "gradient_requests",
-                                  "device_executions", "device_derivatives", "iterations")}
+                                  "device_executions", "device_derivatives", "device_vjps", "iterations")}
 
     def evaluate(theta):
         nonlocal accepted
@@ -93,6 +113,7 @@ def _run_lbfgsb(objective, theta0, settings: OptimizerSettings, device=None) -> 
             row["device_work"] = {} if tracker is None else dict(tracker.totals)
             counts["device_executions"] += int(row["device_work"].get("executions", 0))
             counts["device_derivatives"] += int(row["device_work"].get("derivatives", 0))
+            counts["device_vjps"] += int(row["device_work"].get("vjps", 0))
             row["elapsed_seconds"] = perf_counter() - started
             row["error"] = failure.detail if failure else None
             trace.append(row)
@@ -138,7 +159,7 @@ def _run_lbfgsb(objective, theta0, settings: OptimizerSettings, device=None) -> 
     finite_rows = [row for row in trace if row["C"] is not None]
     best = max(finite_rows, key=lambda row: row["C"], default=None)
     return {
-        "record_version": 2, "run_completed": True,
+        "record_version": 3, "run_completed": True,
         "theta0": theta0.tolist(), "settings": asdict(settings),
         "theta_final": accepted["theta"] if accepted else None,
         "C_final": accepted["C"] if accepted else None,
@@ -151,22 +172,31 @@ def _run_lbfgsb(objective, theta0, settings: OptimizerSettings, device=None) -> 
     }
 
 
-def optimize_qaoa(graph, p: int, theta0, settings: OptimizerSettings) -> dict:
+def optimize_qaoa(graph, p: int, theta0, settings: OptimizerSettings, *,
+                  circuit=None, backend: str = "default.qubit") -> dict:
     """Run the single study objective, with no reference value or early hit stop.
 
     C_final is the last accepted valid point, including when a later trial fails.
     best_seen may belong to an unaccepted trial. A failed run remains failed even
     if it retains a valid preceding endpoint. Reruns start again at theta0.
+    A worker may supply a QNode already built for this graph and depth; the
+    caller owns that correspondence. Its device is used without reconstruction,
+    while each call creates fresh optimizer state, counters and trace.
     """
     if np.shape(theta0) != (2 * p,):
         raise ValueError(f"Expected {2 * p} angles in [gamma..., beta...] order.")
-    circuit = make_qaoa(graph, p)
-    result = _run_lbfgsb(lambda theta: qaoa_loss_and_gradient(theta, circuit),
-                        theta0, settings, device=circuit.device)
+    try:
+        if circuit is None:
+            circuit = make_qaoa(graph, p, backend=backend)
+    except Exception as error:
+        result = failure_record(theta0, settings, error, p=p, stop_reason="evaluation_error")
+    else:
+        result = _run_lbfgsb(lambda theta: qaoa_loss_and_gradient(theta, circuit),
+                            theta0, settings, device=circuit.device)
     # Preserve the input graph without assuming its labels are JSON scalars.
     nodes = list(graph)
     indices = {v: i for i, v in enumerate(nodes)}
     result.update(p=p, n=len(nodes), edges=[[indices[u], indices[v]] for u, v in graph.edges],
                   angle_order="gamma_then_beta_radians", optimizer_method="L-BFGS-B",
-                  method=None, bounds=None)
+                  method=None, bounds=None, backend=circuit.device.name if circuit is not None else backend)
     return result

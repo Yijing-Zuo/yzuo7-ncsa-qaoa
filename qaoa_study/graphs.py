@@ -128,47 +128,100 @@ def _draw_graph(n, family, target_degree, seed):
     return graph, parameters
 
 
-def _allocate_counts(capacities, total):
-    """Proportional largest remainder; ties follow stable cell insertion order."""
+SPLIT_VERSION = "seeded-largest-remainder-v2"
+
+
+def _allocate_counts(capacities, total, tie_rng):
+    """Proportional largest remainder, breaking equal remainders by seed.
+
+    Sorting keys before the independent random ranking removes any dependency
+    on dictionary insertion order. The ranking never uses graph/QAOA outcomes.
+    """
     size = sum(capacities.values())
     if size == 0:
         return dict.fromkeys(capacities, 0)
     total = min(total, size)
     counts = {key: total * count // size for key, count in capacities.items()}
-    ranking = sorted(capacities, key=lambda key: -(total * capacities[key] % size))
+    keys = sorted(capacities)
+    random_rank = dict(zip(keys, tie_rng.permutation(len(keys)), strict=True))
+    ranking = sorted(keys, key=lambda key: (-(total * capacities[key] % size), random_rank[key]))
     for key in ranking[:total - sum(counts.values())]:
         counts[key] += 1
     return counts
 
 
-def _stratified_sample(records, total, rng):
+def _stratified_sample(records, total, member_rng, tie_rng):
     groups = defaultdict(list)
     for record in records:
         groups[record["representative_cell"]].append(record)
-    allocation = _allocate_counts({key: len(group) for key, group in groups.items()}, total)
+    allocation = _allocate_counts({key: len(group) for key, group in groups.items()}, total, tie_rng)
     selected = []
-    for key, group in groups.items():
-        order = rng.permutation(len(group))
+    for key in sorted(groups):
+        group = sorted(groups[key], key=lambda record: record["iso_class_id"])
+        order = member_rng.permutation(len(group))
         selected.extend(group[int(i)] for i in order[:allocation[key]])
     return selected, allocation
 
 
-def assign_splits(records, *, tier2_count, training_count, split_seed):
+def graph_split_coverage(records, cells=None):
+    """Count graph-split coverage by the fixed representative's ownership.
+
+    Multi-family provenance remains in each graph record; counting every source
+    as a separate graph would inflate coverage. Missing training or evaluation
+    cells (including cells absent from sampling) make this a smoke test, not a
+    balanced random generalization study. Coverage alone is not a power claim.
+    """
+    metadata = {cell["cell_id"]: {"n": cell["n"], "family": cell["family"],
+                                  "degree_band": cell["target_degree"]} for cell in cells or []}
+    for record in records:
+        source = record.get("provenance", [{}])[0]
+        metadata.setdefault(record["representative_cell"], {
+            "n": record.get("n", source.get("n", "unknown")),
+            "family": source.get("family", "unknown"),
+            "degree_band": source.get("target_degree", "unknown"),
+        })
+    tables = {}
+    for name, dimension in (("by_n", "n"), ("by_family", "family"),
+                            ("by_degree_band", "degree_band"), ("by_cell", "cell_id")):
+        counts = {}
+        for cell_id, dimensions in metadata.items():
+            key = cell_id if dimension == "cell_id" else dimensions[dimension]
+            columns = dimensions if dimension == "cell_id" else {}
+            counts.setdefault(key, {**columns, dimension: key, "training": 0, "evaluation": 0,
+                                    "not_applicable": 0, "tier2": 0, "total": 0})
+        for record in records:
+            cell_id = record["representative_cell"]
+            key = cell_id if dimension == "cell_id" else metadata[cell_id][dimension]
+            row = counts[key]
+            row[record["graph_split"]] += 1
+            row["tier2"] += int(record["tier"] == 2)
+            row["total"] += 1
+        tables[name] = [counts[key] for key in sorted(counts, key=str)]
+    incomplete = [row["cell_id"] for row in tables["by_cell"]
+                  if row["training"] == 0 or row["evaluation"] == 0]
+    return {**tables, "smoke_test": bool(incomplete) or not metadata,
+            "coverage_status": "smoke_test_missing_split_cells" if incomplete or not metadata
+                               else "all_cells_represented_no_power_claim",
+            "missing_training_or_evaluation_cells": incomplete,
+            "ownership": "first_representative_cell"}
+
+
+def assign_splits(records, *, tier2_count, training_count, split_seed, cells=None):
     """Fix graph subsets after deduplication; no QAOA result enters selection.
 
     Tier2 and training counts are allocated proportionally by representative
-    cell with largest remainder, ties in generation order. Independent RNG
-    streams permute members within each cell. A Tier2 shortfall retains the
+    cell with largest remainder and independently seeded random tie rankings.
+    Separate RNG streams permute members within each cell. A Tier2 shortfall retains the
     requested train/evaluation ratio, rounding a tied remainder to training.
     """
     if not 0 <= training_count <= tier2_count:
         raise ValueError("Require 0 <= training_count <= tier2_count.")
     for record in records:
         record.update(tier=1, graph_split="not_applicable")
-    tier2_seed, training_seed = np.random.SeedSequence(split_seed).spawn(2)
-    tier2, tier2_allocation = _stratified_sample(records, tier2_count, np.random.default_rng(tier2_seed))
+    streams = [np.random.default_rng(seed) for seed in np.random.SeedSequence(split_seed).spawn(4)]
+    tier2, tier2_allocation = _stratified_sample(records, tier2_count, streams[0], streams[1])
     actual_training = (2 * len(tier2) * training_count + tier2_count) // (2 * tier2_count) if tier2_count else 0
-    training, training_allocation = _stratified_sample(tier2, actual_training, np.random.default_rng(training_seed))
+    training, training_allocation = _stratified_sample(tier2, actual_training, streams[2], streams[3])
     for record in tier2:
         record.update(tier=2, graph_split="evaluation")
     for record in training:
@@ -182,13 +235,39 @@ def assign_splits(records, *, tier2_count, training_count, split_seed):
         "shortfall": {key: requested[key] - actual[key] for key in requested},
         "provisional": len(tier2) < tier2_count,
         "tier2_allocation": tier2_allocation, "training_allocation": training_allocation,
+        "split_version": SPLIT_VERSION, "split_seed": split_seed,
+        "coverage": graph_split_coverage(records, cells),
         "algorithm": "capacity-proportional largest remainder by representative cell; "
-                     "ties follow generation order; SeedSequence(split_seed).spawn(2) separates "
-                     "Tier2 and training permutations; shortfall scales train/evaluation ratio "
+                     "SeedSequence(split_seed).spawn(4) separates Tier2 member, Tier2 tie, "
+                     "training member and training tie streams; sorted cell/identity order; "
+                     "shortfall scales train/evaluation ratio "
                      "with a tied remainder assigned to training",
         "lofo_rule": "Exclude every multi-family class from LOFO training and evaluation; "
                      "retain it for the global random graph split.",
     }
+
+
+def resplit_library(library, *, split_seed, tier2_count=None, training_count=None):
+    """Create a new split revision without regenerating/relabeling any graph.
+
+    The caller saves to a new directory. Original topology, iso IDs, features,
+    exact witnesses, provenance and draw logs are copied byte-for-value.
+    """
+    revised = deepcopy(library)
+    config = revised["config"]
+    config.update(split_seed=split_seed,
+                  tier2_count=config["tier2_count"] if tier2_count is None else tier2_count,
+                  training_count=config["training_count"] if training_count is None else training_count)
+    summary = assign_splits(revised["graphs"], tier2_count=config["tier2_count"],
+                            training_count=config["training_count"], split_seed=split_seed,
+                            cells=revised.get("cells"))
+    revised.update(parent_library_id=library["library_id"], split_summary=summary,
+                   split_revision=library.get("split_revision", 0) + 1)
+    identity = {"parent_library_id": library["library_id"], "split_summary": summary,
+                "splits": [(row["iso_class_id"], row["tier"], row["graph_split"])
+                           for row in revised["graphs"]]}
+    revised["library_id"] = f"{config['dataset_namespace']}:{_hash(identity)}"
+    return revised
 
 
 def generate_library(config: dict) -> dict:
@@ -258,7 +337,8 @@ def generate_library(config: dict) -> dict:
                              status="satisfied" if stats["accepted"] == quota else "shortfall_unknown_population")
                 cells.append(stats)
     split_summary = assign_splits(records, tier2_count=config["tier2_count"],
-                                  training_count=config["training_count"], split_seed=config["split_seed"])
+                                  training_count=config["training_count"], split_seed=config["split_seed"],
+                                  cells=cells)
     identity = {"config": config, "graphs": records, "attempts": attempts,
                 "wl_settings": WL_SETTINGS, "split_summary": split_summary}
     return {"graphs": records, "attempts": attempts, "cells": cells, "config": config,

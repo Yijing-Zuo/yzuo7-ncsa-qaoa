@@ -7,6 +7,16 @@ import copy
 import hashlib
 from importlib.metadata import version
 import platform
+import os
+import tempfile
+
+
+EXECUTION_FAILURES = frozenset(("numerical_error", "evaluation_error", "optimizer_failed", "program_error"))
+
+
+def execution_failed(result: dict) -> bool:
+    """Separate execution faults from valid budget/iteration/line-search stops."""
+    return result["stop_reason"] in EXECUTION_FAILURES
 
 
 def evaluate_trace(result: dict, C_ref: float, epsilon: float = 0.5) -> dict:
@@ -22,41 +32,79 @@ def evaluate_trace(result: dict, C_ref: float, epsilon: float = 0.5) -> dict:
     first_hit = next((row["call_id"] for row in result["trace"]
                       if row["C"] is not None and math.isfinite(row["C"]) and row["C"] >= threshold), None)
     final = result["C_final"]
-    invalid_run = result["stop_reason"] in ("numerical_error", "evaluation_error", "optimizer_failed")
+    invalid_run = execution_failed(result)
     return {"C_ref": C_ref, "epsilon": epsilon, "first_hit": first_hit,
             "hit": first_hit is not None,
             "terminal_success": bool(not invalid_run and final is not None and
                                      math.isfinite(final) and final >= threshold),
-            "reference_exceeded": any(row["C"] is not None and row["C"] > C_ref for row in result["trace"])}
+            "reference_exceeded": any(row["C"] is not None and math.isfinite(row["C"]) and
+                                      row["C"] > C_ref for row in result["trace"])}
 
 
 def save_run(path, result: dict) -> None:
-    """Atomically save one completed attempt; no optimizer-state checkpointing."""
+    """Publish a completed, checksummed attempt without replacing any record.
+
+    Retrying requires a new attempt ID/path. Concurrent writers may race, but
+    exactly one can publish the destination; all others get FileExistsError.
+    """
     if not result.get("run_completed"):
         raise ValueError("Only a completed attempt can be saved as a run record.")
-    write_json(path, result)
+    checksum = hashlib.sha256(_canonical_json(result)).hexdigest()
+    write_once_json(path, {**result, "_run_file_version": 1,
+                          "_integrity": {"algorithm": "sha256", "value": checksum}})
 
 
-def read_run(path) -> dict:
+def read_run(path, *, require_integrity=False, input_hashes=None) -> dict:
     """Read a completed attempt; interrupted work must restart as a new attempt."""
-    result = read_json(path)
+    stored = read_json(path, input_hashes=input_hashes)
+    if require_integrity and "_integrity" not in stored:
+        raise ValueError("Batch resume requires checksummed new attempts, not legacy records.")
+    if "_run_file_version" in stored or "_integrity" in stored:
+        if stored.get("_run_file_version") != 1 or stored.get("_integrity", {}).get("algorithm") != "sha256":
+            raise ValueError("Unsupported or incomplete run envelope.")
+        result = {key: value for key, value in stored.items() if key not in ("_run_file_version", "_integrity")}
+        if hashlib.sha256(_canonical_json(result)).hexdigest() != stored["_integrity"].get("value"):
+            raise ValueError("Run record checksum mismatch.")
+    else:
+        # Historical records remain readable; their original bytes are preserved.
+        result = stored
     if not result.get("run_completed"):
         raise ValueError("Incomplete run record.")
     return result
 
 
-def write_json(path, value) -> None:
-    """Replace a small JSON file after its complete contents have been written."""
+def _canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def write_once_json(path, value) -> None:
+    """Publish immutable JSON atomically; fail if the destination already exists."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8", newline="\n")
-    temporary.replace(path)
+    contents = json.dumps(value, indent=2, allow_nan=False) + "\n"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Atomic create-if-absent on the same filesystem. No replace fallback:
+        # filesystems without hard links must report their unsupported operation.
+        os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
-def read_json(path):
+def read_json(path, *, input_hashes=None):
     """Load a small UTF-8 JSON configuration or record."""
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    path = Path(path)
+    content = path.read_bytes()
+    if input_hashes is not None:
+        input_hashes[path.name] = hashlib.sha256(content).hexdigest()
+    return json.loads(content.decode("utf-8"))
 
 
 def annotate_library(library, exact_sizes=(12, 16), chunk_size=65_536):
@@ -129,8 +177,8 @@ def save_library(directory, library):
     table = pa.Table.from_pylist(rows)
     table = table.replace_schema_metadata({b"qaoa_study_graph_schema": b"1"})
     pq.write_table(table, directory / "graphs.parquet", compression="zstd")
-    write_json(directory / "config.json", library["config"])
-    write_json(directory / "splits.json", splits)
+    write_once_json(directory / "config.json", library["config"])
+    write_once_json(directory / "splits.json", splits)
     with (directory / "generation.jsonl").open("w", encoding="utf-8", newline="\n") as stream:
         for attempt in library["attempts"]:
             stream.write(json.dumps(attempt, sort_keys=True, allow_nan=False) + "\n")
@@ -144,7 +192,7 @@ def save_library(directory, library):
         "source_sha256": {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                           for name in ("graphs.py", "exact.py", "features.py", "records.py")},
     }
-    write_json(directory / "manifest.json", manifest)
+    write_once_json(directory / "manifest.json", manifest)
 
 
 def read_library(directory):
@@ -174,7 +222,12 @@ def read_library(directory):
 
 
 def check_library(library):
-    """Audit restored topology, stored cut witnesses, features and graph splits."""
+    """Audit topology, stored cut witnesses, features and split consistency.
+
+    A witness proves its reported cut value, not optimality of C_star. This
+    read-only audit never solves MaxCut; independent solver tests validate the
+    exact enumerator separately.
+    """
     import networkx as nx
     from .exact import cut_value
     from .features import graph_features

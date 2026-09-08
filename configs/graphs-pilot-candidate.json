@@ -1,0 +1,31 @@
+{
+  "purpose": "pilot_candidate_not_executed",
+  "dataset_namespace": "plan-a-pilot-candidate-v1",
+  "seed": 20270011,
+  "split_seed": 20270012,
+  "sizes": [
+    12,
+    16
+  ],
+  "families": [
+    "regular",
+    "er"
+  ],
+  "degree_bands": [
+    3,
+    5
+  ],
+  "quota_per_cell": {
+    "12": 12,
+    "16": 13
+  },
+  "max_attempts_per_cell": 5000,
+  "tier2_count": 40,
+  "training_count": 24,
+  "exact_sizes": [
+    12,
+    16
+  ],
+  "exact_chunk_size": 65536,
+  "quota_origin": "Proposal100graphgate:2families x2sizes x2bands; n12 has4x12=48, n16 has4x13=52."
+}

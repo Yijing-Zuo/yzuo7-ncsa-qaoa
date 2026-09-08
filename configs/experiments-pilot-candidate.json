@@ -1,0 +1,81 @@
+{
+  "protocol_version": "plan-a-stage45-pilot-candidate-v1",
+  "purpose": "pilot_candidate_not_executed",
+  "production_frozen": false,
+  "seed_namespace": "plan-a-independent-pools-v1",
+  "seed": 20270013,
+  "depths": [
+    1,
+    2
+  ],
+  "epsilon": 0.5,
+  "tier1_restarts": 5,
+  "reference": {
+    "p2_candidate": "best_seen_valid_execution",
+    "p2_restarts": 100,
+    "p1_grid": {
+      "gamma_points": 256,
+      "beta_points": 128,
+      "refinement_factor": 2,
+      "chunk_size": 4096,
+      "refinement_tolerance": 0.05
+    }
+  },
+  "evaluation_restarts": 50,
+  "gradient_samples": 128,
+  "max_attempts": 2,
+  "optimizer": {
+    "1": {
+      "max_evaluations": 100,
+      "maxiter": 80,
+      "maxls": 20,
+      "ftol": 1e-10,
+      "gtol": 1e-07
+    },
+    "2": {
+      "max_evaluations": 200,
+      "maxiter": 150,
+      "maxls": 20,
+      "ftol": 1e-10,
+      "gtol": 1e-07
+    }
+  },
+  "expected_library": {
+    "graphs": 100,
+    "tier2": 40,
+    "training": 24,
+    "evaluation": 16
+  },
+  "require_full_design": false,
+  "analysis": {
+    "epsilon": 0.5,
+    "evaluation_restarts": 50,
+    "cluster_threshold": 0.05,
+    "cluster_sensitivity": [
+      0.025,
+      0.1
+    ],
+    "energy_bins": 20
+  },
+  "choices": {
+    "evaluation": "50 per graph per depth is the adopted clarification of proposal 50 restarts.",
+    "budgets_grid_gradients": "Executable candidates; manual pilot must confirm costs and settings.",
+    "retry": "At most2 completed execution-fault attempts per logicaltask; never retry normal misses/nonconvergence.",
+    "gradient_scope": "128 independently seeded uniform periodic points for eachTier2graph,depth; separate tasks/cost."
+  },
+  "design": {
+    "sizes": [
+      12,
+      16
+    ],
+    "families": [
+      "regular",
+      "er"
+    ],
+    "degree_bands": [
+      3,
+      5
+    ]
+  },
+  "require_split_coverage": true
+}

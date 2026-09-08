@@ -1,0 +1,39 @@
+{
+  "purpose": "production_candidate_not_pilot_frozen",
+  "dataset_namespace": "plan-a-production-candidate-v1",
+  "seed": 20270001,
+  "split_seed": 20270002,
+  "sizes": [
+    12,
+    16,
+    20,
+    24
+  ],
+  "families": [
+    "regular",
+    "er",
+    "ba",
+    "sbm"
+  ],
+  "degree_bands": [
+    3,
+    5
+  ],
+  "quota_per_cell": {
+    "12": 45,
+    "16": 46,
+    "20": 48,
+    "24": 49
+  },
+  "max_attempts_per_cell": 5000,
+  "tier2_count": 500,
+  "training_count": 300,
+  "exact_sizes": [
+    12,
+    16,
+    20,
+    24
+  ],
+  "exact_chunk_size": 65536,
+  "quota_origin": "Protocol candidate 45/46/48/49 per family/band at n12/16/20/24: 1504, implementing proposal approximately1500."
+}
