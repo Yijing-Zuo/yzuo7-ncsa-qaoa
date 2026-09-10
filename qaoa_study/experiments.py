@@ -6,6 +6,7 @@ optimizer checkpoint is implemented here.
 """
 
 from collections import Counter, defaultdict
+from contextlib import contextmanager, nullcontext
 import csv
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, distributions, version
@@ -25,12 +26,14 @@ import pennylane as qml
 from .graphs import SPLIT_VERSION, graph_from_record, graph_split_coverage
 from .optimize import OptimizerSettings, failure_record, optimize_qaoa, random_angles
 from .qaoa import make_qaoa, p1_expectation_grid, qaoa_loss_and_gradient
-from .records import execution_failed, read_json, read_library, read_run, save_run, write_once_json
+from .records import (execution_failed, read_json, read_library, read_run, save_run, write_once_json,
+                      read_record_bundle, record_temporary, seal_record_bundle)
 
 
 TASK_VERSION = "plan-a-tasks-v1"
 ATTEMPT_RULE = "first nonfault attempt ordered by attempt_number,started_utc,attempt_id; else first fault"
 ENTRY_FILES = ("build_library.py", "experiment.py", "verify_backend.py", "snapshot.py")
+PARTITIONED_LAYOUT = "graph-role-v1"
 
 
 def digest(value):
@@ -389,25 +392,43 @@ def _attempt_metadata(attempt):
     return {key: value for key, value in attempt.items() if key not in ("trace", "gradient_samples", "invalid_result")}
 
 
-def load_attempts(manifest, tasks, directory, *, metadata_only=False, paths=None, audit=None, execution=None):
-    """Validate every completed record; corruption is an error, not a missing run."""
-    directory = Path(directory)
-    if not directory.exists():
-        return [], None
-    input_hashes = audit.setdefault("file_hashes", {}) if audit is not None else None
-    if execution is None:
-        execution = read_json(directory / "manifest.json", input_hashes=input_hashes)
+def _validate_execution(manifest, execution):
     if execution["batch_id"] != manifest["batch_id"] or digest({k: v for k, v in execution.items()
             if k != "execution_id"}) != execution["execution_id"]:
         raise ValueError("Execution manifest identity mismatch.")
     if (execution["source"]["source_id"] != manifest["source_id"] or execution["config"] != manifest["config"]
             or digest(execution["source"]["files"]) != manifest["source_id"]):
         raise ValueError("Execution source/configuration does not match the frozen batch.")
+
+
+def _record_directory(directory):
+    """Support hashed record paths beyond Windows MAX_PATH; keep POSIX paths unchanged."""
+    path = os.path.abspath(directory) if os.name == "nt" else str(directory)
+    if os.name == "nt" and not path.startswith("\\\\?\\"):
+        path = "\\\\?\\UNC\\" + path[2:] if path.startswith("\\\\") else "\\\\?\\" + path
+    return Path(path)
+
+
+def _load_flat_attempts(manifest, tasks, directory, *, metadata_only=False, paths=None, audit=None,
+                        execution=None, contents=None):
+    """Validate every completed record; corruption is an error, not a missing run."""
+    directory = _record_directory(directory)
+    if contents is None and not directory.exists():
+        return [], None
+    input_hashes = audit.setdefault("file_hashes", {}) if audit is not None else None
+    if execution is None:
+        execution = read_json(directory / "manifest.json", input_hashes=input_hashes,
+                              contents=contents.get("manifest.json") if contents is not None else None)
+    _validate_execution(manifest, execution)
     lookup = {task["task_id"]: task for task in tasks}
-    paths = sorted(directory.glob("*.json")) if paths is None else sorted(paths)
+    if contents is not None:
+        paths = [directory / name for name in sorted(contents) if name.endswith(".json")]
+    else:
+        paths = sorted(directory.glob("*.json")) if paths is None else sorted(paths)
     receipts = {}
     for path in (path for path in paths if path.name.endswith(".started.json")):
-        receipt = read_json(path, input_hashes=input_hashes)
+        receipt = read_json(path, input_hashes=input_hashes,
+                            contents=contents[path.name] if contents is not None else None)
         body = {key: value for key, value in receipt.items() if key != "receipt_id"}
         if digest(body) != receipt.get("receipt_id") or receipt.get("task_id") not in lookup:
             raise ValueError("Interrupted/start receipt integrity or task identity mismatch.")
@@ -426,7 +447,8 @@ def load_attempts(manifest, tasks, directory, *, metadata_only=False, paths=None
     for path in paths:
         if path.name == "manifest.json" or path.name.endswith((".started.json", ".io.json")):
             continue
-        attempt = read_run(path, require_integrity=True, input_hashes=input_hashes)
+        attempt = read_run(path, require_integrity=True, input_hashes=input_hashes,
+                           contents=contents[path.name] if contents is not None else None)
         if attempt["task_id"] not in lookup:
             raise ValueError("An attempt belongs to a different task list.")
         if path.name != f"{attempt['task_id']}--{attempt['attempt_id']}.json":
@@ -439,8 +461,9 @@ def load_attempts(manifest, tasks, directory, *, metadata_only=False, paths=None
         if attempt.get("device_identity") != receipt.get("device_identity"):
             raise ValueError("Completed attempt device identity differs from its start receipt.")
         io_path = directory / f"{attempt['task_id']}--{attempt['attempt_id']}.io.json"
-        if io_path.exists():
-            io = read_json(io_path, input_hashes=input_hashes)
+        if (io_path.name in contents) if contents is not None else io_path.exists():
+            io = read_json(io_path, input_hashes=input_hashes,
+                           contents=contents[io_path.name] if contents is not None else None)
             if io.get("attempt_id") != attempt["attempt_id"] or not math.isfinite(io["save_seconds"]) or io["save_seconds"] < 0:
                 raise ValueError("I/O measurement provenance mismatch.")
             if audit is not None:
@@ -448,7 +471,138 @@ def load_attempts(manifest, tasks, directory, *, metadata_only=False, paths=None
         attempts.append(_attempt_metadata(attempt) if metadata_only else attempt)
     if len({r["attempt_id"] for r in attempts}) != len(attempts):
         raise ValueError("Duplicate attempt ID.")
+    complete_names = {f"{row['task_id']}--{row['attempt_id']}.io.json" for row in attempts}
+    if any(path.name.endswith(".io.json") and path.name not in complete_names for path in paths):
+        raise ValueError("I/O measurement has no completed attempt.")
     return attempts, execution
+
+
+def _task_groups(tasks):
+    groups = defaultdict(list)
+    for task in tasks:
+        groups[task["iso_class_id"], task["experiment_role"]].append(task)
+    return dict(sorted(groups.items()))
+
+
+def _scope_metadata(manifest, execution, tasks):
+    return {"batch_id": manifest["batch_id"], "execution_id": execution["execution_id"],
+            "group_id": digest([tasks[0]["iso_class_id"], tasks[0]["experiment_role"]]),
+            "task_ids": sorted(task["task_id"] for task in tasks)}
+
+
+def _check_partition_paths(directory, groups):
+    """Inspect names once; foreign scopes never silently disappear in a filtered run."""
+    allowed = {digest(list(key)) for key in groups}
+    for path in directory.iterdir():
+        if path.is_symlink() or (path.name not in {"manifest.json", "active", "sealed", "writer.lock"}
+                                  and not (path.is_file() and record_temporary(path.name))):
+            raise ValueError(f"Unexpected partitioned output entry: {path.name}")
+    for folder, suffix in (("active", ""), ("sealed", ".tgz")):
+        parent = directory / folder
+        if parent.exists():
+            for path in parent.iterdir():
+                if (folder == "sealed" and not path.is_symlink() and path.is_file()
+                        and path.name.startswith(".") and path.name.endswith(".tmp")):
+                    continue  # Unpublished interrupted archive; never completion evidence.
+                identity = path.name.removesuffix(suffix) if suffix else path.name
+                if (path.is_symlink() or identity not in allowed or
+                    (folder == "active" and not path.is_dir()) or
+                    (folder == "sealed" and (not path.is_file() or not path.name.endswith(suffix)))):
+                    raise ValueError(f"Unexpected partition scope: {path}")
+
+
+def _load_scope(manifest, execution, tasks, directory, *, metadata_only=False, audit=None):
+    metadata = _scope_metadata(manifest, execution, tasks)
+    identity = metadata["group_id"]
+    active, archive = directory / "active" / identity, directory / "sealed" / f"{identity}.tgz"
+    contents = None
+    if active.exists():
+        for path in active.iterdir():
+            if path.is_symlink() or not path.is_file() or not (path.name.endswith(".json") or record_temporary(path.name)):
+                raise ValueError(f"Unexpected active record entry: {path}")
+    if archive.exists():
+        stored, contents = read_record_bundle(archive)
+        if stored != metadata or "manifest.json" not in contents:
+            raise ValueError("Sealed scope task/execution identity mismatch.")
+        if active.exists():
+            for path in active.iterdir():
+                if path.is_symlink() or not path.is_file() or path.name not in contents or path.read_bytes() != contents[path.name]:
+                    raise ValueError("Active files conflict with the sealed scope.")
+    elif not active.exists():
+        return []
+    local_audit = {} if audit is not None else None
+    rows, actual = _load_flat_attempts(manifest, tasks, active, metadata_only=metadata_only,
+                                       audit=local_audit, contents=contents)
+    if actual != execution:
+        raise ValueError("Scope and root execution identities differ.")
+    if contents is not None:
+        chosen = select_attempts(rows)
+        if set(chosen) != set(metadata["task_ids"]) or any(execution_failed(row) for row in chosen.values()):
+            raise ValueError("Sealed scope contains missing or failed tasks.")
+    if audit is not None:
+        opaque = contents if contents is not None else {
+            path.name: path.read_bytes() for path in active.iterdir() if record_temporary(path.name)}
+        local_audit.setdefault("file_hashes", {}).update({name: hashlib.sha256(value).hexdigest()
+                                                        for name, value in opaque.items() if record_temporary(name)})
+        audit.setdefault("file_hashes", {}).update({identity + "/" + name: value
+                                                    for name, value in local_audit.get("file_hashes", {}).items()})
+        audit.setdefault("started_attempt_ids", []).extend(local_audit.get("started_attempt_ids", []))
+        audit.setdefault("save_seconds", {}).update(local_audit.get("save_seconds", {}))
+    return rows
+
+
+def iter_attempt_groups(manifest, tasks, directory, *, metadata_only=False, graph_ids=None, audit=None):
+    """Read each flat graph or sealed graph/role once; never retain the whole trace set."""
+    directory = _record_directory(directory)
+    if not directory.exists():
+        return
+    execution = read_json(directory / "manifest.json",
+                          input_hashes=audit.setdefault("file_hashes", {}) if audit is not None else None)
+    _validate_execution(manifest, execution)
+    groups = _task_groups(tasks)
+    requested = set(graph_ids) if graph_ids is not None else {key[0] for key in groups}
+    if requested - {key[0] for key in groups}:
+        raise ValueError("Requested graph is absent from this batch.")
+    layout = execution.get("storage_layout", "flat")
+    if layout == PARTITIONED_LAYOUT:
+        _check_partition_paths(directory, groups)
+        for (identity, _), group in groups.items():
+            if identity in requested:
+                yield group, _load_scope(manifest, execution, group, directory,
+                                         metadata_only=metadata_only, audit=audit), execution
+    elif layout == "flat":
+        by_graph, files = defaultdict(list), defaultdict(list)
+        lookup = {task["task_id"]: task for task in tasks}
+        for task in tasks:
+            by_graph[task["iso_class_id"]].append(task)
+        for path in sorted(directory.glob("*.json")):
+            if path.name != "manifest.json":
+                task = lookup.get(path.name.partition("--")[0])
+                if task is None:
+                    raise ValueError("Attempt directory includes an unplanned task.")
+                files[task["iso_class_id"]].append(path)
+        for identity, group in sorted(by_graph.items()):
+            if identity in requested:
+                rows, _ = _load_flat_attempts(manifest, group, directory, metadata_only=metadata_only,
+                                              paths=files[identity], audit=audit, execution=execution)
+                yield group, rows, execution
+    else:
+        raise ValueError("Unsupported attempt storage layout.")
+
+
+def load_attempts(manifest, tasks, directory, *, metadata_only=False, paths=None, audit=None,
+                  execution=None, graph_ids=None):
+    """Compatibility reader; full audits visit every scope, filtered reads state their scope."""
+    if paths is not None or execution is not None or not tasks:
+        return _load_flat_attempts(manifest, tasks, directory, metadata_only=metadata_only,
+                                   paths=paths, audit=audit, execution=execution)
+    attempts, actual = [], None
+    for _, rows, actual in iter_attempt_groups(manifest, tasks, directory, metadata_only=metadata_only,
+                                               graph_ids=graph_ids, audit=audit):
+        attempts.extend(rows)
+    if len({row["attempt_id"] for row in attempts}) != len(attempts):
+        raise ValueError("Duplicate attempt ID across groups.")
+    return attempts, actual
 
 
 def select_attempts(attempts):
@@ -551,57 +705,15 @@ def _execute_task(task, graph, circuit):
     return result
 
 
-def run_worker(batch_directory, output, *, backend="default.qubit", execute=False,
-               shard_index=0, shard_count=1, max_tasks=None, roles=None):
-    """Dry-run by default; explicit execution resumes only verified whole attempts."""
-    manifest, library, tasks = read_batch(batch_directory)
-    work = sorted(shard_tasks(tasks, shard_index, shard_count),
-                  key=lambda row: (row["iso_class_id"], row["p"], row["experiment_role"], row["restart_id"]))
-    if roles is not None:
-        if not set(roles) <= {"tier1", "reference", "evaluation", "gradient_diagnostic"}:
-            raise ValueError("Unknown experiment role.")
-        work = [task for task in work if task["experiment_role"] in roles]
-    if max_tasks is not None and max_tasks < 1:
-        raise ValueError("max_tasks must be positive when provided.")
-    # Validate each complete trace, then discard it on resume. The worker needs
-    # completion metadata, not every historical state/gradient in memory.
-    attempts, old_execution = load_attempts(manifest, tasks, output, metadata_only=True)
-    selected = select_attempts(attempts)
-    source = source_identity()
-    runtime_environment = environment(backend)
-    device_identity = runtime_environment.pop("device_identity")
-    execution = {"batch_id": manifest["batch_id"], "source": source, "environment": runtime_environment,
-                 "protocol_version": manifest["config"]["protocol_version"],
-                 "config": manifest["config"], "attempt_selection_rule": ATTEMPT_RULE}
-    execution["execution_id"] = digest(execution)
-    issues = list(manifest["issues"])
-    if runtime_environment["gpu"] is not None and runtime_environment["gpu"]["unknown"]:
-        issues.append({"unknown_gpu_environment": runtime_environment["gpu"]["unknown"],
-                       "action": "verify_package_metadata_and_device_visibility_before_execution"})
-    if source["source_id"] != manifest["source_id"]:
-        issues.append({"mismatch": "source_changed_since_planning"})
-    if old_execution is not None and old_execution != execution:
-        issues.append({"mismatch": "execution_environment_or_settings_changed", "action": "use_a_new_output_directory"})
-    report = {"dry_run": not execute, "batch_id": manifest["batch_id"], "planned": len(tasks),
-              "shard_tasks": len(work), "completed": len(selected), "issues": issues,
-              "completed_scope": "entire_batch", "valid_completed": sum(not execution_failed(row) for row in selected.values()),
-              "work_scope": {"roles": sorted(roles) if roles is not None else "all",
-                             "shard_index": shard_index, "shard_count": shard_count},
-              "unresolved_execution_faults": sum(task["task_id"] in selected and execution_failed(selected[task["task_id"]]) for task in work),
-              "missing_tasks": sum(task["task_id"] not in selected for task in work),
-              "coverage": manifest["coverage"], "executed": 0, "execution_faults": 0,
-              "compute_started": False}
-    if not execute:
-        return report
-    if issues:
-        raise ValueError(f"Incomplete or incompatible batch: {issues}")
-    output = Path(output)
+def _execute_work(manifest, library, work, output, execution, attempts, report, *, backend,
+                  device_identity, max_tasks):
+    """Run the same numerical loop for legacy directories and active scopes."""
     output.mkdir(parents=True, exist_ok=True)
-    try:
+    if not (output / "manifest.json").exists():
         write_once_json(output / "manifest.json", execution)
-    except FileExistsError:
-        if read_json(output / "manifest.json") != execution:
-            raise ValueError("Concurrent worker has incompatible execution settings.")
+    elif read_json(output / "manifest.json") != execution:
+        raise ValueError("Concurrent worker has incompatible execution settings.")
+    selected = select_attempts(attempts)
     graphs = {row["iso_class_id"]: row for row in library["graphs"]}
     attempt_groups = defaultdict(list)
     for row in attempts:
@@ -675,12 +787,131 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
             report["execution_faults"] += int(execution_failed(result))
             if not execution_failed(result):
                 break
-    selected = select_attempts(attempts)
-    report["completed"] = len(selected)
-    report["valid_completed"] = sum(not execution_failed(row) for row in selected.values())
-    report["unresolved_execution_faults"] = sum(task["task_id"] in selected and execution_failed(selected[task["task_id"]]) for task in work)
-    report["missing_tasks"] = sum(task["task_id"] not in selected for task in work)
+    _completion(report, work, attempts)
     return report
+
+
+@contextmanager
+def _writer_lock(directory):
+    """One writer per partitioned output; the OS releases the lock on process exit."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "writer.lock").open("a+b") as stream:
+        if os.name == "nt":
+            import msvcrt
+            if stream.tell() == 0:
+                stream.write(b"0")
+                stream.flush()
+            stream.seek(0)
+            acquire = lambda: msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            release = lambda: msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            acquire = lambda: fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release = lambda: fcntl.flock(stream, fcntl.LOCK_UN)
+        try:
+            acquire()
+        except OSError as error:
+            raise ValueError("Another writer owns this output; use one worker per directory.") from error
+        try:
+            yield
+        finally:
+            release()
+
+
+def _completion(report, work, attempts):
+    chosen = select_attempts(attempts)
+    report.update(completed=len(chosen), valid_completed=sum(not execution_failed(row) for row in chosen.values()),
+                  unresolved_execution_faults=sum(task["task_id"] in chosen and execution_failed(chosen[task["task_id"]]) for task in work),
+                  missing_tasks=sum(task["task_id"] not in chosen for task in work))
+
+
+def run_worker(batch_directory, output, *, backend="default.qubit", execute=False,
+               shard_index=0, shard_count=1, max_tasks=None, roles=None, partitioned=False, graph_ids=None):
+    """Resume verified attempts; optionally seal complete graph/role scopes losslessly.
+
+    Partitioned execution has one writer. Graph selection limits record reads,
+    not task identity, budgets or seeds; reports explicitly describe that scope.
+    """
+    manifest, library, tasks = read_batch(batch_directory)
+    groups = _task_groups(tasks)
+    if roles is not None and not set(roles) <= {"tier1", "reference", "evaluation", "gradient_diagnostic"}:
+        raise ValueError("Unknown experiment role.")
+    if graph_ids is not None and not set(graph_ids) <= {key[0] for key in groups}:
+        raise ValueError("Requested graph is absent from this batch.")
+    if max_tasks is not None and max_tasks < 1:
+        raise ValueError("max_tasks must be positive when provided.")
+    if partitioned and (shard_index != 0 or shard_count != 1):
+        raise ValueError("Partitioned output uses graph selection and one writer, not task shards.")
+    work = sorted((task for task in shard_tasks(tasks, shard_index, shard_count)
+                   if (roles is None or task["experiment_role"] in roles)
+                   and (graph_ids is None or task["iso_class_id"] in graph_ids)),
+                  key=lambda row: (row["iso_class_id"], row["p"], row["experiment_role"], row["restart_id"]))
+    source, runtime = source_identity(), environment(backend)
+    device_identity = runtime.pop("device_identity")
+    execution = {"batch_id": manifest["batch_id"], "source": source, "environment": runtime,
+                 "protocol_version": manifest["config"]["protocol_version"], "config": manifest["config"],
+                 "attempt_selection_rule": ATTEMPT_RULE}
+    if partitioned:
+        execution["storage_layout"] = PARTITIONED_LAYOUT
+    execution["execution_id"] = digest(execution)
+    issues = list(manifest["issues"])
+    if runtime["gpu"] is not None and runtime["gpu"]["unknown"]:
+        issues.append({"unknown_gpu_environment": runtime["gpu"]["unknown"],
+                       "action": "verify_package_metadata_and_device_visibility_before_execution"})
+    if source["source_id"] != manifest["source_id"]:
+        issues.append({"mismatch": "source_changed_since_planning"})
+    report = {"dry_run": not execute, "batch_id": manifest["batch_id"], "planned": len(tasks),
+              "shard_tasks": len(work), "issues": issues,
+              "completed_scope": "selected_groups" if partitioned else "entire_batch",
+              "work_scope": {"roles": sorted(roles) if roles is not None else "all",
+                             "graph_ids": sorted(graph_ids) if graph_ids is not None else "all",
+                             "shard_index": shard_index, "shard_count": shard_count},
+              "coverage": manifest["coverage"], "executed": 0, "execution_faults": 0, "compute_started": False}
+    output = _record_directory(output)
+    with _writer_lock(output) if execute and partitioned else nullcontext():
+        old = read_json(output / "manifest.json") if (output / "manifest.json").exists() else None
+        if old is not None:
+            _validate_execution(manifest, old)
+            if old != execution:
+                issues.append({"mismatch": "execution_environment_or_settings_changed", "action": "use_a_new_output_directory"})
+        if execute and issues:
+            raise ValueError(f"Incomplete or incompatible batch: {issues}")
+        if not partitioned:
+            attempts, _ = (_load_flat_attempts(manifest, tasks, output, metadata_only=True, execution=old)
+                            if old is None or old.get("storage_layout", "flat") == "flat" else
+                            load_attempts(manifest, tasks, output, metadata_only=True))
+            _completion(report, work, attempts)
+            return (_execute_work(manifest, library, work, output, execution, attempts, report,
+                                  backend=backend, device_identity=device_identity, max_tasks=max_tasks)
+                    if execute else report)
+        if output.exists():
+            _check_partition_paths(output, groups)
+            if old is None and any((output / name).exists() for name in ("active", "sealed")):
+                raise ValueError("Partitioned records have no root execution manifest.")
+        if execute and old is None:
+            write_once_json(output / "manifest.json", execution)
+        report.update(completed=0, valid_completed=0, unresolved_execution_faults=0, missing_tasks=0)
+        for group in _task_groups(work).values():
+            attempts = _load_scope(manifest, old or execution, group, output, metadata_only=True)
+            metadata = _scope_metadata(manifest, execution, group)
+            active, archive = output / "active" / metadata["group_id"], output / "sealed" / (metadata["group_id"] + ".tgz")
+            scope = {"executed": 0, "execution_faults": 0, "compute_started": False}
+            if execute:
+                remaining = None if max_tasks is None else max_tasks - report["executed"]
+                if not archive.exists() and (remaining is None or remaining > 0):
+                    _execute_work(manifest, library, group, active, execution, attempts, scope,
+                                  backend=backend, device_identity=device_identity, max_tasks=remaining)
+                chosen = select_attempts(attempts)
+                if (len(chosen) == len(group) and all(not execution_failed(row) for row in chosen.values())
+                        and (not archive.exists() or active.exists())):
+                    seal_record_bundle(active, archive, metadata)
+                report["executed"] += scope["executed"]
+                report["execution_faults"] += scope["execution_faults"]
+                report["compute_started"] |= scope["compute_started"]
+            _completion(scope, group, attempts)
+            for name in ("completed", "valid_completed", "unresolved_execution_faults", "missing_tasks"):
+                report[name] += scope[name]
+        return report
 
 
 def freeze_references(manifest, tasks, selected):

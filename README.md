@@ -119,6 +119,20 @@ change source files within a resumable batch or overlap old/new sharding plans.
 Completed files cannot be overwritten. Budget/iteration limits are normal
 outcomes; numerical/device/program faults return a nonzero status after saving.
 
+For larger new batches, `run --partitioned` stores active records by graph and
+experiment role. A completed group is sealed into one checksummed `.tgz`, with
+the original start, result and I/O bytes retained; verified loose duplicates
+are then removed. Failures and interrupted-start evidence remain in the group.
+Recognized unpublished temporary bytes are preserved but never count as results.
+Old flat directories remain readable; select a new output for this layout.
+Use one writer per partitioned output; an OS lock rejects overlapping writers
+and is released when the process exits. `--graph-ids ID ...` limits record reads
+to named frozen graphs. Partitioned outputs do not use task shard flags.
+`completed_scope=selected_groups` means completion counts cover the selected
+graphs and roles; `planned` still describes the entire frozen batch. A task
+limit is not evidence of batch completion. A full read-only audit still checks
+every group. Hashed record paths use extended Windows paths when needed.
+
 Freeze references and rebuild summaries from existing records only:
 
 Complete `run --roles reference --execute` first, freeze complete references,
@@ -136,6 +150,15 @@ reference freeze returns 2 and remains explicitly provisional. Summary JSON
 and Parquet retain planned denominators, missing/fault counts and provenance;
 a successful summary command does not mean that complete 50-restart labels
 exist. Evaluation results never redefine a frozen reference.
+
+For large outputs, add `summarize --partitioned-output` to write each graph's
+JSON/Parquet tables separately and a final root manifest linking their hashes
+and completion counts. Trace memory is limited to graph-sized groups; the
+frozen task list and identity metadata still scale with the batch. The root
+manifest is published only after all graph summaries succeed. Its `complete`
+flag requires all configured tasks to have valid executions and all required
+references to be complete; scientific success-label counts are separate.
+An interrupted summary directory is retained; choose a new summary output.
 
 `scripts/verify_backend.py` defaults to a no-computation plan; `--execute`
 explicitly runs fixed-parameter comparisons and complete restarts. It supports

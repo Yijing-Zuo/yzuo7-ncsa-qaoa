@@ -9,6 +9,10 @@ from importlib.metadata import version
 import platform
 import os
 import tempfile
+import io
+import re
+import tarfile
+import gzip
 
 
 EXECUTION_FAILURES = frozenset(("numerical_error", "evaluation_error", "optimizer_failed", "program_error"))
@@ -54,9 +58,9 @@ def save_run(path, result: dict) -> None:
                           "_integrity": {"algorithm": "sha256", "value": checksum}})
 
 
-def read_run(path, *, require_integrity=False, input_hashes=None) -> dict:
+def read_run(path, *, require_integrity=False, input_hashes=None, contents=None) -> dict:
     """Read a completed attempt; interrupted work must restart as a new attempt."""
-    stored = read_json(path, input_hashes=input_hashes)
+    stored = read_json(path, input_hashes=input_hashes, contents=contents)
     if require_integrity and "_integrity" not in stored:
         raise ValueError("Batch resume requires checksummed new attempts, not legacy records.")
     if "_run_file_version" in stored or "_integrity" in stored:
@@ -98,13 +102,113 @@ def write_once_json(path, value) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def read_json(path, *, input_hashes=None):
-    """Load a small UTF-8 JSON configuration or record."""
+def read_json(path, *, input_hashes=None, contents=None):
+    """Load UTF-8 JSON from a file or already-read archive member bytes."""
     path = Path(path)
-    content = path.read_bytes()
+    content = path.read_bytes() if contents is None else contents
     if input_hashes is not None:
         input_hashes[path.name] = hashlib.sha256(content).hexdigest()
     return json.loads(content.decode("utf-8"))
+
+
+def _bundle_name(name):
+    return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.json", name) is not None or record_temporary(name)
+
+
+def record_temporary(name):
+    """Identify unpublished write_once_json bytes retained after an interruption."""
+    return re.fullmatch(r"\.[A-Za-z0-9][A-Za-z0-9_.-]*\.json\.[A-Za-z0-9_-]{8}\.tmp", name) is not None
+
+
+def read_record_bundle(archive):
+    """Read a sealed group without extraction; verify every exact record byte."""
+    archive = Path(archive)
+    if archive.is_symlink() or not archive.is_file():
+        raise ValueError(f"Expected a regular record archive: {archive}")
+    members = {}
+    with gzip.open(archive, "rb") as stream, tarfile.open(fileobj=stream, mode="r|") as bundle:
+        for entry in bundle:
+            if not entry.isfile() or not _bundle_name(entry.name) or entry.name in members:
+                raise ValueError(f"Unsafe or duplicate record archive member: {entry.name}")
+            members[entry.name] = bundle.extractfile(entry).read()
+        # tarfile may stop at its end marker without checking the gzip trailer.
+        while stream.read(1 << 20):
+            pass
+    manifest = json.loads(members.pop("bundle-manifest.json", b"{}").decode("utf-8"))
+    if (not isinstance(manifest, dict) or manifest.get("schema_version") != 1 or
+            not isinstance(manifest.get("metadata"), dict) or not members or
+            manifest.get("files") != {name: hashlib.sha256(value).hexdigest()
+                                      for name, value in members.items()}):
+        raise ValueError("Incomplete record archive or member checksum mismatch.")
+    return manifest["metadata"], members
+
+
+def _active_bundle_files(directory):
+    """Review regular records and recognized unpublished bytes before compaction."""
+    if directory.is_symlink():
+        raise ValueError(f"Record directory cannot be a symlink: {directory}")
+    members = {}
+    if directory.exists():
+        for path in directory.iterdir():
+            if (path.is_symlink() or not path.is_file() or not _bundle_name(path.name) or
+                    path.name == "bundle-manifest.json" or path.resolve().parent != directory.resolve()):
+                raise ValueError(f"Unexpected active record path: {path}")
+            members[path.name] = path.read_bytes()
+    return members
+
+
+def seal_record_bundle(directory, archive, metadata):
+    """Seal a caller-validated complete group, then remove verified duplicates.
+
+    Retain failures, orphan start receipts and unpublished temporary bytes.
+    The caller establishes semantic completeness and excludes concurrent writers.
+    Rerunning after an interrupted cleanup accepts an exact remaining subset.
+    """
+    directory, archive = Path(directory), Path(archive)
+    if archive.resolve().is_relative_to(directory.resolve()):
+        raise ValueError("The sealed archive must be outside its active directory.")
+    if not isinstance(metadata, dict):
+        raise ValueError("Record archive metadata must be a JSON object.")
+    members = _active_bundle_files(directory)
+    if not archive.exists():
+        if not members:
+            raise ValueError("Cannot seal an empty or missing record directory.")
+        manifest = {"schema_version": 1, "metadata": metadata,
+                    "files": {name: hashlib.sha256(value).hexdigest() for name, value in members.items()}}
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="wb", dir=archive.parent, prefix=f".{archive.name}.",
+                                             suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                with tarfile.open(fileobj=stream, mode="w:gz") as bundle:
+                    for name, value in sorted({**members, "bundle-manifest.json": _canonical_json(manifest)}.items()):
+                        entry = tarfile.TarInfo(name)
+                        entry.size = len(value)
+                        bundle.addfile(entry, io.BytesIO(value))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(temporary, archive)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    saved_metadata, saved_members = read_record_bundle(archive)
+    if _canonical_json(saved_metadata) != _canonical_json(metadata):
+        raise ValueError("Existing record archive metadata conflicts with this group.")
+    if any(saved_members.get(name) != value for name, value in members.items()):
+        raise ValueError("Active records conflict with the sealed archive; nothing was removed.")
+    del members
+    remaining = _active_bundle_files(directory)
+    if any(saved_members.get(name) != value for name, value in remaining.items()):
+        raise ValueError("Active records conflict with the sealed archive; nothing was removed.")
+    for name, value in remaining.items():
+        path = directory / name
+        if path.is_symlink() or path.resolve().parent != directory.resolve() or path.read_bytes() != value:
+            raise ValueError(f"Active record changed during compaction: {path}")
+        path.unlink()
+    if directory.exists():
+        directory.rmdir()
+    return saved_metadata
 
 
 def annotate_library(library, exact_sizes=(12, 16), chunk_size=65_536):
