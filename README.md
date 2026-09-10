@@ -123,6 +123,10 @@ For larger new batches, `run --partitioned` stores active records by graph and
 experiment role. A completed group is sealed into one checksummed `.tgz`, with
 the original start, result and I/O bytes retained; verified loose duplicates
 are then removed. Failures and interrupted-start evidence remain in the group.
+On Linux, archive contents and the sealed directory and its parent are synced
+before loose records are removed, including interrupted-cleanup recovery.
+A sync error retains those loose records and stops compaction; this relies on
+the filesystem honoring `fsync`, not on a power-failure guarantee for the server.
 Recognized unpublished temporary bytes are preserved but never count as results.
 Old flat directories remain readable; select a new output for this layout.
 Use one writer per partitioned output; an OS lock rejects overlapping writers

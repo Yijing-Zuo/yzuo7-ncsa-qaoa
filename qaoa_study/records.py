@@ -157,6 +157,20 @@ def _active_bundle_files(directory):
     return members
 
 
+def sync_directory(path):
+    """Persist Linux/POSIX directory entries; propagate unsupported filesystem errors.
+
+    Windows has no equivalent directory fsync through this interface.
+    """
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def seal_record_bundle(directory, archive, metadata):
     """Seal a caller-validated complete group, then remove verified duplicates.
 
@@ -201,6 +215,12 @@ def seal_record_bundle(directory, archive, metadata):
     remaining = _active_bundle_files(directory)
     if any(saved_members.get(name) != value for name, value in remaining.items()):
         raise ValueError("Active records conflict with the sealed archive; nothing was removed.")
+    # Sync even an existing archive recovered after interruption. Its inode and
+    # the new sealed directory entry must persist before it becomes the sole copy.
+    with archive.open("r+b" if os.name == "nt" else "rb") as stream:
+        os.fsync(stream.fileno())
+    sync_directory(archive.parent)
+    sync_directory(archive.parent.parent)
     for name, value in remaining.items():
         path = directory / name
         if path.is_symlink() or path.resolve().parent != directory.resolve() or path.read_bytes() != value:
