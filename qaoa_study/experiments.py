@@ -228,11 +228,18 @@ def library_issues(library, config):
     return issues
 
 
-def save_batch(directory, library_path, config):
+def save_batch(directory, library_path, config, *, b2_fit=None, reference_binding=None):
     """Freeze task JSONL and metadata. This operation performs no scientific computation."""
     directory, library_path = Path(directory), Path(library_path).resolve()
     library = read_library(library_path)
-    tasks = build_tasks(library, config)
+    if b2_fit is not None:
+        config = {**config, "b2_inputs": {"fit_id": b2_fit["fit_id"],
+                  "fit_digest": digest(b2_fit), "reference_binding_digest": digest(reference_binding)}}
+        tasks = build_b2_tasks(library, config, b2_fit, reference_binding)
+    else:
+        if config.get("kind") == "b2":
+            raise ValueError("B2 planning requires a frozen fit and audited reference binding.")
+        tasks = build_tasks(library, config)
     content = "".join(json.dumps(task, sort_keys=True, allow_nan=False) + "\n" for task in tasks).encode()
     source = source_identity()
     identity = {"library_id": library["library_id"], "config": config, "source_id": source["source_id"],
@@ -245,6 +252,9 @@ def save_batch(directory, library_path, config):
                 "coverage": graph_split_coverage(library["graphs"], library.get("cells")),
                 "attempt_selection_rule": ATTEMPT_RULE}
     directory.mkdir(parents=True, exist_ok=False)
+    if b2_fit is not None:
+        write_once_json(directory / "fit.json", b2_fit)
+        write_once_json(directory / "reference_binding.json", reference_binding)
     (directory / "tasks.jsonl").write_bytes(content)
     write_once_json(directory / "manifest.json", manifest)
     return manifest
@@ -280,6 +290,10 @@ def read_batch(directory):
                "attempt_selection_rule": ATTEMPT_RULE}
     if any(manifest.get(key) != value for key, value in derived.items()):
         raise ValueError("Batch completeness, coverage, counts or attempt rule changed.")
+    if manifest["config"].get("kind") == "b2":
+        fit, binding = read_b2_inputs(directory, manifest)
+        if build_b2_tasks(library, manifest["config"], fit, binding) != tasks:
+            raise ValueError("B2 tasks disagree with frozen fit/reference inputs.")
     return manifest, library, tasks
 
 
@@ -294,6 +308,7 @@ def validate_attempt(task, attempt, manifest, execution):
     required = {key: task[key] for key in ("task_id", "library_id", "iso_class_id", "p", "graph_split",
                                           "kind", "experiment_role", "pool", "method", "restart_id",
                                           "seed", "theta0", "protocol_version", "budget")}
+    required.update({key: task[key] for key in ("fit_id", "reference_id", "regime", "fold", "variant") if key in task})
     required.update(batch_id=manifest["batch_id"], execution_id=execution["execution_id"], task_digest=digest(task))
     if any(attempt.get(key) != value for key, value in required.items()):
         raise ValueError("Attempt task, protocol, execution settings or initial angles disagree.")
@@ -834,7 +849,7 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
     """
     manifest, library, tasks = read_batch(batch_directory)
     groups = _task_groups(tasks)
-    if roles is not None and not set(roles) <= {"tier1", "reference", "evaluation", "gradient_diagnostic"}:
+    if roles is not None and not set(roles) <= {"tier1", "reference", "evaluation", "gradient_diagnostic", "warm_start"}:
         raise ValueError("Unknown experiment role.")
     if graph_ids is not None and not set(graph_ids) <= {key[0] for key in groups}:
         raise ValueError("Requested graph is absent from this batch.")
@@ -979,3 +994,198 @@ def read_references(directory):
             raise ValueError("Multiple reference versions for one graph/depth in a frozen set.")
         references[key] = ref
     return references
+
+
+def attempt_cost_totals(attempts, *, save_seconds=None):
+    """Account all retained attempts; unavailable work remains unknown."""
+    from .analysis import _costs
+
+    save_seconds = save_seconds or {}
+    missing = [row["attempt_id"] for row in attempts if save_seconds.get(row["attempt_id"]) is None]
+    measured = math.fsum(save_seconds[row["attempt_id"]] for row in attempts
+                         if save_seconds.get(row["attempt_id"]) is not None)
+    return {**_costs(attempts), "attempts": len(attempts),
+            "record_save_seconds": None if missing else measured,
+            "record_save_seconds_measured": measured, "record_save_measurements_missing": len(missing),
+            "record_save_missing_attempt_ids": missing,
+            "execution_faults": sum(execution_failed(r) for r in attempts),
+            "population": "all_retained_attempts_including_execution_faults"}
+
+
+def audit_b2_references(batch, references_directory, attempts_directory, graph_ids):
+    """Re-derive required frozen references from validated original attempts.
+
+    This is a read contract, never permission to resume the source batch.
+    Only score-defining source files must match; optimizer compatibility is a
+    separate requirement when comparing B1 traces.
+    """
+    manifest, library, tasks = read_batch(batch)
+    if manifest["config"].get("kind") == "b2":
+        raise ValueError("B2 requires an original B1 reference batch.")
+    current_source = source_identity()
+    for name in ("qaoa_study/qaoa.py", "qaoa_study/exact.py"):
+        if manifest["source"]["files"].get(name) != current_source["files"].get(name):
+            raise ValueError("Reference score convention/source requires independent validation.")
+    ref_manifest = read_json(Path(references_directory) / "manifest.json")
+    if digest(ref_manifest["files"]) != ref_manifest["reference_set_id"]:
+        raise ValueError("Reference set manifest changed.")
+    audit = {}
+    attempts, execution = load_attempts(manifest, tasks, attempts_directory, metadata_only=True,
+                                        graph_ids=graph_ids, audit=audit)
+    expected = freeze_references(manifest, tasks, select_attempts(attempts))
+    required = {(identity, p) for identity in graph_ids for p in (1, 2)}
+    references = {}
+    for key in required:
+        candidate = expected.get(key)
+        name = candidate["reference_id"] + ".json" if candidate else None
+        if not candidate or not candidate["complete"] or name not in ref_manifest["files"]:
+            raise ValueError(f"Complete, reproducible reference required for {key}.")
+        ref = read_json(Path(references_directory) / name)
+        if ref != candidate:
+            raise ValueError(f"Complete, reproducible reference required for {key}.")
+        references[key] = ref
+        if not np.all(np.isfinite(ref["source"]["theta"])) or len(ref["source"]["theta"]) != 2 * key[1]:
+            raise ValueError("Invalid reference angle dimensions or values.")
+    binding = {"version": "b2-reference-binding-v1", "source_batch_id": manifest["batch_id"],
+        "source_id": manifest["source_id"], "source": manifest["source"],
+        "source_config": manifest["config"], "library_id": library["library_id"],
+        "reference_set_id": ref_manifest["reference_set_id"],
+        "source_batch_manifest_sha256": hashlib.sha256((Path(batch) / "manifest.json").read_bytes()).hexdigest(),
+        "reference_manifest_sha256": hashlib.sha256((Path(references_directory) / "manifest.json").read_bytes()).hexdigest(),
+        "execution_id": execution["execution_id"] if execution else None,
+        "attempt_input_digest": digest(audit.get("file_hashes", {})),
+        "interrupted_attempt_ids_in_read_scopes": sorted(set(audit.get("started_attempt_ids", [])) -
+                                                          {row["attempt_id"] for row in attempts}),
+        "references": [references[key] for key in sorted(required)]}
+    costs = attempt_cost_totals([r for r in attempts if r["experiment_role"] == "reference"],
+                               save_seconds=audit.get("save_seconds"))
+    costs.update(interrupted_attempt_ids_in_read_scopes=binding["interrupted_attempt_ids_in_read_scopes"],
+                 scope="Completed reference attempts on required graphs; listed interrupted work in read scopes has unknown cost.")
+    return manifest, library, binding, costs
+
+
+def save_b2_fit(output, batch, references_directory, attempts_directory, *, regime="random", fold=None):
+    """Fit both depths from every predeclared training reference, with no QAOA calls."""
+    from .learning import B2_RULES, fixed_angles, select_b2_graphs
+
+    _, library, _ = read_batch(batch)
+    training = select_b2_graphs(library, regime, fold, "training")
+    ids = [r["iso_class_id"] for r in training]
+    if not ids:
+        raise ValueError("The declared B2 training set is empty.")
+    _, _, binding, costs = audit_b2_references(batch, references_directory, attempts_directory, ids)
+    start = perf_counter()
+    fits = {str(p): fixed_angles([{"iso_class_id": ref["iso_class_id"], "theta": ref["source"]["theta"]}
+                                  for ref in binding["references"] if ref["p"] == p]) for p in (1, 2)}
+    fit = {"version": "b2-fit-v1", "rules": B2_RULES, "library_id": library["library_id"],
+           "split_digest": digest(library["split_summary"]), "regime": regime, "fold": fold,
+           "training_graph_ids": ids, "fits": fits, "reference_binding": binding,
+           "reference_costs": costs, "fit_seconds": perf_counter() - start, "source": source_identity()}
+    fit["fit_id"] = digest(fit)
+    write_once_json(output, fit)
+    return fit
+
+
+def read_b2_fit(path):
+    from .learning import B2_RULES
+
+    fit = read_json(path)
+    if (fit.get("version") != "b2-fit-v1" or fit.get("rules") != B2_RULES or
+            digest({k: v for k, v in fit.items() if k != "fit_id"}) != fit.get("fit_id")):
+        raise ValueError("B2 fit identity or construction rules changed.")
+    return fit
+
+
+def read_b2_inputs(directory, manifest):
+    fit = read_b2_fit(Path(directory) / "fit.json")
+    binding = read_json(Path(directory) / "reference_binding.json")
+    expected = {"fit_id": fit["fit_id"], "fit_digest": digest(fit), "reference_binding_digest": digest(binding)}
+    if manifest["config"].get("b2_inputs") != expected:
+        raise ValueError("B2 fit or external reference binding changed.")
+    return fit, binding
+
+
+def build_b2_tasks(library, config, fit, binding):
+    """One independent frozen B2 variant per evaluation graph/depth."""
+    from .learning import B2_RULES, select_b2_graphs
+
+    if digest({k: v for k, v in fit.items() if k != "fit_id"}) != fit.get("fit_id"):
+        raise ValueError("B2 fit identity changed.")
+    if (config.get("kind") != "b2" or config["depths"] != [1, 2] or config["epsilon"] != 0.5 or
+            config["variants"] != ["medoid", "aligned_median"] or
+            type(config["max_attempts"]) is not int or config["max_attempts"] < 1):
+        raise ValueError("B2 requires both depths, both frozen variants and the adopted single-start budget.")
+    training = select_b2_graphs(library, fit["regime"], fit["fold"], "training")
+    evaluation = select_b2_graphs(library, fit["regime"], fit["fold"], "evaluation")
+    ids = [r["iso_class_id"] for r in training]
+    if (not ids or not evaluation or fit["training_graph_ids"] != ids or fit["rules"] != B2_RULES or
+            fit["split_digest"] != digest(library["split_summary"]) or
+            fit["library_id"] != library["library_id"] or binding["library_id"] != library["library_id"] or
+            binding["source_batch_id"] != fit["reference_binding"]["source_batch_id"]):
+        raise ValueError("B2 fit/evaluation membership or source library is incompatible.")
+    refs = {(r["iso_class_id"], r["p"]): r for r in binding["references"]}
+    if len(refs) != len(binding["references"]):
+        raise ValueError("Duplicate bound reference.")
+    for ref in fit["reference_binding"]["references"]:
+        if refs.get((ref["iso_class_id"], ref["p"])) != ref:
+            raise ValueError("Training reference changed after B2 fitting.")
+    for ref in refs.values():
+        if (not ref["complete"] or ref["library_id"] != library["library_id"] or
+                ref["batch_id"] != binding["source_batch_id"] or
+                digest({k: v for k, v in ref.items() if k != "reference_id"}) != ref["reference_id"]):
+            raise ValueError("Invalid external reference identity.")
+    tasks = []
+    for p in (1, 2):
+        budget = config["optimizer"][str(p)]
+        OptimizerSettings(**budget)
+        if budget != binding["source_config"]["optimizer"][str(p)]:
+            raise ValueError("B2 must use the same single-run optimizer budget as B1.")
+        for graph in evaluation:
+            ref = refs.get((graph["iso_class_id"], p))
+            if ref is None:
+                raise ValueError("Evaluation reference is missing from the frozen binding.")
+            for variant in config["variants"]:
+                theta = fit["fits"][str(p)]["medoid" if variant == "medoid" else "median"]["theta"]
+                stream = {"namespace": config["seed_namespace"], "seed": config["seed"],
+                          "fit_id": fit["fit_id"], "iso_class_id": graph["iso_class_id"], "p": p, "variant": variant}
+                task = {"task_version": "plan-a-b2-tasks-v1", "library_id": library["library_id"],
+                    "iso_class_id": graph["iso_class_id"], "n": graph["n"], "p": p,
+                    "graph_split": "evaluation", "kind": "optimization", "experiment_role": "warm_start",
+                    "pool": None, "method": "B2", "restart_id": 0, "seed": int(digest(stream)[:32], 16),
+                    "theta0": theta, "budget": budget, "protocol_version": config["protocol_version"],
+                    "regime": fit["regime"], "fold": fit["fold"], "variant": variant,
+                    "fit_id": fit["fit_id"], "reference_id": ref["reference_id"]}
+                task["task_id"] = digest(task)
+                tasks.append(task)
+    return sorted(tasks, key=lambda row: row["task_id"])
+
+
+def save_b2_batch(output, fit_path, batch, references_directory, attempts_directory, settings):
+    """Audit external references once, then embed immutable fit/binding inputs."""
+    from .learning import select_b2_graphs
+
+    fit = read_b2_fit(fit_path)
+    source, library, _ = read_batch(batch)
+    evaluation = select_b2_graphs(library, fit["regime"], fit["fold"], "evaluation")
+    ids = sorted(set(fit["training_graph_ids"]) | {r["iso_class_id"] for r in evaluation})
+    _, _, binding, _ = audit_b2_references(batch, references_directory, attempts_directory, ids)
+    inherited = {k: source["config"][k] for k in ("optimizer", "max_attempts", "expected_library",
+                 "require_full_design", "design", "require_split_coverage") if k in source["config"]}
+    if set(settings) & set(inherited):
+        raise ValueError("B2 settings cannot override the source B1 optimizer or library contract.")
+    return save_batch(output, (Path(batch) / source["library_path"]).resolve(), {**inherited, **settings},
+                      b2_fit=fit, reference_binding=binding)
+
+
+def validate_b1_comparison(warm, baseline, warm_execution, baseline_execution):
+    """Compare existing B1 traces only under the declared identical numerical contract."""
+    if warm["library_id"] != baseline["library_id"]:
+        raise ValueError("B1 comparison library mismatch.")
+    for name in ("qaoa_study/qaoa.py", "qaoa_study/exact.py", "qaoa_study/optimize.py"):
+        if warm["source"]["files"].get(name) != baseline["source"]["files"].get(name):
+            raise ValueError("B1 optimizer/objective source is not comparable.")
+    for key in ("depths", "epsilon", "optimizer"):
+        if warm["config"][key] != baseline["config"][key]:
+            raise ValueError("B1 single-start comparison settings differ.")
+    if warm_execution and baseline_execution and warm_execution["environment"] != baseline_execution["environment"]:
+        raise ValueError("B1/B2 numerical environments differ; a new comparable B1 run is required.")

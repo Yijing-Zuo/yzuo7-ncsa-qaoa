@@ -270,15 +270,15 @@ def _costs(rows):
     known subtotals and the affected attempt identities remain inspectable.
     """
     names = ("objective_calls", "gradient_requests", "device_executions", "device_derivatives", "device_vjps", "iterations")
-    metrics = (*names, "elapsed_seconds", "preparation_seconds", "analytic_evaluations")
+    metrics = (*names, "elapsed_seconds", "preparation_seconds", "analytic_evaluations", "analytic_points_requested")
     known, unknown = {name: [] for name in metrics}, {name: [] for name in metrics}
     affected = []
     for row in rows:
         unavailable = row.get("cost_unavailable") or {}
         values = {name: (row.get("counts") or {}).get(name) for name in names}
-        values.update(elapsed_seconds=row.get("elapsed_seconds"), preparation_seconds=row.get("preparation_seconds"),
-                      analytic_evaluations=(row.get("grid") or {}).get(
-                          "analytic_evaluations", None if row.get("kind") == "p1_grid" else 0))
+        values.update(elapsed_seconds=row.get("elapsed_seconds"), preparation_seconds=row.get("preparation_seconds"))
+        values.update({name: (row.get("grid") or {}).get(name, None if row.get("kind") == "p1_grid" else 0)
+                       for name in ("analytic_evaluations", "analytic_points_requested")})
         missing = []
         for name, value in values.items():
             # The partial-validation contract retains finite counters only
@@ -423,3 +423,181 @@ def build_summary(library: dict, tasks: list[dict], selected_attempts: dict,
         })
     return {"analysis_version": ANALYSIS_VERSION, "settings": settings, "library_id": library["library_id"],
             "graph_qaoa": graph_rows, "restarts": restart_rows, "diagnostics": diagnostics}
+
+
+WARM_ANALYSIS_VERSION = "plan-a-warm-analysis-v1"
+DEFAULT_WARM_SETTINGS = {"epsilon": 0.5, "bootstrap_seed": 20260912, "bootstrap_samples": 2000}
+_WARM_METRICS = ("C_initial", "C_final", "ratio_initial_exact", "ratio_final_exact",
+                 "gap_initial_ref", "gap_final_ref", "terminal_success_fraction", "hit_fraction")
+
+
+def _warm_restart(task, attempt, reference, graph, epsilon):
+    row = evaluate_restart(task, attempt, reference, epsilon)
+    row.update({key: task.get(key) for key in ("regime", "fold", "variant", "fit_id")})
+    first = next(iter(attempt.get("trace", [])), None) if attempt else None
+    if first and (first["call_id"] != 1 or first.get("theta") != task["theta0"]):
+        raise ValueError("Warm comparison requires the actual first call at frozen theta0.")
+    initial = first["C"] if first and _finite(first.get("C")) else None
+    exact = graph.get("C_star") if graph.get("exact_status") == "computed" else None
+    row.update(C_initial=initial, initial_call_id=1 if initial is not None else None,
+               initial_score_source="trace[0].C at frozen theta0; no new objective evaluation",
+               initial_score_available=initial is not None, C_star=exact)
+    for name, score in (("initial", initial), ("final", row["C_final"])):
+        row[f"ratio_{name}_exact"] = score / exact if _finite(score) and exact else None
+        row[f"gap_{name}_ref"] = row["C_ref"] - score if _finite(score) and row["reference_complete"] else None
+    return row
+
+
+def _warm_pool(rows):
+    """One graph: average B1 repeats before any across-graph calculation."""
+    planned = len(rows)
+    valid = sum(row["execution_valid"] for row in rows)
+    ready = all(row["reference_complete"] for row in rows)
+    complete = valid == planned and ready and all(row["initial_score_available"] for row in rows)
+    metrics, observed = {}, {}
+    for name in _WARM_METRICS[:6]:
+        values = [row[name] for row in rows if row["execution_valid"] and _finite(row[name])]
+        mean = math.fsum(values) / len(values) if values else None
+        metrics[name] = mean if len(values) == planned else None
+        observed[name] = {"mean": mean, "valid_observed": len(values), "planned": planned}
+    metrics["terminal_success_fraction"] = sum(row["terminal_success"] is True for row in rows) / planned if ready else None
+    metrics["hit_fraction"] = sum(row["first_hit"] is not None for row in rows) / planned if ready else None
+    return {"planned": planned, "valid": valid, "missing": sum(row["missing"] for row in rows),
+            "execution_faults": sum(row["execution_fault"] for row in rows),
+            "reference_complete": ready, "complete": complete, "provisional": not complete,
+            "metrics": metrics, "observed_scores": observed,
+            "first_hits": [row["first_hit"] for row in rows],
+            "task_ids": [row["task_id"] for row in rows], "attempt_ids": [row["attempt_id"] for row in rows],
+            "success_interpretation": "known successes/planned; unresolved outcomes retained, not treated as completed failures"}
+
+
+def _warm_hit_curve(pools):
+    """F(k)=mean_graph mean_planned_restart 1[first_hit<=k], with no censoring."""
+    if not all(pool["reference_complete"] for pool in pools):
+        return None
+    events = defaultdict(list)
+    for pool in pools:
+        for call in pool["first_hits"]:
+            if call is not None:
+                events[call].append(1 / (len(pools) * pool["planned"]))
+    curve = [{"objective_calls": 0, "fraction": 0.0}]
+    masses = []
+    for call in sorted(events):
+        masses.append(math.fsum(events[call]))
+        curve.append({"objective_calls": call, "fraction": min(1.0, math.fsum(masses))})
+    quantiles = {}
+    for name, fraction in (("median", 0.5), ("p90", 0.9)):
+        hit = next((point["objective_calls"] for point in curve if point["fraction"] >= fraction - 1e-12), None)
+        quantiles[name] = {"value": hit, "status": "reached" if hit is not None else "not_reached"}
+    return {"population": "all_planned_graphs_equal_weight; within_graph_all_planned_restarts_equal_weight",
+            "graphs": len(pools), "planned_restarts": sum(pool["planned"] for pool in pools),
+            "provisional": any(pool["provisional"] for pool in pools), "curve": curve, **quantiles}
+
+
+def _warm_comparison(rows, settings):
+    complete = all(row["complete"] for row in rows)
+    draws = np.random.default_rng(settings["bootstrap_seed"]).integers(
+        len(rows), size=(settings["bootstrap_samples"], len(rows))) if complete and len(rows) > 1 else None
+    metrics = {}
+    for name in _WARM_METRICS:
+        baseline = [row["B1"]["metrics"][name] for row in rows]
+        warm = [row["B2"]["metrics"][name] for row in rows]
+        available = all(_finite(value) for value in baseline + warm)
+        delta = np.asarray(warm) - np.asarray(baseline) if available else None
+        metrics[name] = {
+            "B1": math.fsum(baseline) / len(rows) if all(_finite(v) for v in baseline) else None,
+            "B2": math.fsum(warm) / len(rows) if all(_finite(v) for v in warm) else None,
+            "difference_B2_minus_B1": float(delta.mean()) if available else None,
+            "paired_bootstrap_ci95": np.quantile(delta[draws].mean(axis=1), [0.025, 0.975]).tolist()
+            if available and draws is not None else None,
+            "ci_status": "available" if available and draws is not None else
+                         "provisional" if not complete else "fewer_than_two_graphs" if len(rows) < 2 else "metric_unavailable",
+        }
+    return {"graphs": len(rows), "complete": complete, "provisional": not complete,
+            "weighting": "B1 mean within each graph, then equal graph weights; B2 one start per graph",
+            "difference_interpretation": "B2 minus B1; provisional known-success differences are not bounds",
+            "metrics": metrics, "hit_statistics": {
+                method: _warm_hit_curve([row[method] for row in rows]) for method in ("B1", "B2")},
+            "bootstrap": {"unit": "paired iso_class_id", "seed": settings["bootstrap_seed"],
+                          "samples": settings["bootstrap_samples"], "interval": "percentile 95%",
+                          "scope": "mean paired differences; no CI when planned execution/reference incomplete"}}
+
+
+def build_warm_summary(library: dict, tasks: list[dict], selected: dict, references: dict, *,
+                       b1_tasks: list[dict], b1_selected: dict, settings: dict | None = None) -> dict:
+    """Compare a frozen single-start B2 batch with separately validated B1 traces.
+
+    The caller validates source batches, references, fits and attempt provenance.
+    This pure summary enforces task/graph identities, one B2 start per variant,
+    and identical optimizer budgets. It never selects attempts by their scores.
+    Missing/faulted planned runs remain in denominators; formal paired intervals
+    require every planned run and reference. No existing B1 label rule changes.
+    """
+    settings = {**DEFAULT_WARM_SETTINGS, **(settings or {})}
+    if (settings["epsilon"] != 0.5 or type(settings["bootstrap_samples"]) is not int or
+            settings["bootstrap_samples"] < 1 or type(settings["bootstrap_seed"]) is not int or settings["bootstrap_seed"] < 0):
+        raise ValueError("Warm analysis requires epsilon=0.5 and fixed positive bootstrap count/nonnegative integer seed.")
+    graphs = {graph["iso_class_id"]: graph for graph in library["graphs"]}
+    warm_groups, baseline_tasks = defaultdict(list), defaultdict(list)
+    seen = set()
+    for method, planned, attempts in (("B1", b1_tasks, b1_selected), ("B2", tasks, selected)):
+        identities = {task["task_id"] for task in planned}
+        if len(identities) != len(planned) or set(attempts) - identities or identities & seen:
+            raise ValueError("Warm comparison contains duplicate/unplanned task identities.")
+        seen.update(identities)
+        for task in planned:
+            graph = graphs.get(task["iso_class_id"])
+            if (not graph or task["library_id"] != library["library_id"] or task["graph_split"] != graph["graph_split"]
+                    or task["kind"] != "optimization" or task["method"] != method
+                    or task["experiment_role"] != ("evaluation" if method == "B1" else "warm_start")):
+                raise ValueError("Warm comparison task, graph, method or role disagrees.")
+            if task["task_id"] in attempts and attempts[task["task_id"]]["task_id"] != task["task_id"]:
+                raise ValueError("Selected warm comparison attempt belongs to another task.")
+            if method == "B1":
+                baseline_tasks[task["iso_class_id"], task["p"]].append(task)
+            else:
+                if (task["regime"] not in ("random", "lofo") or task["variant"] not in ("medoid", "aligned_median")
+                        or (task["regime"] == "random") != (task["fold"] is None) or graph["graph_split"] != "evaluation"):
+                    raise ValueError("Unsupported warm regime/fold/variant or non-evaluation target graph.")
+                key = tuple(task[name] for name in ("regime", "fold", "p", "variant", "fit_id"))
+                warm_groups[key].append(task)
+    restarts, graph_rows, comparisons, evaluated_b1 = [], [], [], {}
+    target_sets = {}
+    for key, group in sorted(warm_groups.items(), key=lambda item: repr(item[0])):
+        metadata = dict(zip(("regime", "fold", "p", "variant", "fit_id"), key))
+        identities = {task["iso_class_id"] for task in group}
+        target_key = key[:3] + key[4:]
+        if len(identities) != len(group) or target_sets.setdefault(target_key, identities) != identities:
+            raise ValueError("Each warm variant must have exactly one task per same target graph/depth.")
+        paired = []
+        for task in sorted(group, key=lambda row: row["iso_class_id"]):
+            identity, p = task["iso_class_id"], task["p"]
+            baseline = sorted(baseline_tasks.get((identity, p), []), key=lambda row: row["task_id"])
+            if not baseline or any(row["budget"] != task["budget"] for row in baseline):
+                raise ValueError("Warm comparison needs a planned B1 pool with exactly the same optimizer budget.")
+            reference = references.get((identity, p))
+            if reference and any(reference.get(name) != value for name, value in
+                                 (("library_id", library["library_id"]), ("iso_class_id", identity), ("p", p))):
+                raise ValueError("Warm reference and target graph/depth identities disagree.")
+            if (identity, p) not in evaluated_b1:
+                evaluated_b1[identity, p] = [_warm_restart(row, b1_selected.get(row["task_id"]), reference,
+                                                         graphs[identity], settings["epsilon"]) for row in baseline]
+                restarts.extend(evaluated_b1[identity, p])
+            warm = _warm_restart(task, selected.get(task["task_id"]), reference, graphs[identity], settings["epsilon"])
+            restarts.append(warm)
+            b1, b2 = _warm_pool(evaluated_b1[identity, p]), _warm_pool([warm])
+            row = {**metadata, "library_id": library["library_id"], "iso_class_id": identity,
+                   "graph_split": graphs[identity]["graph_split"], "n": graphs[identity]["n"],
+                   "reference_id": reference.get("reference_id") if reference else None,
+                   "B1": b1, "B2": b2, "complete": b1["complete"] and b2["complete"],
+                   "provisional": not (b1["complete"] and b2["complete"]),
+                   "budget": task["budget"]}
+            paired.append(row)
+            graph_rows.append(row)
+        comparisons.append({**metadata, **_warm_comparison(paired, settings)})
+    used = {row["task_id"] for row in restarts}
+    return {"analysis_version": WARM_ANALYSIS_VERSION, "settings": settings, "library_id": library["library_id"],
+            "graph_qaoa": graph_rows, "restarts": restarts, "diagnostics": [], "comparisons": comparisons,
+            "complete": bool(comparisons) and all(row["complete"] for row in comparisons),
+            "selected_costs_by_method": {method: _costs([attempt for identity, attempt in attempts.items() if identity in used])
+                                         for method, attempts in (("B1", b1_selected), ("B2", selected))}}

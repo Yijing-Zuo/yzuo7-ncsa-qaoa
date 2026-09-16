@@ -1,0 +1,16 @@
+{
+  "kind": "b2",
+  "protocol_version": "plan-a-b2-single-start-v1",
+  "purpose": "B2 development candidate; optimizer and library contract inherited from the bound B1 batch",
+  "production_frozen": false,
+  "depths": [1, 2],
+  "epsilon": 0.5,
+  "variants": ["medoid", "aligned_median"],
+  "seed_namespace": "plan-a-b2-fixed-start-v1",
+  "seed": 20260912,
+  "analysis": {
+    "epsilon": 0.5,
+    "bootstrap_seed": 20260912,
+    "bootstrap_samples": 2000
+  }
+}

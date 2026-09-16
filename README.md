@@ -3,9 +3,10 @@
 Research code for unweighted MaxCut at QAOA depths `p=1,2`: exact cut
 enumeration, analytic p1 scores, statevector expectations and gradients,
 single-run L-BFGS-B optimization, frozen graph libraries, reproducible B1
-task/reference/evaluation pools, and read-only labels and diagnostics.
-Production and 100-graph pilot configurations are executable candidates;
-neither has been run or frozen by a pilot. Machine learning and B2–B7 are
+task/reference/evaluation pools, read-only labels and diagnostics, and
+training-derived B2 fixed starts with a single-start comparison.
+Supplied production and pilot configurations are candidates; use the frozen
+batch manifests for adopted settings. Machine learning and B3–B7 remain
 outside the current implementation.
 
 Use Python 3.12. From the repository root, install the pinned environment
@@ -18,17 +19,20 @@ python -m venv .venv
 ```
 
 On Linux/macOS, substitute `.venv/bin/python`; those platforms have not been
-verified. The numerical backend is PennyLane 0.43.0 `default.qubit`,
+verified by the local B2 checks. The numerical backend is PennyLane 0.43.0 `default.qubit`,
 `shots=None`, Autograd, adjoint first derivatives and double precision.
 `default.qubit` is the CPU reference. Explicit `lightning.gpu` selection uses
 the same circuit and optimizer, requires a separately prepared Linux GPU
-environment, and never falls back to CPU. GPU execution has not been validated.
+environment, and never falls back to CPU. GPU validation must establish the
+actual device and environment before execution.
 For predictable development resource use, set `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` to `1` before running Python.
 
 Keep the editable (`-e`) installation: experiment provenance locates the
 working code, configuration and entry points through the installed module.
 Do not edit this checkout while a batch is running or awaiting resume.
+Keep its original runtime snapshot and environment for continued execution;
+a new B2 batch does not make an edited checkout compatible with old B1 resume.
 
 On an allocated Linux GPU session, use a separate Python 3.12 environment.
 The following pinned GPU additions are installation candidates until verified
@@ -197,3 +201,50 @@ defines QAOA; the p1 edge formula follows corrected
 [Wang et al. (1706.02998v2, Eq. 14 and Appendix A)](https://arxiv.org/abs/1706.02998v2).
 The implementation uses [PennyLane 0.43.0](https://github.com/PennyLaneAI/pennylane/tree/v0.43.0),
 chosen in place of the original study proposal's CUDA-Q.
+
+## B2 fixed starts
+
+`learning.py` fits a common-symmetry medoid and a separately frozen, one-pass
+aligned coordinate median from complete training references at each depth.
+The distance is Euclidean radians on gamma period 2pi, beta period pi/2,
+quotiented by simultaneous reversal of all angles. It is a parameter distance,
+not an energy metric. LOFO retains the original training/evaluation boundary
+and excludes multi-family classes on both sides.
+
+Angle rules `b2-common-quotient-v2` resolve sign choices using the coordinate
+with the largest separation between the two representatives. This prevents a
+near-zero leading angle from deciding a distant aligned-median lift. Older
+rule-v1 fits/batches require their original source for replay; refit and plan
+into new paths with v2, reusing the audited B1 references. Existing artifacts
+are not migrated or overwritten.
+
+With existing B1 data, use new output paths for each fit and batch:
+
+```bash
+python scripts/experiment.py fit-b2 --batch B1_BATCH --attempts B1_ATTEMPTS \
+  --references B1_REFERENCES --regime random --output B2_FIT.json
+python scripts/experiment.py plan-b2 --batch B1_BATCH --attempts B1_ATTEMPTS \
+  --references B1_REFERENCES --fit B2_FIT.json \
+  --config configs/warm-benchmark-candidate.json --output B2_BATCH
+python scripts/experiment.py run --batch B2_BATCH --output B2_ATTEMPTS
+# Explicitly select the validated backend and add --execute to run.
+python scripts/experiment.py summarize-b2 --batch B2_BATCH --attempts B2_ATTEMPTS \
+  --b1-batch B1_BATCH --b1-attempts B1_ATTEMPTS --output B2_SUMMARY
+```
+
+For LOFO, fit with `--regime lofo --fold regular` (or er/ba/sbm), using a
+separate output for every fold. Fitting requires all declared training
+references, without requiring the 50-restart success labels; planning also
+requires complete target references. Original references are re-derived from
+validated attempts and bound by identity. B2 inherits the frozen B1 optimizer
+settings. Existing B1 traces are compared only when objective/optimizer source,
+budgets and execution environments agree; this read permission never changes
+the strict source/environment rules for resuming B1.
+
+Each variant has one start per graph. B1 repeats estimate random single-start
+performance: average within each graph first, then give every graph equal
+weight. Initial score, terminal score/success, first hit and complete costs
+remain separate. Missing/faulted runs keep their planned denominators and
+suppress formal paired intervals. JSON includes comparisons and first-hit
+curves; Parquet retains graph/restart tables. Unreached median/p90 are null.
+The two variants are never selected by their scores on individual test graphs.

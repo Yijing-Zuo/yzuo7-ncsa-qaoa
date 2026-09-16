@@ -8,12 +8,13 @@ import math
 from pathlib import Path
 import sys
 
-from qaoa_study.analysis import build_summary
+from qaoa_study.analysis import build_summary, build_warm_summary
 from qaoa_study.experiments import (
     _record_directory, digest, freeze_references, iter_attempt_groups, load_attempts, read_batch, read_references,
     run_worker, save_batch, save_references, select_attempts, source_identity,
+    attempt_cost_totals, read_b2_inputs, save_b2_fit, save_b2_batch, validate_b1_comparison,
 )
-from qaoa_study.records import execution_failed, read_json, write_once_json
+from qaoa_study.records import evaluate_trace, execution_failed, read_json, write_once_json
 
 
 def save_summary(output, summary):
@@ -228,6 +229,73 @@ def save_partitioned_summary(output, batch, attempts_directory, references_direc
     return index
 
 
+def _warm_attempt_views(manifest, tasks, directory, references, requested):
+    """Project validated graph-sized traces onto events needed by warm analysis.
+
+    These in-memory views retain the first call, first threshold hit and maximum
+    score event. They are not run records and are never written as attempts.
+    Full calls/counts and provenance were validated before projection.
+    """
+    selected, costs, reference_costs, audit, execution, completed_ids = {}, [], [], {}, None, set()
+    lookup = {t["task_id"]: t for t in requested}
+    graph_ids = sorted({t["iso_class_id"] for t in requested})
+    for _, rows, execution in iter_attempt_groups(manifest, tasks, directory, graph_ids=graph_ids, audit=audit):
+        completed_ids.update(row["attempt_id"] for row in rows)
+        for row in rows:
+            target = costs if row["task_id"] in lookup else reference_costs if row["experiment_role"] == "reference" else None
+            if target is not None:
+                target.append({k: v for k, v in row.items() if k in
+                               ("task_id", "attempt_id", "kind", "stop_reason", "counts", "elapsed_seconds",
+                                "preparation_seconds", "cost_status", "cost_unavailable", "grid")})
+        rows = [row for row in rows if row["task_id"] in lookup]
+        for identity, row in select_attempts(rows).items():
+            ref = references[row["iso_class_id"], row["p"]]
+            hit = evaluate_trace(row, ref["C_ref"])["first_hit"]
+            calls = {1, hit, row.get("best_call_id")}
+            view = {k: v for k, v in row.items() if k not in ("trace", "optimizer_messages", "invalid_result")}
+            view["trace"] = [{k: point[k] for k in ("call_id", "C", "theta")}
+                             for point in row["trace"] if point["call_id"] in calls]
+            selected[identity] = view
+    interrupted = sorted(set(audit.get("started_attempt_ids", [])) - completed_ids)
+    return selected, execution, {"input_digest": digest(audit.get("file_hashes", {})),
+        "input_files": len(audit.get("file_hashes", {})), "interrupted_attempt_ids_in_read_scopes": interrupted,
+        "all_requested_attempt_costs": attempt_cost_totals(costs, save_seconds=audit.get("save_seconds")),
+        "reference_attempt_costs": attempt_cost_totals(reference_costs, save_seconds=audit.get("save_seconds"))}
+
+
+def summarize_b2_batch(batch, attempts_directory, b1_batch, b1_attempts):
+    """Read a bound B2 experiment and separately verify B1 comparison eligibility."""
+    manifest, library, tasks = read_batch(batch)
+    if manifest["config"].get("kind") != "b2":
+        raise ValueError("summarize-b2 requires a B2 batch.")
+    fit, binding = read_b2_inputs(batch, manifest)
+    baseline, _, baseline_tasks = read_batch(b1_batch)
+    if baseline["batch_id"] != binding["source_batch_id"]:
+        raise ValueError("B1 comparison is not the explicitly bound source batch.")
+    references = {(r["iso_class_id"], r["p"]): r for r in binding["references"]}
+    targets = {(t["iso_class_id"], t["p"]) for t in tasks}
+    b1_tasks = [t for t in baseline_tasks if t["experiment_role"] == "evaluation"
+                and (t["iso_class_id"], t["p"]) in targets]
+    selected, execution, warm_audit = _warm_attempt_views(manifest, tasks, attempts_directory, references, tasks)
+    b1_selected, b1_execution, b1_audit = _warm_attempt_views(baseline, baseline_tasks, b1_attempts, references, b1_tasks)
+    validate_b1_comparison(manifest, baseline, execution, b1_execution)
+    summary = build_warm_summary(library, tasks, selected, references, b1_tasks=b1_tasks,
+                                 b1_selected=b1_selected, settings=manifest["config"].get("analysis"))
+    evaluation_reference_costs = b1_audit.pop("reference_attempt_costs")
+    summary.update(batch_id=manifest["batch_id"], b1_batch_id=baseline["batch_id"], fit_id=fit["fit_id"],
+        reference_binding_digest=digest(binding), analysis_source=source_identity(),
+        execution_id=execution["execution_id"] if execution else None,
+        b1_execution_id=b1_execution["execution_id"] if b1_execution else None,
+        input_audits={"B1": b1_audit, "B2": warm_audit}, fit_seconds=fit["fit_seconds"],
+        training_reference_costs=fit["reference_costs"],
+        evaluation_reference_costs=evaluation_reference_costs,
+        cost_scope="Original B1/B2 retained attempts charged once; both B2 variants are separate runs. "
+                   "Training references at fit time and evaluation references at summary time are separate; "
+                   "each reference scope is shared by both variants. Interrupted unrecorded work is unknown.",
+        uncertainty_scope="Graph-paired intervals conditional on this frozen training fit; no training-resampling uncertainty.")
+    return summary
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -235,6 +303,19 @@ def main(argv=None):
     plan.add_argument("--library", required=True)
     plan.add_argument("--config", required=True)
     plan.add_argument("--output", required=True)
+    for command in ("fit-b2", "plan-b2"):
+        sub = commands.add_parser(command, help="Fit or freeze B2 using complete original training references")
+        for option in ("batch", "attempts", "references", "output"):
+            sub.add_argument("--" + option, required=True)
+        if command == "fit-b2":
+            sub.add_argument("--regime", choices=("random", "lofo"), default="random")
+            sub.add_argument("--fold", choices=("regular", "er", "ba", "sbm"))
+        else:
+            sub.add_argument("--fit", required=True)
+            sub.add_argument("--config", required=True)
+    warm_summary = commands.add_parser("summarize-b2", help="Read bound B2 and comparable original B1 traces")
+    for option in ("batch", "attempts", "b1-batch", "b1-attempts", "output"):
+        warm_summary.add_argument("--" + option, required=True)
     run = commands.add_parser("run", help="Check only unless --execute is explicit")
     run.add_argument("--batch", required=True)
     run.add_argument("--output", required=True)
@@ -245,7 +326,7 @@ def main(argv=None):
     run.add_argument("--shard-index", type=int, default=0)
     run.add_argument("--shard-count", type=int, default=1)
     run.add_argument("--max-tasks", type=int, help="Maximum actual attempts during this invocation")
-    run.add_argument("--roles", nargs="+", choices=("tier1", "reference", "evaluation", "gradient_diagnostic"))
+    run.add_argument("--roles", nargs="+", choices=("tier1", "reference", "evaluation", "gradient_diagnostic", "warm_start"))
     for command in ("freeze", "summarize"):
         sub = commands.add_parser(command, help="Read existing attempts; no QAOA/solver/grid execution")
         sub.add_argument("--batch", required=True)
@@ -258,6 +339,19 @@ def main(argv=None):
     try:
         if args.command != "run" and Path(args.output).exists():
             raise FileExistsError("Choose a new output path; frozen outputs are not overwritten.")
+        if args.command == "fit-b2":
+            fit = save_b2_fit(args.output, args.batch, args.references, args.attempts, regime=args.regime, fold=args.fold)
+            print(json.dumps({"fit_id": fit["fit_id"], "training_graphs": len(fit["training_graph_ids"])}))
+            return 0
+        if args.command == "plan-b2":
+            manifest = save_b2_batch(args.output, args.fit, args.batch, args.references, args.attempts, read_json(args.config))
+            print(json.dumps({k: manifest[k] for k in ("batch_id", "task_count", "issues")}))
+            return 2 if manifest["issues"] else 0
+        if args.command == "summarize-b2":
+            summary = summarize_b2_batch(args.batch, args.attempts, args.b1_batch, args.b1_attempts)
+            save_summary(args.output, summary)
+            print(json.dumps({"complete": summary["complete"], "comparisons": len(summary["comparisons"])}))
+            return 0 if summary["complete"] else 2
         if args.command == "plan":
             manifest = save_batch(args.output, args.library, read_json(args.config))
             print(json.dumps({key: manifest[key] for key in ("batch_id", "task_count", "counts", "issues", "coverage")}, indent=2))
