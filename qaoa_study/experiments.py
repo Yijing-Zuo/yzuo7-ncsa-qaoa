@@ -228,20 +228,30 @@ def library_issues(library, config):
     return issues
 
 
-def save_batch(directory, library_path, config, *, b2_fit=None, reference_binding=None):
+def save_batch(directory, library_path, config, *, b2_fit=None, reference_binding=None, b3_initializations=None):
     """Freeze task JSONL and metadata. This operation performs no scientific computation."""
     directory, library_path = Path(directory), Path(library_path).resolve()
     library = read_library(library_path)
-    if b2_fit is not None:
+    if b3_initializations is not None:
+        config = {**config, "b3_inputs": {
+            "initialization_set_id": b3_initializations["initialization_set_id"],
+            "initializations_digest": digest(b3_initializations),
+            "initializations_sha256": hashlib.sha256((json.dumps(b3_initializations, indent=2,
+                allow_nan=False) + "\n").encode()).hexdigest(),
+            "reference_binding_digest": digest(reference_binding)}}
+        tasks = build_b3_tasks(library, config, b3_initializations, reference_binding)
+    elif b2_fit is not None:
         config = {**config, "b2_inputs": {"fit_id": b2_fit["fit_id"],
                   "fit_digest": digest(b2_fit), "reference_binding_digest": digest(reference_binding)}}
         tasks = build_b2_tasks(library, config, b2_fit, reference_binding)
     else:
-        if config.get("kind") == "b2":
-            raise ValueError("B2 planning requires a frozen fit and audited reference binding.")
+        if config.get("kind") in ("b2", "b3"):
+            raise ValueError("Warm planning requires frozen initialization inputs and audited reference binding.")
         tasks = build_tasks(library, config)
     content = "".join(json.dumps(task, sort_keys=True, allow_nan=False) + "\n" for task in tasks).encode()
     source = source_identity()
+    if b3_initializations is not None and b3_initializations["source"] != source:
+        raise ValueError("B3 source changed since preparation; prepare again with the final source.")
     identity = {"library_id": library["library_id"], "config": config, "source_id": source["source_id"],
                 "tasks_sha256": hashlib.sha256(content).hexdigest()}
     manifest = {**identity, "batch_id": digest(identity), "source": source,
@@ -254,6 +264,9 @@ def save_batch(directory, library_path, config, *, b2_fit=None, reference_bindin
     directory.mkdir(parents=True, exist_ok=False)
     if b2_fit is not None:
         write_once_json(directory / "fit.json", b2_fit)
+    if b3_initializations is not None:
+        write_once_json(directory / "initializations.json", b3_initializations)
+    if reference_binding is not None:
         write_once_json(directory / "reference_binding.json", reference_binding)
     (directory / "tasks.jsonl").write_bytes(content)
     write_once_json(directory / "manifest.json", manifest)
@@ -294,6 +307,10 @@ def read_batch(directory):
         fit, binding = read_b2_inputs(directory, manifest)
         if build_b2_tasks(library, manifest["config"], fit, binding) != tasks:
             raise ValueError("B2 tasks disagree with frozen fit/reference inputs.")
+    elif manifest["config"].get("kind") == "b3":
+        prepared, binding = read_b3_inputs(directory, manifest)
+        if build_b3_tasks(library, manifest["config"], prepared, binding) != tasks:
+            raise ValueError("B3 tasks disagree with frozen initialization/reference inputs.")
     return manifest, library, tasks
 
 
@@ -308,7 +325,8 @@ def validate_attempt(task, attempt, manifest, execution):
     required = {key: task[key] for key in ("task_id", "library_id", "iso_class_id", "p", "graph_split",
                                           "kind", "experiment_role", "pool", "method", "restart_id",
                                           "seed", "theta0", "protocol_version", "budget")}
-    required.update({key: task[key] for key in ("fit_id", "reference_id", "regime", "fold", "variant") if key in task})
+    required.update({key: task[key] for key in ("fit_id", "reference_id", "regime", "fold", "variant",
+        "rule_id", "initialization_id", "initialization_set_id") if key in task})
     required.update(batch_id=manifest["batch_id"], execution_id=execution["execution_id"], task_digest=digest(task))
     if any(attempt.get(key) != value for key, value in required.items()):
         raise ValueError("Attempt task, protocol, execution settings or initial angles disagree.")
@@ -875,6 +893,10 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
                        "action": "verify_package_metadata_and_device_visibility_before_execution"})
     if source["source_id"] != manifest["source_id"]:
         issues.append({"mismatch": "source_changed_since_planning"})
+    if manifest["config"].get("kind") == "b3":
+        prepared, _ = read_b3_inputs(batch_directory, manifest)
+        if prepared["environment"] != runtime:
+            issues.append({"mismatch": "B3_preparation_environment_changed"})
     report = {"dry_run": not execute, "batch_id": manifest["batch_id"], "planned": len(tasks),
               "shard_tasks": len(work), "issues": issues,
               "completed_scope": "selected_groups" if partitioned else "entire_batch",
@@ -1012,7 +1034,7 @@ def attempt_cost_totals(attempts, *, save_seconds=None):
             "population": "all_retained_attempts_including_execution_faults"}
 
 
-def audit_b2_references(batch, references_directory, attempts_directory, graph_ids):
+def audit_b2_references(batch, references_directory, attempts_directory, graph_ids, *, depths=(1, 2)):
     """Re-derive required frozen references from validated original attempts.
 
     This is a read contract, never permission to resume the source batch.
@@ -1020,8 +1042,10 @@ def audit_b2_references(batch, references_directory, attempts_directory, graph_i
     separate requirement when comparing B1 traces.
     """
     manifest, library, tasks = read_batch(batch)
-    if manifest["config"].get("kind") == "b2":
-        raise ValueError("B2 requires an original B1 reference batch.")
+    if manifest["config"].get("kind") not in (None, "b1"):
+        raise ValueError("Warm initialization requires an original B1 reference batch.")
+    if not depths or len(set(depths)) != len(depths) or not set(depths) <= {1, 2}:
+        raise ValueError("Reference audit needs a nonempty subset of p=1/2.")
     current_source = source_identity()
     for name in ("qaoa_study/qaoa.py", "qaoa_study/exact.py"):
         if manifest["source"]["files"].get(name) != current_source["files"].get(name):
@@ -1033,7 +1057,7 @@ def audit_b2_references(batch, references_directory, attempts_directory, graph_i
     attempts, execution = load_attempts(manifest, tasks, attempts_directory, metadata_only=True,
                                         graph_ids=graph_ids, audit=audit)
     expected = freeze_references(manifest, tasks, select_attempts(attempts))
-    required = {(identity, p) for identity in graph_ids for p in (1, 2)}
+    required = {(identity, p) for identity in graph_ids for p in depths}
     references = {}
     for key in required:
         candidate = expected.get(key)
@@ -1057,10 +1081,11 @@ def audit_b2_references(batch, references_directory, attempts_directory, graph_i
         "interrupted_attempt_ids_in_read_scopes": sorted(set(audit.get("started_attempt_ids", [])) -
                                                           {row["attempt_id"] for row in attempts}),
         "references": [references[key] for key in sorted(required)]}
-    costs = attempt_cost_totals([r for r in attempts if r["experiment_role"] == "reference"],
+    costs = attempt_cost_totals([r for r in attempts if r["experiment_role"] == "reference"
+                                and (r["iso_class_id"], r["p"]) in required],
                                save_seconds=audit.get("save_seconds"))
     costs.update(interrupted_attempt_ids_in_read_scopes=binding["interrupted_attempt_ids_in_read_scopes"],
-                 scope="Completed reference attempts on required graphs; listed interrupted work in read scopes has unknown cost.")
+                 scope="Completed reference attempts on required graph/depth pairs; interrupted work in read scopes has unknown cost.")
     return manifest, library, binding, costs
 
 
@@ -1184,8 +1209,167 @@ def validate_b1_comparison(warm, baseline, warm_execution, baseline_execution):
     for name in ("qaoa_study/qaoa.py", "qaoa_study/exact.py", "qaoa_study/optimize.py"):
         if warm["source"]["files"].get(name) != baseline["source"]["files"].get(name):
             raise ValueError("B1 optimizer/objective source is not comparable.")
-    for key in ("depths", "epsilon", "optimizer"):
-        if warm["config"][key] != baseline["config"][key]:
-            raise ValueError("B1 single-start comparison settings differ.")
+    depths = warm["config"]["depths"]
+    if (not depths or not set(depths) <= set(baseline["config"]["depths"])
+            or warm["config"]["epsilon"] != baseline["config"]["epsilon"]
+            or any(warm["config"]["optimizer"][str(p)] != baseline["config"]["optimizer"][str(p)] for p in depths)):
+        raise ValueError("B1 single-start comparison settings differ.")
     if warm_execution and baseline_execution and warm_execution["environment"] != baseline_execution["environment"]:
-        raise ValueError("B1/B2 numerical environments differ; a new comparable B1 run is required.")
+        raise ValueError("Warm comparison numerical environments differ; comparable runs are required.")
+
+
+def _validate_b3_settings(settings):
+    depths = settings["depths"]
+    if (settings.get("kind") != "b3" or not depths or depths != sorted(set(depths))
+            or any(type(p) is not int or p not in (1, 2) for p in depths) or settings["epsilon"] != 0.5):
+        raise ValueError("B3 requires a nonempty ordered subset of p=1/2 and epsilon=0.5.")
+    cases = settings["comparison_cases"]
+    keys = [(row["regime"], row["fold"]) for row in cases]
+    if (len(set(keys)) != len(keys) or ("random", None) not in keys or
+            any(key != ("random", None) and key not in
+                [("lofo", family) for family in ("regular", "er", "ba", "sbm")] for key in keys)):
+        raise ValueError("B3 comparison cases require random and unique declared LOFO folds.")
+
+
+def save_b3_initializations(output, library_path, settings, *, backend="default.qubit"):
+    """Explicit graph-only preparation; no reference, fit, QNode or optimizer calls.
+
+    Timings are separate from scientific initialization identities. The measured
+    initializer interval includes graph statistics and angle arithmetic together;
+    graph decoding/I/O and the entire preparation interval are reported separately.
+    """
+    from .learning import b3_initialization, select_b2_graphs
+
+    _validate_b3_settings(settings)
+    if Path(output).exists():
+        raise FileExistsError(output)
+    source, runtime = source_identity(), environment(backend)
+    runtime.pop("device_identity")
+    start = perf_counter()
+    library_path = Path(library_path)
+    library = read_library(library_path)
+    graphs = select_b2_graphs(library, "random", None, "evaluation")
+    if not graphs:
+        raise ValueError("B3 evaluation set is empty.")
+    load_seconds = perf_counter() - start
+    entries, graph_timings, initializer_timings = [], [], []
+    for record in graphs:
+        before = perf_counter()
+        graph = graph_from_record(record)
+        graph_timings.append({"iso_class_id": record["iso_class_id"], "seconds": perf_counter() - before})
+        for p in settings["depths"]:
+            before = perf_counter()
+            result = b3_initialization(graph, p)
+            elapsed = perf_counter() - before
+            entry = {"library_id": library["library_id"], "source_id": source["source_id"],
+                     "iso_class_id": record["iso_class_id"], "p": p,
+                     "topology_hash": digest({"n": record["n"], "edges": record["edges"]}), **result}
+            entry["initialization_id"] = digest(entry)
+            entries.append(entry)
+            initializer_timings.append({"initialization_id": entry["initialization_id"], "p": p, "seconds": elapsed})
+    prepared = {"version": "b3-initializations-v1", "library_id": library["library_id"],
+                "library_manifest_sha256": hashlib.sha256((library_path / "manifest.json").read_bytes()).hexdigest(),
+                "split_digest": digest(library["split_summary"]), "depths": settings["depths"],
+                "source": source, "environment": runtime, "initializations": entries,
+                "initialization_set_id": digest([row["initialization_id"] for row in entries]),
+                "preparation": {"library_read_seconds": load_seconds, "graph_decode": graph_timings,
+                    "initializers": initializer_timings, "total_seconds": perf_counter() - start,
+                    "timing_scope": "initializer includes topology statistics and angle arithmetic; shared library read/decode charged once",
+                    "external_p2_constant_optimization_seconds": None,
+                    "external_cost_status": "unmeasured_published_theoretical_proxy_optimization"}}
+    prepared["artifact_id"] = digest(prepared)
+    write_once_json(output, prepared)
+    return prepared
+
+
+def read_b3_inputs(directory, manifest):
+    """Read complete frozen preparation, including measured cost; never redo it."""
+    path = Path(directory) / "initializations.json"
+    prepared = read_json(path)
+    binding = read_json(Path(directory) / "reference_binding.json")
+    expected = {"initialization_set_id": prepared["initialization_set_id"],
+                "initializations_digest": digest(prepared),
+                "initializations_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "reference_binding_digest": digest(binding)}
+    if (manifest["config"].get("b3_inputs") != expected or prepared["source"] != manifest["source"]):
+        raise ValueError("B3 preparation, source or external reference binding changed.")
+    return prepared, binding
+
+
+def build_b3_tasks(library, config, prepared, binding):
+    """Rebuild one task per graph/depth using only frozen initial angles."""
+    from .learning import B3_RULES, select_b2_graphs
+
+    _validate_b3_settings(config)
+    if (prepared.get("version") != "b3-initializations-v1" or
+            digest({k: v for k, v in prepared.items() if k != "artifact_id"}) != prepared.get("artifact_id") or
+            prepared["library_id"] != library["library_id"] or binding["library_id"] != library["library_id"] or
+            prepared["split_digest"] != digest(library["split_summary"]) or prepared["depths"] != config["depths"]):
+        raise ValueError("B3 preparation identity, library, split or depths disagree.")
+    evaluation = select_b2_graphs(library, "random", None, "evaluation")
+    expected = {(graph["iso_class_id"], p) for graph in evaluation for p in config["depths"]}
+    entries = {(row["iso_class_id"], row["p"]): row for row in prepared["initializations"]}
+    refs = {(r["iso_class_id"], r["p"]): r for r in binding["references"]}
+    if (not expected or set(entries) != expected or len(entries) != len(prepared["initializations"])
+            or set(refs) != expected or len(refs) != len(binding["references"])
+            or prepared["initialization_set_id"] != digest([row["initialization_id"] for row in prepared["initializations"]])):
+        raise ValueError("B3 requires exact initialization/reference coverage for every evaluation graph/depth.")
+    if binding["source_config"].get("kind") not in (None, "b1"):
+        raise ValueError("B3 scoring references must come from the original B1 batch.")
+    if type(config["max_attempts"]) is not int or config["max_attempts"] < 1:
+        raise ValueError("B3 requires a positive fixed attempt cap.")
+    tasks = []
+    for graph in evaluation:
+        for p in config["depths"]:
+            row, ref = entries[graph["iso_class_id"], p], refs[graph["iso_class_id"], p]
+            if (row["rule_id"] != B3_RULES[str(p)]["rule_id"] or row["library_id"] != library["library_id"] or
+                    row["source_id"] != prepared["source"]["source_id"] or
+                    row["topology_hash"] != digest({"n": graph["n"], "edges": graph["edges"]}) or
+                    row["initialization_id"] != digest({k: v for k, v in row.items() if k != "initialization_id"}) or
+                    np.shape(row["theta"]) != (2 * p,) or not np.all(np.isfinite(row["theta"]))):
+                raise ValueError("B3 initialization rule, angle or graph identity changed.")
+            if (not ref["complete"] or ref["library_id"] != library["library_id"] or
+                    ref["batch_id"] != binding["source_batch_id"] or
+                    digest({k: v for k, v in ref.items() if k != "reference_id"}) != ref["reference_id"]):
+                raise ValueError("B3 scoring reference is incomplete or changed.")
+            budget = config["optimizer"][str(p)]
+            OptimizerSettings(**budget)
+            if budget != binding["source_config"]["optimizer"][str(p)]:
+                raise ValueError("B3 must use the same optimizer budget as B1 at each depth.")
+            seed = int(digest({"namespace": config["seed_namespace"], "seed": config["seed"],
+                "library_id": library["library_id"], "iso_class_id": graph["iso_class_id"], "p": p,
+                "rule_id": row["rule_id"]})[:32], 16)
+            task = {"task_version": "plan-a-b3-tasks-v1", "library_id": library["library_id"],
+                "iso_class_id": graph["iso_class_id"], "n": graph["n"], "p": p, "graph_split": "evaluation",
+                "kind": "optimization", "experiment_role": "warm_start", "pool": None, "method": "B3",
+                "restart_id": 0, "seed": seed, "theta0": row["theta"], "budget": budget,
+                "protocol_version": config["protocol_version"], "rule_id": row["rule_id"],
+                "initialization_id": row["initialization_id"], "initialization_set_id": prepared["initialization_set_id"],
+                "reference_id": ref["reference_id"]}
+            task["task_id"] = digest(task)
+            tasks.append(task)
+    return sorted(tasks, key=lambda row: row["task_id"])
+
+
+def save_b3_batch(output, initializations_path, batch, references_directory, attempts_directory, settings):
+    """Bind already prepared graph-only starts to audited scoring references."""
+    from .learning import select_b2_graphs
+
+    _validate_b3_settings(settings)
+    prepared = read_json(initializations_path)
+    source, library, _ = read_batch(batch)
+    library_path = (Path(batch) / source["library_path"]).resolve()
+    if prepared["library_manifest_sha256"] != source["library_manifest_sha256"]:
+        raise ValueError("B3 preparation used a different frozen library.")
+    ids = [g["iso_class_id"] for g in select_b2_graphs(library, "random", None, "evaluation")]
+    _, _, binding, _ = audit_b2_references(batch, references_directory, attempts_directory, ids, depths=settings["depths"])
+    inherited = {k: source["config"][k] for k in ("optimizer", "max_attempts", "expected_library",
+                 "require_full_design", "design", "require_split_coverage") if k in source["config"]}
+    if set(settings) & set(inherited):
+        raise ValueError("B3 settings cannot override the source B1 optimizer or library contract.")
+    validate_b1_comparison({"library_id": library["library_id"], "source": prepared["source"],
+                           "config": {**inherited, **settings}}, source,
+                          {"environment": prepared["environment"]},
+                          read_json(Path(attempts_directory) / "manifest.json"))
+    return save_batch(output, library_path, {**inherited, **settings},
+                      b3_initializations=prepared, reference_binding=binding)

@@ -1,0 +1,22 @@
+{
+  "kind": "b3",
+  "protocol_version": "plan-a-b3-single-start-v1",
+  "purpose": "B3 graph-only initialization development candidate; optimizer and retry limits inherited from the bound B1 batch",
+  "production_frozen": false,
+  "depths": [1, 2],
+  "epsilon": 0.5,
+  "seed_namespace": "plan-a-b3-graph-start-v1",
+  "seed": 20260919,
+  "analysis": {
+    "epsilon": 0.5,
+    "bootstrap_seed": 20260912,
+    "bootstrap_samples": 2000
+  },
+  "comparison_cases": [
+    {"regime": "random", "fold": null},
+    {"regime": "lofo", "fold": "regular"},
+    {"regime": "lofo", "fold": "er"},
+    {"regime": "lofo", "fold": "ba"},
+    {"regime": "lofo", "fold": "sbm"}
+  ]
+}

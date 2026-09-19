@@ -1,6 +1,12 @@
-"""Training-only fixed starts under the common unweighted MaxCut symmetries."""
+"""Training-only fixed starts and graph-only theoretical initializations."""
 
+from copy import deepcopy
+import math
+
+import networkx as nx
 import numpy as np
+
+from qaoa_study.graphs import validate_graph
 
 
 _ANGLE_TIE = 32 * np.finfo(np.float64).eps * np.pi
@@ -21,6 +27,83 @@ B2_RULES = {
     "median": "one nearest lift per candidate to frozen medoid; coordinate median; canonicalize once",
     "median_even_count": "arithmetic mean of the two middle coordinates",
 }
+B3_RULES = {
+    "1": {
+        "rule_id": "max-degree-gamma-analytic-beta-v1",
+        "sources": [{"paper": "https://arxiv.org/html/1706.02998v2#S3",
+                     "location": "Theorem 1 and triangle-free regular specialization"}],
+        "derivation": "maximum-degree tree gamma; exact beta maximizer of the p1 formula",
+        "coefficient_order": "sorted (min(deg(u)-1,deg(v)-1),max(deg(u)-1,deg(v)-1),common_neighbors); math.fsum",
+    },
+    "2": {
+        "rule_id": "mean-degree-arctan-infinite-angle-p2-v1",
+        "raw_gamma": [0.3817, 0.6655], "gamma_multiplier": 2.0,
+        "beta": [0.4960, 0.2690],
+        "sources": [
+            {"paper": "https://arxiv.org/html/2110.14206v3#A3",
+             "location": "Eq. (2.3), Appendix C Table 4, q=2 p=2",
+             "code": "https://github.com/benjaminvillalonga/large-girth-maxcut-qaoa/blob/b5bbc23ad4309af12a95666862cd082bddcac0e3/data.csv",
+             "commit": "b5bbc23ad4309af12a95666862cd082bddcac0e3",
+             "sha256": "39b1b0d82d4f8040b68b9e0d1870e0edd4e8e6b3529b7216e1ca4cb173ba8030"},
+            {"paper": "https://arxiv.org/html/2305.15201v3#S6.SS1",
+             "location": "Section 6.1 Eq. (87), unit weights and actual mean degree"}],
+        "convention": "H_author=-sum(ZZ)/sqrt(D); C_project=(m-sum(ZZ))/2; beta unchanged",
+        "precision": "printed four-decimal constants define this rule exactly",
+        "external_optimization_cost": "not measured in this project",
+    },
+}
+
+
+def b3_initialization(graph, p):
+    """Return a deterministic JSON-compatible initial point using only topology.
+
+    p1 fixes gamma by maximum degree and analytically maximizes beta, without
+    searching gamma. p2 rescales external infinite-degree constants by actual
+    mean degree. Both are finite-graph heuristics; neither promises a better
+    optimized endpoint. Preparation timing belongs to the artifact writer.
+    """
+    if type(p) is not int or p not in (1, 2):
+        raise ValueError("B3 supports integer p=1 or p=2 only.")
+    validate_graph(graph)
+    n, m = graph.number_of_nodes(), graph.number_of_edges()
+    if not m or not nx.is_connected(graph):
+        raise ValueError("B3 requires a connected graph with at least one edge.")
+    rule = deepcopy(B3_RULES[str(p)])
+    diagnostics = {"n": n, "m": m}
+    counters = {"analytic_coefficient_passes": int(p == 1), "gamma_search_points": 0,
+                "qnode_calls": 0, "degree_scaling_evaluations": int(p == 2)}
+    if p == 1:
+        degree = dict(graph.degree())
+        maximum = max(degree.values())
+        gamma = math.atan2(1.0, math.sqrt(maximum - 1))
+        cosine, cosine2 = math.cos(gamma), math.cos(2 * gamma)
+        triples = []
+        for u, v in graph.edges():
+            a, b = sorted((degree[u] - 1, degree[v] - 1))
+            triples.append((a, b, len(graph[u].keys() & graph[v].keys())))
+        triples.sort()
+        a_coefficient = math.sin(gamma) / 4 * math.fsum(
+            cosine**a + cosine**b for a, b, _ in triples)
+        triangle_coefficient = math.fsum(
+            cosine**(a + b - 2 * t) * (1 - cosine2**t) for a, b, t in triples) / 4
+        beta = math.atan2(2 * a_coefficient, triangle_coefficient) / 4
+        radius = math.hypot(a_coefficient, triangle_coefficient / 2)
+        theta = [gamma, beta]
+        diagnostics.update({
+            "max_degree": maximum, "gamma": gamma, "A": a_coefficient,
+            "T": triangle_coefficient, "beta": beta,
+            "analytic_initial_cut": m / 2 - triangle_coefficient / 2 + radius,
+            "tree_angle_cut": m / 2 - triangle_coefficient / 2 + a_coefficient,
+            "beta_gain": radius - a_coefficient,
+        })
+    else:
+        mean_degree = 2 * m / n
+        scale = math.atan2(1.0, math.sqrt(mean_degree - 1))
+        theta = [rule["gamma_multiplier"] * value * scale for value in rule["raw_gamma"]]
+        theta += rule["beta"]
+        diagnostics.update({"mean_degree": mean_degree, "gamma_scale": scale})
+    return {"rule_id": rule["rule_id"], "theta": theta, "diagnostics": diagnostics,
+            "provenance": rule, "counters": counters}
 
 
 def _periods(p):

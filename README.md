@@ -4,9 +4,9 @@ Research code for unweighted MaxCut at QAOA depths `p=1,2`: exact cut
 enumeration, analytic p1 scores, statevector expectations and gradients,
 single-run L-BFGS-B optimization, frozen graph libraries, reproducible B1
 task/reference/evaluation pools, read-only labels and diagnostics, and
-training-derived B2 fixed starts with a single-start comparison.
+training-derived B2 fixed starts and graph-only B3 theoretical starts with single-start comparisons.
 Supplied production and pilot configurations are candidates; use the frozen
-batch manifests for adopted settings. Machine learning and B3–B7 remain
+batch manifests for adopted settings. Machine learning and B4–B7 remain
 outside the current implementation.
 
 Use Python 3.12. From the repository root, install the pinned environment
@@ -248,3 +248,48 @@ remain separate. Missing/faulted runs keep their planned denominators and
 suppress formal paired intervals. JSON includes comparisons and first-hit
 curves; Parquet retains graph/restart tables. Unreached median/p90 are null.
 The two variants are never selected by their scores on individual test graphs.
+
+## B3 graph-only starts
+
+B3 uses one deterministic initialization per evaluation graph and depth. At
+p1 it chooses maximum-degree tree gamma and analytically optimizes beta at
+that gamma. At p2 it scales the published infinite-degree angles by the
+arctangent of the inverse square root of actual mean degree minus one.
+The rule and source constants are recorded in each preparation artifact.
+These are finite-graph heuristics, with no general optimality or improvement
+guarantee. They require neither training labels nor target-graph optimization.
+
+Prepare once in the final source and numerical environment, matching the
+original B1/B2 execution environment. Planning checks compatibility with B1
+before execution. Read, dry-run, resume and summary never regenerate angles.
+
+```bash
+python scripts/experiment.py prepare-b3 --library LIBRARY \
+  --config configs/b3-candidate.json --backend default.qubit --output INITIALIZATIONS.json
+python scripts/experiment.py plan-b3 --initializations INITIALIZATIONS.json \
+  --batch B1_BATCH --attempts B1_ATTEMPTS --references B1_REFERENCES \
+  --config configs/b3-candidate.json --output B3_BATCH
+python scripts/experiment.py run --batch B3_BATCH --output B3_ATTEMPTS --partitioned
+# Select the matching backend and explicitly add --execute to run.
+python scripts/experiment.py summarize-b3 --batch B3_BATCH --attempts B3_ATTEMPTS \
+  --b1-batch B1_BATCH --b1-attempts B1_ATTEMPTS \
+  --b2-case B2_RANDOM_BATCH B2_RANDOM_ATTEMPTS \
+  --b2-case B2_REGULAR_BATCH B2_REGULAR_ATTEMPTS \
+  --b2-case B2_ER_BATCH B2_ER_ATTEMPTS \
+  --b2-case B2_BA_BATCH B2_BA_ATTEMPTS \
+  --b2-case B2_SBM_BATCH B2_SBM_ATTEMPTS --output B3_SUMMARY
+```
+
+The candidate declares both depths and all five B2 cases. LOFO reuses B3
+attempts; it creates no new runs. Comparisons include paired complete-call
+differences and intervals, with preparation and reference costs separated by
+depth. External optimization of the published constants is unmeasured,
+not zero. Missing results retain planned denominators and suppress intervals.
+
+`snapshot.py --checkpoint` archives B3 source, library, configuration,
+preparation, complete attempts, summary and a read-only reproduction script.
+It requires `--batch`, `--attempts`, `--summary`, and `--dependencies` in
+addition to the existing `--output`, `--library`, and `--config`. Dependencies
+declare canonical B1/B2 paths and SHA256 values plus the explicit comparison
+input paths; archives are referenced without nesting. Verification with
+`--external-root` additionally checks these separately retained dependencies.

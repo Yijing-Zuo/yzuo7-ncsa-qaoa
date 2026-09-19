@@ -494,30 +494,30 @@ def _warm_hit_curve(pools):
             "provisional": any(pool["provisional"] for pool in pools), "curve": curve, **quantiles}
 
 
-def _warm_comparison(rows, settings):
+def _warm_comparison(rows, settings, *, baseline_method="B1", warm_method="B2", metrics_names=_WARM_METRICS):
     complete = all(row["complete"] for row in rows)
     draws = np.random.default_rng(settings["bootstrap_seed"]).integers(
         len(rows), size=(settings["bootstrap_samples"], len(rows))) if complete and len(rows) > 1 else None
     metrics = {}
-    for name in _WARM_METRICS:
-        baseline = [row["B1"]["metrics"][name] for row in rows]
-        warm = [row["B2"]["metrics"][name] for row in rows]
+    for name in metrics_names:
+        baseline = [row[baseline_method]["metrics"][name] for row in rows]
+        warm = [row[warm_method]["metrics"][name] for row in rows]
         available = all(_finite(value) for value in baseline + warm)
         delta = np.asarray(warm) - np.asarray(baseline) if available else None
         metrics[name] = {
-            "B1": math.fsum(baseline) / len(rows) if all(_finite(v) for v in baseline) else None,
-            "B2": math.fsum(warm) / len(rows) if all(_finite(v) for v in warm) else None,
-            "difference_B2_minus_B1": float(delta.mean()) if available else None,
+            baseline_method: math.fsum(baseline) / len(rows) if all(_finite(v) for v in baseline) else None,
+            warm_method: math.fsum(warm) / len(rows) if all(_finite(v) for v in warm) else None,
+            f"difference_{warm_method}_minus_{baseline_method}": float(delta.mean()) if available else None,
             "paired_bootstrap_ci95": np.quantile(delta[draws].mean(axis=1), [0.025, 0.975]).tolist()
             if available and draws is not None else None,
             "ci_status": "available" if available and draws is not None else
                          "provisional" if not complete else "fewer_than_two_graphs" if len(rows) < 2 else "metric_unavailable",
         }
     return {"graphs": len(rows), "complete": complete, "provisional": not complete,
-            "weighting": "B1 mean within each graph, then equal graph weights; B2 one start per graph",
-            "difference_interpretation": "B2 minus B1; provisional known-success differences are not bounds",
+            "weighting": f"{baseline_method} mean within each graph, then equal graph weights; {warm_method} one start per graph",
+            "difference_interpretation": f"{warm_method} minus {baseline_method}; provisional known-success differences are not bounds",
             "metrics": metrics, "hit_statistics": {
-                method: _warm_hit_curve([row[method] for row in rows]) for method in ("B1", "B2")},
+                method: _warm_hit_curve([row[method] for row in rows]) for method in (baseline_method, warm_method)},
             "bootstrap": {"unit": "paired iso_class_id", "seed": settings["bootstrap_seed"],
                           "samples": settings["bootstrap_samples"], "interval": "percentile 95%",
                           "scope": "mean paired differences; no CI when planned execution/reference incomplete"}}
@@ -601,3 +601,139 @@ def build_warm_summary(library: dict, tasks: list[dict], selected: dict, referen
             "complete": bool(comparisons) and all(row["complete"] for row in comparisons),
             "selected_costs_by_method": {method: _costs([attempt for identity, attempt in attempts.items() if identity in used])
                                          for method, attempts in (("B1", b1_selected), ("B2", selected))}}
+
+
+B3_ANALYSIS_VERSION = "plan-a-b3-comparison-v1"
+
+
+def _b3_pool(rows, method):
+    pool = _warm_pool(rows)
+    calls = _costs(rows)["objective_calls"]
+    pool["metrics"]["objective_calls"] = calls / len(rows) if calls is not None else None
+    if method == "B1":
+        pool["terminal_success_wilson95_restarts"] = (
+            wilson_interval(sum(row["terminal_success"] is True for row in rows), len(rows))
+            if pool["complete"] else None)
+    return pool
+
+
+def _b3_success_intervals(rows, method, settings):
+    """Separate graph-mixture uncertainty from nominal binary-graph Wilson intervals."""
+    pools = [row[method] for row in rows]
+    values = [pool["metrics"]["terminal_success_fraction"] for pool in pools]
+    ready = all(_finite(value) for value in values)
+    complete = all(row["complete"] for row in rows)
+    result = {"planned_graphs": len(rows), "complete": complete,
+              "fraction": math.fsum(values) / len(rows) if ready else None}
+    if method == "B1":
+        draws = np.random.default_rng(settings["bootstrap_seed"]).integers(
+            len(rows), size=(settings["bootstrap_samples"], len(rows))) if complete and len(rows) > 1 else None
+        result.update(graph_bootstrap_ci95=np.quantile(np.asarray(values)[draws].mean(axis=1), [0.025, 0.975]).tolist()
+                      if ready and draws is not None else None,
+                      scope="equal graph weights over within-graph random-restart fractions; no pooled binomial interval")
+    else:
+        successes = sum(int(value) for value in values) if ready else None
+        result.update(known_successes=successes,
+                      wilson95_nominal=wilson_interval(successes, len(rows)) if ready and complete else None,
+                      scope="nominal independent-graph Bernoulli approximation; stratified-design coverage not guaranteed")
+    return result
+
+
+def build_b3_summary(library: dict, tasks: list[dict], selected: dict, references: dict, *,
+                     b1_tasks: list[dict], b1_selected: dict, b2_tasks: list[dict],
+                     b2_selected: dict, settings: dict | None = None) -> dict:
+    """Compare each frozen B3 depth with B1 and both B2 variants in each supplied scope.
+
+    The caller audits batches, fits, source/environment compatibility, reference
+    bindings and required case coverage. Inputs contain only the requested depths.
+    B3 has one global task per evaluation graph/depth; LOFO views reuse that task.
+    This function checks complete planned target sets rather than intersecting them,
+    and keeps missing attempts in their planned denominators. No file or device I/O.
+    """
+    warm = build_warm_summary(library, b2_tasks, b2_selected, references,
+                             b1_tasks=b1_tasks, b1_selected=b1_selected, settings=settings)
+    settings = warm["settings"]
+    graphs = {row["iso_class_id"]: row for row in library["graphs"]
+              if row["tier"] == 2 and row["graph_split"] == "evaluation"}
+    depths = {task["p"] for task in tasks}
+    lookup = {(task["iso_class_id"], task["p"]): task for task in tasks}
+    identities = {task["task_id"] for task in tasks}
+    if (not depths or not depths <= {1, 2} or len(lookup) != len(tasks) or len(identities) != len(tasks)
+            or set(selected) - identities or identities & {row["task_id"] for row in warm["restarts"]}
+            or set(lookup) != {(identity, p) for identity in graphs for p in depths}):
+        raise ValueError("B3 requires exactly one global task per evaluation graph/depth and distinct planned identities.")
+    rules = defaultdict(set)
+    b3_rows = []
+    for key, task in sorted(lookup.items()):
+        reference = references.get(key)
+        if (task["library_id"] != library["library_id"] or task["graph_split"] != "evaluation"
+                or task["method"] != "B3" or task["kind"] != "optimization" or task["experiment_role"] != "warm_start"
+                or task["restart_id"] != 0 or not task.get("rule_id") or not task.get("initialization_id")
+                or (reference is not None and task.get("reference_id") != reference.get("reference_id"))
+                or (task["task_id"] in selected and selected[task["task_id"]]["task_id"] != task["task_id"])):
+            raise ValueError("B3 task, rule, initialization, reference or selected attempt identity disagrees.")
+        rules[task["p"]].add(task["rule_id"])
+        row = _warm_restart(task, selected.get(task["task_id"]), reference, graphs[key[0]], settings["epsilon"])
+        row.update({name: task.get(name) for name in ("rule_id", "initialization_id", "initialization_set_id")})
+        b3_rows.append(row)
+    if any(len(values) != 1 for values in rules.values()):
+        raise ValueError("B3 requires one frozen rule per depth.")
+
+    restart_rows = {row["task_id"]: row for row in (*warm["restarts"], *b3_rows)}
+    b1_groups, scopes = defaultdict(list), defaultdict(list)
+    for row in warm["restarts"]:
+        if row["method"] == "B1":
+            b1_groups[row["iso_class_id"], row["p"]].append(row)
+    for task in b2_tasks:
+        scopes[task["regime"], task["fold"]].append(task)
+    if ("random", None) not in scopes:
+        raise ValueError("B3 comparison requires the declared random B2 case.")
+    b3_pools = {(row["iso_class_id"], row["p"]): _b3_pool([row], "B3") for row in b3_rows}
+    b1_pools = {key: _b3_pool(rows, "B1") for key, rows in b1_groups.items()}
+    graph_rows, comparisons = [], []
+    for (regime, fold), group in sorted(scopes.items(), key=lambda item: repr(item[0])):
+        expected = {identity for identity, graph in graphs.items() if regime == "random"
+                    or (graph["lofo_eligible"] and graph["families"] == [fold])}
+        indexed = {(task["iso_class_id"], task["p"], task["variant"]): task for task in group}
+        if (not expected or len({task["fit_id"] for task in group}) != 1 or len(indexed) != len(group)
+                or set(indexed) != {(identity, p, variant) for identity in expected for p in depths
+                                    for variant in ("medoid", "aligned_median")}):
+            raise ValueError("Each B2 case must provide both variants and every declared graph/depth under one fit.")
+        for p in sorted(depths):
+            for method, variant in (("B1", None), ("B2", "medoid"), ("B2", "aligned_median")):
+                metadata = {"regime": regime, "fold": fold, "p": p, "baseline_method": method,
+                            "variant": variant, "fit_id": group[0]["fit_id"] if method == "B2" else None,
+                            "rule_id": next(iter(rules[p]))}
+                paired = []
+                for identity in sorted(expected):
+                    task = lookup[identity, p]
+                    b2 = indexed[identity, p, variant or "medoid"]
+                    if b2["budget"] != task["budget"]:
+                        raise ValueError("B3 and its B1/B2 comparison need identical optimizer budgets.")
+                    baseline = (b1_pools[identity, p] if method == "B1"
+                                else _b3_pool([restart_rows[b2["task_id"]]], "B2"))
+                    b3 = b3_pools[identity, p]
+                    row = {**metadata, "library_id": library["library_id"], "iso_class_id": identity,
+                           "graph_split": "evaluation", "n": graphs[identity]["n"],
+                           "reference_id": restart_rows[task["task_id"]]["reference_id"],
+                           method: baseline, "B3": b3, "budget": task["budget"],
+                           "complete": baseline["complete"] and b3["complete"],
+                           "provisional": not (baseline["complete"] and b3["complete"])}
+                    paired.append(row)
+                    graph_rows.append(row)
+                comparison = _warm_comparison(paired, settings, baseline_method=method, warm_method="B3",
+                                               metrics_names=(*_WARM_METRICS, "objective_calls"))
+                comparison["success_intervals"] = {name: _b3_success_intervals(paired, name, settings)
+                                                   for name in (method, "B3")}
+                comparisons.append({**metadata, **comparison})
+    used = set(restart_rows)
+    selected_inputs = (("B1", b1_tasks, b1_selected), ("B2", b2_tasks, b2_selected), ("B3", tasks, selected))
+    return {"analysis_version": B3_ANALYSIS_VERSION, "settings": settings, "library_id": library["library_id"],
+            "graph_qaoa": graph_rows, "restarts": list(restart_rows.values()), "diagnostics": [],
+            "comparisons": comparisons, "complete": all(row["complete"] for row in comparisons),
+            "selected_costs_by_method": {method: _costs([row for identity, row in attempts.items() if identity in used])
+                                         for method, _, attempts in selected_inputs},
+            "selected_costs_by_method_depth": {
+                method: {str(p): _costs([attempts[task["task_id"]] for task in planned if task["p"] == p
+                                        and task["task_id"] in attempts and task["task_id"] in used]) for p in sorted(depths)}
+                for method, planned, attempts in selected_inputs}}
