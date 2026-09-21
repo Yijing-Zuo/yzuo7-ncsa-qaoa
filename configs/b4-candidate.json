@@ -1,0 +1,21 @@
+{
+  "kind": "b4",
+  "protocol_version": "plan-a-b4-ridge-v1",
+  "purpose": "B4 Ridge candidate; frozen original B1 optimizer and reference pools, no automatic research execution",
+  "production_frozen": false,
+  "depths": [1, 2],
+  "epsilon": 0.5,
+  "seed_namespace": "plan-a-b4-ridge-start-v1",
+  "seed": 20260921,
+  "feature_groups": ["L", "U", "F", "J+U", "J+U+S"],
+  "shuffle_seeds": [20260922, 20260923, 20260924],
+  "learning": {"development": false, "random_n_splits": 5},
+  "analysis": {"epsilon": 0.5, "bootstrap_seed": 20260912, "bootstrap_samples": 2000},
+  "comparison_cases": [
+    {"regime": "random", "fold": null},
+    {"regime": "lofo", "fold": "regular"},
+    {"regime": "lofo", "fold": "er"},
+    {"regime": "lofo", "fold": "ba"},
+    {"regime": "lofo", "fold": "sbm"}
+  ]
+}

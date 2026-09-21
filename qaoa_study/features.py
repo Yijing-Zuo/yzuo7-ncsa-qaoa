@@ -6,7 +6,7 @@ Spectral moments are tr(A**k)/n, not normalized-Laplacian moments. Definitions
 are frozen by FEATURE_VERSION; no generator, partition or QAOA metadata is read.
 """
 
-from math import fsum
+from math import fsum, isfinite
 
 import networkx as nx
 import numpy as np
@@ -138,3 +138,118 @@ def graph_features(graph: nx.Graph) -> dict:
         if order < 4:
             power = power @ adjacency
     return {"values": values, "missing": missing}
+
+
+B4_FEATURE_VERSION = "b4-features-v1"
+B4_GROUPS = ("L", "U", "F", "J+U", "J+U+S")
+B4_JOINT_TYPES = tuple((a, b, c) for a in range(23)
+                       for b in range(a, 23) for c in range(a + 1))
+_B4_JOINT_INDEX = {kind: index for index, kind in enumerate(B4_JOINT_TYPES)}
+_B4_JOINT_NAMES = tuple(f"joint_edge_frequency_{a}_{b}_{c}" for a, b, c in B4_JOINT_TYPES)
+_B4_MISSING = "degree_assortativity_missing"
+_B4_MISSING_REASON = "constant_edge_endpoint_degree"
+
+
+def b4_feature_names(group: str) -> tuple:
+    """Return the frozen complete schema, before training-only constant masking."""
+    if group not in B4_GROUPS:
+        raise ValueError(f"Unknown B4 feature group: {group}")
+    base = LOCAL_FEATURES if group == "L" else ML_FEATURES[:14]
+    if group in ("F", "J+U+S"):
+        base = ML_FEATURES
+    joint = _B4_JOINT_NAMES if group.startswith("J+") else ()
+    return joint + base + (_B4_MISSING,)
+
+
+def _b4_values(values, missing):
+    """Validate original scalars; only declared assortativity null is missing."""
+    if (not isinstance(values, dict) or not isinstance(missing, dict)
+            or not set(ML_FEATURES).issubset(values)):
+        raise ValueError("B4 requires all original feature columns and missingness declarations.")
+    declared = {"degree_assortativity": _B4_MISSING_REASON}
+    if missing not in ({}, declared):
+        raise ValueError("Only declared constant-degree assortativity may be missing in B4.")
+    for name in ML_FEATURES:
+        value = values[name]
+        if value is None:
+            if name != "degree_assortativity" or missing != declared:
+                raise ValueError(f"Unexpected missing B4 feature: {name}")
+        elif isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+            raise ValueError(f"B4 feature must be finite numeric or a declared null: {name}")
+    if bool(missing) != (values["degree_assortativity"] is None):
+        raise ValueError("B4 assortativity value and missingness declaration disagree.")
+    n, m = values["n"], values["m"]
+    if (int(n) != n or not 4 <= n <= 24 or int(m) != m
+            or not n - 1 <= m <= n * (n - 1) // 2):
+        raise ValueError("B4 requires simple connected graphs with 4 <= n <= 24.")
+
+
+def b4_feature_row(graph: nx.Graph, stored_features=None) -> dict:
+    """Create a graph-only sidecar row without modifying historical features.
+
+    Optional stored_features has graph_features' {values, missing} structure;
+    it is checked against the topology and retains the frozen original scalars.
+    The connected normalized-L mean is then exactly one in this new sidecar.
+    Callers attach library graph IDs, topology hashes and split provenance.
+    """
+    validate_graph(graph)
+    if not 4 <= len(graph) <= 24 or not nx.is_connected(graph):
+        raise ValueError("B4 requires simple connected graphs with 4 <= n <= 24.")
+    computed = graph_features(graph)
+    selected = computed if stored_features is None else stored_features
+    _b4_values(selected["values"], selected["missing"])
+    if selected["missing"] != computed["missing"]:
+        raise ValueError("Stored B4 feature missingness disagrees with topology.")
+    for name in ML_FEATURES:
+        actual, expected = selected["values"][name], computed["values"][name]
+        if (expected is None and actual is not None) or (
+                expected is not None and (actual is None or abs(actual - expected) > 1e-10)):
+            raise ValueError(f"Stored B4 feature disagrees with topology: {name}")
+    degree = dict(graph.degree())
+    counts = [0] * len(B4_JOINT_TYPES)
+    for u, v in graph.edges:
+        a, b = sorted((degree[u] - 1, degree[v] - 1))
+        counts[_B4_JOINT_INDEX[(a, b, len(set(graph[u]) & set(graph[v])))]] += 1
+    parities = {value % 2 for value in degree.values()}
+    values = {name: selected["values"][name] for name in ML_FEATURES}
+    values["normalized_laplacian_mean"] = 1.0
+    return {"feature_version": B4_FEATURE_VERSION, "values": values,
+            "missing": dict(selected["missing"]), "joint_counts": counts,
+            "degree_parity": "even" if parities == {0} else "odd" if parities == {1} else "mixed"}
+
+
+def b4_feature_matrix(rows, group: str) -> np.ndarray:
+    """Build float64 inputs; legitimate assortativity null alone becomes NaN.
+
+    The learner must fit its imputer on training rows. An input NaN/Inf is an
+    error, distinct from a declared JSON null. Joint frequencies retain all
+    2300 positions, including impossible and training-unseen types.
+    """
+    names = b4_feature_names(group)
+    matrix = np.empty((len(rows), len(names)), dtype=np.float64)
+    for index, row in enumerate(rows):
+        if row.get("feature_version") != B4_FEATURE_VERSION:
+            raise ValueError("Unsupported B4 feature version.")
+        values, missing, counts = row["values"], row["missing"], row["joint_counts"]
+        _b4_values(values, missing)
+        n, m = values["n"], values["m"]
+        if (len(counts) != len(B4_JOINT_TYPES)
+                or any(type(count) is not int or count < 0 for count in counts)
+                or sum(counts) != m):
+            raise ValueError("B4 joint counts require 2300 nonnegative integers summing to m.")
+        active = [(kind, count) for kind, count in zip(B4_JOINT_TYPES, counts) if count]
+        if any(a + b - c > n - 2 or (a, b, c) == (0, 0, 0) for (a, b, c), _ in active):
+            raise ValueError("B4 joint counts contain an impossible connected-graph type.")
+        if abs(fsum(count * (1 / (a + 1) + 1 / (b + 1))
+                    for (a, b, c), count in active) - n) > 1e-10:
+            raise ValueError("B4 joint counts disagree with vertex count.")
+        parity = {(d + 1) % 2 for (a, b, c), _ in active for d in (a, b)}
+        expected_parity = "even" if parity == {0} else "odd" if parity == {1} else "mixed"
+        if row.get("degree_parity") != expected_parity or values["normalized_laplacian_mean"] != 1.0:
+            raise ValueError("B4 parity or exact normalized-L constant is inconsistent.")
+        vector = [count / m for count in counts] if group.startswith("J+") else []
+        original = names[len(vector):-1]
+        vector.extend(np.nan if values[name] is None else values[name] for name in original)
+        vector.append(float(bool(missing)))
+        matrix[index] = vector
+    return matrix

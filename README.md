@@ -293,3 +293,50 @@ addition to the existing `--output`, `--library`, and `--config`. Dependencies
 declare canonical B1/B2 paths and SHA256 values plus the explicit comparison
 input paths; archives are referenced without nesting. Verification with
 `--external-root` additionally checks these separately retained dependencies.
+
+## B4 Ridge initialization
+
+B4 predicts one angle vector from topology features, then uses the same B1
+optimizer and budget. A separate scalar Ridge predicts the original 50-restart
+success rate; it never selects an angle or adds a restart. Both heads use only
+the frozen global training graphs. Inner CV refits preprocessing and the angle
+anchor. Gamma uses sin/cos, beta uses sin(4 beta)/cos(4 beta), with joint sign
+and the graph's applicable exact degree-parity symmetries.
+
+The candidate fixes five groups: L, U, F=U+S, J+U, J+U+S. J is a complete p1
+joint-edge dictionary, not a sufficient p2 description. Spectral-group gains
+measure representation utility, not uniquely nonlocal information. Three
+random/F whole-row shuffles are descriptive controls. The full declaration
+has 56 angle models, 56 success models and 5,200 single-start tasks.
+
+```bash
+python scripts/experiment.py fit-b4 --batch B1_BATCH --attempts B1_ATTEMPTS \
+  --references B1_REFERENCES --config configs/b4-candidate.json --output B4_FITS
+python scripts/experiment.py predict-b4 --fits B4_FITS --library ORIGINAL_LIBRARY \
+  --output B4_PREDICTIONS.json
+python scripts/experiment.py plan-b4 --batch B1_BATCH --attempts B1_ATTEMPTS \
+  --references B1_REFERENCES --predictions B4_PREDICTIONS.json \
+  --config configs/b4-candidate.json --output B4_BATCH
+```
+
+`fit-b4` resumes complete model files after checking frozen inputs; other
+artifacts are create-only. `run` uses the existing worker, with `--execute`
+required. `summarize-b4` takes B4 `--batch/--attempts`, original
+`--b1-batch/--b1-attempts`, all five `--b2-case BATCH ATTEMPTS` pairs,
+`--b3-batch/--b3-attempts`, and `--output`. It reports full first-hit curves,
+terminal quality, calls, prediction errors and paired graph intervals. Missing
+attempts retain planned denominators and make the result provisional.
+
+CPU learning dependencies are pinned separately from the historical compute
+environment fingerprint. Prediction/task planning does not retrain a model or
+evaluate candidate angles. `snapshot.py --checkpoint-b4 --fits B4_FITS` adds the
+complete feature/training/model artifacts to the existing checkpoint workflow;
+its dependencies must name canonical B1/B2/B3 archives. Complete checkpoint
+creation rejects incomplete summaries. Formal pools/GPU execution remain
+explicit user operations, separate from local CPU validation.
+
+Optional repeated `--support PATH` includes explicitly selected B4 run/driver
+or backend-validation evidence inside the checkpoint; paths must stay inside
+the project and cannot include the whole project or previous canonical archives.
+CV and final fitting are timed separately. Unmeasured historical/offline I/O
+costs are reported as unknown, rather than treated as zero.

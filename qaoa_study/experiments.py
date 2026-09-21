@@ -228,11 +228,16 @@ def library_issues(library, config):
     return issues
 
 
-def save_batch(directory, library_path, config, *, b2_fit=None, reference_binding=None, b3_initializations=None):
+def save_batch(directory, library_path, config, *, b2_fit=None, reference_binding=None, b3_initializations=None,
+               b4_prepared=None):
     """Freeze task JSONL and metadata. This operation performs no scientific computation."""
     directory, library_path = Path(directory), Path(library_path).resolve()
     library = read_library(library_path)
-    if b3_initializations is not None:
+    if b4_prepared is not None:
+        config = {**config, "b4_inputs": {"preparation_id": b4_prepared["preparation_id"],
+                  "prepared_digest": digest(b4_prepared), "reference_binding_digest": digest(reference_binding)}}
+        tasks = build_b4_tasks(library, config, b4_prepared, reference_binding)
+    elif b3_initializations is not None:
         config = {**config, "b3_inputs": {
             "initialization_set_id": b3_initializations["initialization_set_id"],
             "initializations_digest": digest(b3_initializations),
@@ -245,13 +250,15 @@ def save_batch(directory, library_path, config, *, b2_fit=None, reference_bindin
                   "fit_digest": digest(b2_fit), "reference_binding_digest": digest(reference_binding)}}
         tasks = build_b2_tasks(library, config, b2_fit, reference_binding)
     else:
-        if config.get("kind") in ("b2", "b3"):
+        if config.get("kind") in ("b2", "b3", "b4"):
             raise ValueError("Warm planning requires frozen initialization inputs and audited reference binding.")
         tasks = build_tasks(library, config)
     content = "".join(json.dumps(task, sort_keys=True, allow_nan=False) + "\n" for task in tasks).encode()
     source = source_identity()
     if b3_initializations is not None and b3_initializations["source"] != source:
         raise ValueError("B3 source changed since preparation; prepare again with the final source.")
+    if b4_prepared is not None and b4_prepared["source"] != source:
+        raise ValueError("B4 source changed since preparation; use the final frozen source.")
     identity = {"library_id": library["library_id"], "config": config, "source_id": source["source_id"],
                 "tasks_sha256": hashlib.sha256(content).hexdigest()}
     manifest = {**identity, "batch_id": digest(identity), "source": source,
@@ -266,6 +273,8 @@ def save_batch(directory, library_path, config, *, b2_fit=None, reference_bindin
         write_once_json(directory / "fit.json", b2_fit)
     if b3_initializations is not None:
         write_once_json(directory / "initializations.json", b3_initializations)
+    if b4_prepared is not None:
+        write_once_json(directory / "prepared.json", b4_prepared)
     if reference_binding is not None:
         write_once_json(directory / "reference_binding.json", reference_binding)
     (directory / "tasks.jsonl").write_bytes(content)
@@ -311,6 +320,10 @@ def read_batch(directory):
         prepared, binding = read_b3_inputs(directory, manifest)
         if build_b3_tasks(library, manifest["config"], prepared, binding) != tasks:
             raise ValueError("B3 tasks disagree with frozen initialization/reference inputs.")
+    elif manifest["config"].get("kind") == "b4":
+        prepared, binding = read_b4_inputs(directory, manifest)
+        if build_b4_tasks(library, manifest["config"], prepared, binding) != tasks:
+            raise ValueError("B4 tasks disagree with frozen prediction/reference inputs.")
     return manifest, library, tasks
 
 
@@ -897,6 +910,10 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
         prepared, _ = read_b3_inputs(batch_directory, manifest)
         if prepared["environment"] != runtime:
             issues.append({"mismatch": "B3_preparation_environment_changed"})
+    if manifest["config"].get("kind") == "b4":
+        prepared, _ = read_b4_inputs(batch_directory, manifest)
+        if prepared["compute_environment"] != runtime:
+            issues.append({"mismatch": "B4_bound_compute_environment_changed"})
     report = {"dry_run": not execute, "batch_id": manifest["batch_id"], "planned": len(tasks),
               "shard_tasks": len(work), "issues": issues,
               "completed_scope": "selected_groups" if partitioned else "entire_batch",
@@ -1373,3 +1390,423 @@ def save_b3_batch(output, initializations_path, batch, references_directory, att
                           read_json(Path(attempts_directory) / "manifest.json"))
     return save_batch(output, library_path, {**inherited, **settings},
                       b3_initializations=prepared, reference_binding=binding)
+
+
+def b4_specifications(settings):
+    """The complete predeclared design; development subsets never become production."""
+    from .features import B4_GROUPS
+
+    _validate_b3_settings({**settings, "kind": "b3"})
+    if settings.get("kind") != "b4" or settings["depths"] != [1, 2]:
+        raise ValueError("B4 requires both depths and its own study kind.")
+    groups, seeds = settings["feature_groups"], settings["shuffle_seeds"]
+    if (not groups or len(set(groups)) != len(groups) or not set(groups) <= set(B4_GROUPS)
+            or len(set(seeds)) != len(seeds) or any(type(s) is not int for s in seeds)):
+        raise ValueError("Invalid or repeated B4 feature groups/shuffle seeds.")
+    learning = settings.get("learning", {})
+    if set(learning) - {"development", "random_n_splits"}:
+        raise ValueError("B4 learning settings cannot override the adopted rules.")
+    if not learning.get("development", False):
+        cases = [{"regime": "random", "fold": None}] + [
+            {"regime": "lofo", "fold": family} for family in ("regular", "er", "ba", "sbm")]
+        if (groups != list(B4_GROUPS) or seeds != [20260922, 20260923, 20260924]
+                or settings["comparison_cases"] != cases or learning.get("random_n_splits", 5) != 5):
+            raise ValueError("Production B4 requires the complete approved five-group/five-scope design.")
+    specs = [{**case, "group": group, "shuffle_seed": None, "p": p}
+             for case in settings["comparison_cases"] for group in groups for p in (1, 2)]
+    if seeds and "F" not in groups:
+        raise ValueError("The shuffled control belongs to the F feature group.")
+    specs += [{"regime": "random", "fold": None, "group": "F", "shuffle_seed": seed, "p": p}
+              for seed in seeds for p in (1, 2)]
+    return specs
+
+
+def _b4_check_identity(value, key):
+    if value.get(key) != digest({k: v for k, v in value.items() if k != key}):
+        raise ValueError(f"B4 {key} checksum mismatch.")
+
+
+def _b4_training_labels(manifest, tasks, attempts_directory, binding, ids):
+    """Use complete original evaluation pools on training graphs, never held-out labels."""
+    if manifest["config"]["evaluation_restarts"] != 50:
+        raise ValueError("B4 success labels require all 50 original evaluation restarts.")
+    refs = {(r["iso_class_id"], r["p"]): r for r in binding["references"]}
+    audit = {}
+    attempts, execution = load_attempts(manifest, tasks, attempts_directory, metadata_only=True, graph_ids=ids, audit=audit)
+    selected = select_attempts(attempts)
+    labels = []
+    for identity in ids:
+        for p in (1, 2):
+            planned = [t for t in tasks if t["iso_class_id"] == identity and t["p"] == p
+                       and t["experiment_role"] == "evaluation"]
+            rows = [selected.get(t["task_id"]) for t in planned]
+            if (len(planned) != 50 or {t["restart_id"] for t in planned} != set(range(50))
+                    or any(r is None or execution_failed(r) or not r.get("run_completed") for r in rows)):
+                raise ValueError(f"B4 needs every successful execution receipt in the training pool: {identity}, p={p}.")
+            reference = refs[identity, p]
+            successes = sum(r["C_final"] >= reference["C_ref"] - .5 for r in rows)
+            labels.append({"iso_class_id": identity, "p": p, "successes": successes, "trials": 50,
+                           "reference_id": reference["reference_id"],
+                           "attempt_ids": [r["attempt_id"] for r in rows]})
+    used = [r for r in attempts if r["experiment_role"] == "evaluation" and r["iso_class_id"] in ids]
+    costs = {**attempt_cost_totals(used, save_seconds=audit.get("save_seconds")),
+             "attempt_ids": sorted(r["attempt_id"] for r in used),
+             "scope": "Original training-graph evaluation pools, shared once across both heads/models; no additional QAOA."}
+    return labels, execution, costs
+
+
+def save_b4_fits(output, batch, references_directory, attempts_directory, settings):
+    """Fit the declared CPU models, resuming only complete immutable model artifacts.
+
+    Features are topology-only; only original global-training reference/outcome
+    rows are loaded here. An interrupted fit restarts from scratch, not optimizer
+    state. No quantum circuit is evaluated by this function.
+    """
+    from threadpoolctl import threadpool_limits
+    from .features import B4_FEATURE_VERSION, b4_feature_row
+    from .learning import fit_b4_model, select_b2_graphs, validate_b4_model
+
+    specs = b4_specifications(settings)
+    output = Path(output)
+    artifact_writes = {}
+
+    def save_artifact(path, value):
+        start = perf_counter()
+        write_once_json(path, value)
+        artifact_writes[Path(path).relative_to(output).as_posix()] = perf_counter() - start
+
+    manifest, library, tasks = read_batch(batch)
+    source = source_identity()
+    training = select_b2_graphs(library, "random", None, "training")
+    ids = [g["iso_class_id"] for g in training]
+    if not ids:
+        raise ValueError("B4 training set is empty.")
+    setup = {"version": "b4-fitting-v1", "source": source, "settings": settings,
+             "library_id": library["library_id"], "library_manifest_sha256": manifest["library_manifest_sha256"],
+             "split_digest": digest(library["split_summary"]), "source_batch_id": manifest["batch_id"],
+             "reference_manifest_sha256": hashlib.sha256((Path(references_directory) / "manifest.json").read_bytes()).hexdigest(),
+             "execution_manifest_sha256": hashlib.sha256((Path(attempts_directory) / "manifest.json").read_bytes()).hexdigest()}
+    output.mkdir(parents=True, exist_ok=True)
+    with _writer_lock(output):
+        if (output / "setup.json").exists():
+            if read_json(output / "setup.json") != setup:
+                raise ValueError("B4 fit resume source/library/configuration changed.")
+        else:
+            if any(output.iterdir()):
+                # The writer lock may create its own advisory lock file.
+                unexpected = [f for f in output.iterdir() if f.name != "writer.lock"]
+                if unexpected:
+                    raise ValueError("B4 fitting directory contains unbound files.")
+            save_artifact(output / "setup.json", setup)
+        if (output / "manifest.json").exists():
+            return read_b4_fits(output)
+        feature_path = output / "features.json"
+        if feature_path.exists():
+            features = read_json(feature_path)
+            _b4_check_identity(features, "feature_artifact_id")
+        else:
+            start = perf_counter()
+            rows = []
+            for graph in library["graphs"]:
+                if graph["tier"] != 2:
+                    continue
+                row = b4_feature_row(graph_from_record(graph), stored_features={
+                    "values": graph["features"], "missing": graph["feature_missing"]})
+                rows.append({**row, "iso_class_id": graph["iso_class_id"],
+                             "topology_hash": digest({"n": graph["n"], "edges": graph["edges"]})})
+            features = {"version": B4_FEATURE_VERSION, "library_id": library["library_id"],
+                        "split_digest": setup["split_digest"], "rows": sorted(rows, key=lambda r: r["iso_class_id"]),
+                        "construction_seconds": perf_counter() - start,
+                        "historical_feature_seconds": None, "source": source}
+            features["feature_artifact_id"] = digest(features)
+            save_artifact(feature_path, features)
+        _, _, binding, costs = audit_b2_references(batch, references_directory, attempts_directory, ids)
+        labels, execution, label_costs = _b4_training_labels(manifest, tasks, attempts_directory, binding, ids)
+        training_data = {"reference_binding": binding, "reference_costs": costs, "success_labels": labels,
+                         "success_label_costs": label_costs}
+        training_path = output / "training.json"
+        if training_path.exists():
+            saved = read_json(training_path)
+            if saved != training_data:
+                raise ValueError("Original B4 training references/outcomes changed on resume.")
+        else:
+            save_artifact(training_path, training_data)
+        learning_environment = {"python": platform.python_version(),
+            "packages": {name: version(name) for name in ("numpy", "scipy", "scikit-learn", "joblib", "threadpoolctl")},
+            "blas_threads": 1, "thread_limit": "threadpoolctl context during fitting"}
+        feature_lookup = {r["iso_class_id"]: r for r in features["rows"]}
+        model_paths = []
+        (output / "models").mkdir(exist_ok=True)
+        for spec in specs:
+            graphs = select_b2_graphs(library, spec["regime"], spec["fold"], "training")
+            wanted = {g["iso_class_id"] for g in graphs}
+            candidates = [{"iso_class_id": r["iso_class_id"], "theta": r["source"]["theta"],
+                           "reference_id": r["reference_id"], "source": r["source"]}
+                          for r in binding["references"] if r["p"] == spec["p"] and r["iso_class_id"] in wanted]
+            outcomes = [r for r in labels if r["p"] == spec["p"] and r["iso_class_id"] in wanted]
+            for head in ("angles", "success"):
+                name = "models/" + digest({**spec, "head": head}) + ".json"
+                model_paths.append(name)
+                path = output / name
+                if path.exists():
+                    model = read_json(path)
+                    _b4_check_identity(model, "fit_id")
+                    validate_b4_model(model)
+                    if (model["source"] != source or model["training_binding_digest"] != digest(training_data)
+                            or model["learning_environment"] != learning_environment
+                            or any(model.get(k) != v for k, v in {**spec, "head": head}.items())):
+                        raise ValueError("B4 saved model no longer matches its fitting inputs.")
+                    continue
+                start = perf_counter()
+                with threadpool_limits(limits=1):
+                    model = fit_b4_model(graphs, [feature_lookup[g["iso_class_id"]] for g in graphs],
+                        candidates, outcomes, **spec, head=head, settings=settings.get("learning"))
+                model.update(source=source, library_id=library["library_id"], split_digest=setup["split_digest"],
+                    training_binding_digest=digest(training_data), feature_artifact_id=features["feature_artifact_id"],
+                    learning_environment=learning_environment, fit_seconds=perf_counter() - start)
+                model["fit_id"] = digest(model)
+                validate_b4_model(model)
+                save_artifact(path, model)
+        if source_identity() != source:
+            raise ValueError("Source changed while fitting; do not finalize this B4 fit set.")
+        names = ["setup.json", "features.json", "training.json", *model_paths]
+        result = {**setup, "model_files": model_paths, "compute_environment": execution["environment"],
+                  "artifact_io": {"write_seconds_by_file": artifact_writes,
+                      "unmeasured_preexisting_files": sorted(set(names) - set(artifact_writes)),
+                      "read_and_manifest_write_seconds": None,
+                      "scope": "Measured immutable artifact writes in the final fitting invocation only; "
+                               "reads, final manifest and interrupted earlier invocations are unmeasured."},
+                  "files": {name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in names}}
+        result["fit_set_id"] = digest(result)
+        write_once_json(output / "manifest.json", result)
+    return read_b4_fits(output)
+
+
+def _b4_fit_manifest(manifest):
+    """Require a complete portable inventory, including every declared model."""
+    _b4_check_identity(manifest, "fit_set_id")
+    specs = [{**s, "head": head} for s in b4_specifications(manifest["settings"])
+             for head in ("angles", "success")]
+    names = ["models/" + digest(s) + ".json" for s in specs]
+    if (manifest.get("version") != "b4-fitting-v1" or manifest["model_files"] != names
+            or set(manifest["files"]) != {"setup.json", "features.json", "training.json", *names}):
+        raise ValueError("B4 fit manifest must bind every planned artifact exactly once.")
+    return specs
+
+
+def read_b4_fits(directory):
+    """Read immutable numeric models with both byte and semantic validation."""
+    from .features import B4_FEATURE_VERSION, b4_feature_matrix
+    from .learning import _b4_settings, validate_b4_model
+
+    directory = Path(directory)
+    manifest = read_json(directory / "manifest.json")
+    expected_specs = _b4_fit_manifest(manifest)
+    for name, expected in manifest["files"].items():
+        path = (directory / name).resolve()
+        if not path.is_relative_to(directory.resolve()) or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise ValueError("B4 fitting file checksum/path mismatch.")
+    models = [read_json(directory / name) for name in manifest["model_files"]]
+    features, training = read_json(directory / "features.json"), read_json(directory / "training.json")
+    _b4_check_identity(features, "feature_artifact_id")
+    setup = read_json(directory / "setup.json")
+    if (any(manifest.get(k) != v for k, v in setup.items())
+            or features.get("version") != B4_FEATURE_VERSION
+            or any(features.get(k) != manifest[k] for k in ("source", "library_id", "split_digest"))
+            or len({r["iso_class_id"] for r in features["rows"]}) != len(features["rows"])
+            or training["reference_binding"]["library_id"] != manifest["library_id"]
+            or training["reference_binding"]["source_batch_id"] != manifest["source_batch_id"]):
+        raise ValueError("B4 feature/training sidecar provenance changed.")
+    b4_feature_matrix(features["rows"], "F")
+    for model, spec in zip(models, expected_specs, strict=True):
+        _b4_check_identity(model, "fit_id")
+        validate_b4_model(model)
+        if (any(model.get(k) != v for k, v in spec.items()) or model["source"] != manifest["source"]
+                or model["library_id"] != manifest["library_id"] or model["split_digest"] != manifest["split_digest"]
+                or model["settings"] != _b4_settings(manifest["settings"].get("learning"))
+                or model["training_binding_digest"] != digest(training)
+                or model["feature_artifact_id"] != features["feature_artifact_id"]):
+            raise ValueError("B4 model identity/design/provenance changed.")
+    return {"manifest": manifest, "features": features, "training": training, "models": models}
+
+
+def save_b4_predictions(output, fits_directory, library_path):
+    """Freeze one prediction per target before binding any evaluation references."""
+    from .learning import predict_b4_model, select_b2_graphs
+
+    if Path(output).exists():
+        raise FileExistsError(output)
+    loaded = read_b4_fits(fits_directory)
+    manifest, models = loaded["manifest"], loaded["models"]
+    library = read_library(library_path)
+    if (library["library_id"] != manifest["library_id"] or digest(library["split_summary"]) != manifest["split_digest"]
+            or hashlib.sha256((Path(library_path) / "manifest.json").read_bytes()).hexdigest() != manifest["library_manifest_sha256"]
+            or source_identity() != manifest["source"]):
+        raise ValueError("B4 prediction source/library changed since fitting.")
+    rows = {r["iso_class_id"]: r for r in loaded["features"]["rows"]}
+    topology = {g["iso_class_id"]: digest({"n": g["n"], "edges": g["edges"]})
+                for g in library["graphs"] if g["tier"] == 2}
+    if set(rows) != set(topology) or any(rows[k]["topology_hash"] != v for k, v in topology.items()):
+        raise ValueError("B4 feature sidecar must cover exactly the frozen Tier2 topologies.")
+    predictions, timings = [], []
+    for index in range(0, len(models), 2):
+        angle, success = models[index:index + 2]
+        targets = select_b2_graphs(library, angle["regime"], angle["fold"], "evaluation")
+        if not targets:
+            raise ValueError("B4 evaluation scope is empty.")
+        features = [rows[g["iso_class_id"]] for g in targets]
+        start = perf_counter()
+        initial = predict_b4_model(angle, features)
+        probabilities = predict_b4_model(success, features)
+        timings.append({"fit_id": angle["fit_id"], "success_fit_id": success["fit_id"],
+                        "graphs": len(targets), "prediction_seconds": perf_counter() - start})
+        for graph, point, probability in zip(targets, initial, probabilities, strict=True):
+            row = {**point, "success_probability": probability["success_probability"],
+                   "raw_success_prediction": probability["raw_prediction"],
+                   "iso_class_id": graph["iso_class_id"], "p": angle["p"], "regime": angle["regime"],
+                   "fold": angle["fold"], "feature_group": angle["group"], "shuffle_seed": angle["shuffle_seed"],
+                   "fit_id": angle["fit_id"], "success_fit_id": success["fit_id"],
+                   "feature_artifact_id": loaded["features"]["feature_artifact_id"],
+                   "topology_hash": rows[graph["iso_class_id"]]["topology_hash"]}
+            row["prediction_id"] = digest(row)
+            predictions.append(row)
+    prepared = {"version": "b4-prepared-v1", "library_id": library["library_id"],
+        "library_manifest_sha256": manifest["library_manifest_sha256"], "split_digest": manifest["split_digest"],
+        "source": manifest["source"], "settings": manifest["settings"], "fit_set_id": manifest["fit_set_id"],
+        "fit_set_manifest": manifest, "compute_environment": manifest["compute_environment"],
+        "feature_artifact_id": loaded["features"]["feature_artifact_id"], "models": models,
+        "training_binding": loaded["training"]["reference_binding"],
+        "training_reference_costs": loaded["training"]["reference_costs"],
+        "success_label_costs": loaded["training"]["success_label_costs"],
+        "feature_costs": {k: loaded["features"][k] for k in ("construction_seconds", "historical_feature_seconds")},
+        "artifact_io": {"fitting": manifest["artifact_io"], "prediction_file_write_seconds": None},
+        "predictions": predictions, "prediction_timings": timings}
+    prepared["preparation_id"] = digest(prepared)
+    write_once_json(output, prepared)
+    return prepared
+
+
+def read_b4_inputs(directory, manifest):
+    prepared = read_json(Path(directory) / "prepared.json")
+    binding = read_json(Path(directory) / "reference_binding.json")
+    _b4_check_identity(prepared, "preparation_id")
+    expected = {"preparation_id": prepared["preparation_id"], "prepared_digest": digest(prepared),
+                "reference_binding_digest": digest(binding)}
+    if manifest["config"].get("b4_inputs") != expected or prepared["source"] != manifest["source"]:
+        raise ValueError("B4 preparation/source/reference binding changed.")
+    return prepared, binding
+
+
+def build_b4_tasks(library, config, prepared, binding):
+    """Plan from frozen predictions only; no refit, inference or score-based selection."""
+    from .learning import _b4_settings, b4_decode_angles, select_b2_graphs, validate_b4_model
+
+    specs = b4_specifications(config)
+    _b4_check_identity(prepared, "preparation_id")
+    fit_manifest = prepared["fit_set_manifest"]
+    _b4_fit_manifest(fit_manifest)
+    if (any(fit_manifest.get(k) != prepared[k] for k in ("fit_set_id", "source", "library_id",
+            "library_manifest_sha256", "split_digest", "settings", "compute_environment"))
+            or fit_manifest["source_batch_id"] != prepared["training_binding"]["source_batch_id"]):
+        raise ValueError("B4 embedded fit manifest/provenance changed.")
+    if (prepared["version"] != "b4-prepared-v1" or prepared["library_id"] != library["library_id"]
+            or prepared["split_digest"] != digest(library["split_summary"])
+            or any(config.get(k) != v for k, v in prepared["settings"].items())
+            or binding["library_id"] != library["library_id"]
+            or binding["source_batch_id"] != prepared["training_binding"]["source_batch_id"]):
+        raise ValueError("B4 preparation/settings/library mismatch.")
+    models = prepared["models"]
+    if len(models) != 2 * len(specs) or len({m["fit_id"] for m in models}) != len(models):
+        raise ValueError("B4 requires the complete unique model design.")
+    lookup = {}
+    for model, spec, name in zip(models, [{**s, "head": h} for s in specs for h in ("angles", "success")],
+                                 fit_manifest["model_files"], strict=True):
+        _b4_check_identity(model, "fit_id")
+        validate_b4_model(model)
+        ids = [g["iso_class_id"] for g in select_b2_graphs(library, spec["regime"], spec["fold"], "training")]
+        if (any(model.get(k) != v for k, v in spec.items()) or model["training_graph_ids"] != ids
+                or model["source"] != prepared["source"] or model["library_id"] != library["library_id"]
+                or model["split_digest"] != prepared["split_digest"]
+                or model["settings"] != _b4_settings(config.get("learning"))
+                or hashlib.sha256((json.dumps(model, indent=2, allow_nan=False) + "\n").encode()).hexdigest()
+                   != fit_manifest["files"][name]
+                or model["feature_artifact_id"] != prepared["feature_artifact_id"]):
+            raise ValueError("B4 model training membership/source/design mismatch.")
+        lookup[model["fit_id"]] = model
+    refs = {(r["iso_class_id"], r["p"]): r for r in binding["references"]}
+    if len(refs) != len(binding["references"]):
+        raise ValueError("Duplicate B4 scoring reference.")
+    for ref in refs.values():
+        _b4_check_identity(ref, "reference_id")
+        if not ref["complete"] or ref["library_id"] != library["library_id"] or ref["batch_id"] != binding["source_batch_id"]:
+            raise ValueError("B4 requires complete original scoring references.")
+    for ref in prepared["training_binding"]["references"]:
+        if refs.get((ref["iso_class_id"], ref["p"])) != ref:
+            raise ValueError("B4 training reference changed after fitting.")
+    predictions = prepared["predictions"]
+    expected = {(m["fit_id"], g["iso_class_id"]): g for m in models if m["head"] == "angles"
+                for g in select_b2_graphs(library, m["regime"], m["fold"], "evaluation")}
+    if len(predictions) != len(expected) or {(r["fit_id"], r["iso_class_id"]) for r in predictions} != set(expected):
+        raise ValueError("B4 requires every predeclared frozen prediction exactly once.")
+    tasks = []
+    for row in predictions:
+        _b4_check_identity(row, "prediction_id")
+        model, success = lookup[row["fit_id"]], lookup.get(row["success_fit_id"])
+        graph = expected[row["fit_id"], row["iso_class_id"]]
+        p = model["p"]
+        if (success is None or success["head"] != "success" or any(success[k] != model[k] for k in ("group", "p", "regime", "fold", "shuffle_seed"))
+                or any(row[k] != model[k] for k in ("p", "regime", "fold", "shuffle_seed"))
+                or row["feature_group"] != model["group"] or row["feature_artifact_id"] != prepared["feature_artifact_id"]
+                or row["topology_hash"] != digest({"n": graph["n"], "edges": graph["edges"]})
+                or np.shape(row["theta0"]) != (2 * p,) or not np.all(np.isfinite(row["theta0"]))
+                or not 0 <= row["success_probability"] <= 1):
+            raise ValueError("B4 prediction geometry/model/schema changed.")
+        decoded = b4_decode_angles(row["raw_prediction"], model["model"]["anchor"]["theta"])
+        # The bound JSON bytes stay exact; recomputed libm values may differ by
+        # an ulp across CPU platforms when reading a returned checkpoint.
+        if (any(row.get(k) != decoded[k] for k in ("fallback", "trigger_coordinates"))
+                or np.shape(row["rho"]) != (2 * p,)
+                or not np.allclose(row["rho"], decoded["rho"], rtol=1e-12, atol=1e-15)
+                or not np.allclose(row["theta0"], decoded["theta0"], rtol=0., atol=1e-12)
+                or not math.isfinite(row["raw_success_prediction"])
+                or row["success_probability"] != float(np.clip(row["raw_success_prediction"], 0., 1.))
+                or type(row["unseen_type_count"]) is not int or not 0 <= row["unseen_type_count"] <= 2300
+                or not math.isfinite(row["unseen_type_fraction"]) or not 0 <= row["unseen_type_fraction"] <= 1):
+            raise ValueError("B4 decoded angle/fallback/success diagnostics disagree with frozen raw predictions.")
+        budget = config["optimizer"][str(p)]
+        OptimizerSettings(**budget)
+        if budget != binding["source_config"]["optimizer"][str(p)]:
+            raise ValueError("B4 cannot change the original B1 optimization budget.")
+        ref = refs.get((graph["iso_class_id"], p))
+        if ref is None:
+            raise ValueError("B4 evaluation scoring reference missing.")
+        task = {"task_version": "plan-a-b4-tasks-v1", "library_id": library["library_id"],
+            "iso_class_id": graph["iso_class_id"], "n": graph["n"], "p": p, "graph_split": "evaluation",
+            "kind": "optimization", "experiment_role": "warm_start", "pool": None, "method": "B4",
+            "restart_id": 0, "seed": int(digest({"namespace": config["seed_namespace"], "seed": config["seed"],
+                "prediction_id": row["prediction_id"]})[:32], 16), "theta0": row["theta0"], "budget": budget,
+            "protocol_version": config["protocol_version"], "regime": row["regime"], "fold": row["fold"],
+            "feature_group": row["feature_group"], "shuffle_seed": row["shuffle_seed"], "fit_id": row["fit_id"],
+            "prediction_id": row["prediction_id"], "reference_id": ref["reference_id"]}
+        task["task_id"] = digest(task)
+        tasks.append(task)
+    return sorted(tasks, key=lambda r: r["task_id"])
+
+
+def save_b4_batch(output, predictions_path, batch, references_directory, attempts_directory, settings):
+    prepared = read_json(predictions_path)
+    source, library, _ = read_batch(batch)
+    if prepared["library_manifest_sha256"] != source["library_manifest_sha256"]:
+        raise ValueError("B4 predictions used a different frozen library.")
+    ids = sorted({r["iso_class_id"] for r in prepared["training_binding"]["references"]}
+                 | {r["iso_class_id"] for r in prepared["predictions"]})
+    _, _, binding, _ = audit_b2_references(batch, references_directory, attempts_directory, ids)
+    inherited = {k: source["config"][k] for k in ("optimizer", "max_attempts", "expected_library",
+                 "require_full_design", "design", "require_split_coverage") if k in source["config"]}
+    if set(settings) & set(inherited):
+        raise ValueError("B4 settings cannot override the original optimizer/library contract.")
+    validate_b1_comparison({"library_id": library["library_id"], "source": prepared["source"],
+        "config": {**inherited, **settings}}, source, {"environment": prepared["compute_environment"]},
+        read_json(Path(attempts_directory) / "manifest.json"))
+    return save_batch(output, (Path(batch) / source["library_path"]).resolve(), {**inherited, **settings},
+                      b4_prepared=prepared, reference_binding=binding)

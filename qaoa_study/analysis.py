@@ -431,6 +431,14 @@ _WARM_METRICS = ("C_initial", "C_final", "ratio_initial_exact", "ratio_final_exa
                  "gap_initial_ref", "gap_final_ref", "terminal_success_fraction", "hit_fraction")
 
 
+def _warm_settings(settings):
+    settings = {**DEFAULT_WARM_SETTINGS, **(settings or {})}
+    if (settings["epsilon"] != 0.5 or type(settings["bootstrap_samples"]) is not int or
+            settings["bootstrap_samples"] < 1 or type(settings["bootstrap_seed"]) is not int or settings["bootstrap_seed"] < 0):
+        raise ValueError("Warm analysis requires epsilon=0.5 and fixed positive bootstrap count/nonnegative integer seed.")
+    return settings
+
+
 def _warm_restart(task, attempt, reference, graph, epsilon):
     row = evaluate_restart(task, attempt, reference, epsilon)
     row.update({key: task.get(key) for key in ("regime", "fold", "variant", "fit_id")})
@@ -524,19 +532,18 @@ def _warm_comparison(rows, settings, *, baseline_method="B1", warm_method="B2", 
 
 
 def build_warm_summary(library: dict, tasks: list[dict], selected: dict, references: dict, *,
-                       b1_tasks: list[dict], b1_selected: dict, settings: dict | None = None) -> dict:
+                       b1_tasks: list[dict], b1_selected: dict, settings: dict | None = None,
+                       include_comparisons: bool = True) -> dict:
     """Compare a frozen single-start B2 batch with separately validated B1 traces.
 
     The caller validates source batches, references, fits and attempt provenance.
     This pure summary enforces task/graph identities, one B2 start per variant,
     and identical optimizer budgets. It never selects attempts by their scores.
+    B3 can omit comparisons whose settings/restarts it alone needs to reuse.
     Missing/faulted planned runs remain in denominators; formal paired intervals
     require every planned run and reference. No existing B1 label rule changes.
     """
-    settings = {**DEFAULT_WARM_SETTINGS, **(settings or {})}
-    if (settings["epsilon"] != 0.5 or type(settings["bootstrap_samples"]) is not int or
-            settings["bootstrap_samples"] < 1 or type(settings["bootstrap_seed"]) is not int or settings["bootstrap_seed"] < 0):
-        raise ValueError("Warm analysis requires epsilon=0.5 and fixed positive bootstrap count/nonnegative integer seed.")
+    settings = _warm_settings(settings)
     graphs = {graph["iso_class_id"]: graph for graph in library["graphs"]}
     warm_groups, baseline_tasks = defaultdict(list), defaultdict(list)
     seen = set()
@@ -594,11 +601,12 @@ def build_warm_summary(library: dict, tasks: list[dict], selected: dict, referen
                    "budget": task["budget"]}
             paired.append(row)
             graph_rows.append(row)
-        comparisons.append({**metadata, **_warm_comparison(paired, settings)})
+        if include_comparisons:
+            comparisons.append({**metadata, **_warm_comparison(paired, settings)})
     used = {row["task_id"] for row in restarts}
     return {"analysis_version": WARM_ANALYSIS_VERSION, "settings": settings, "library_id": library["library_id"],
             "graph_qaoa": graph_rows, "restarts": restarts, "diagnostics": [], "comparisons": comparisons,
-            "complete": bool(comparisons) and all(row["complete"] for row in comparisons),
+            "complete": bool(graph_rows) and all(row["complete"] for row in graph_rows),
             "selected_costs_by_method": {method: _costs([attempt for identity, attempt in attempts.items() if identity in used])
                                          for method, attempts in (("B1", b1_selected), ("B2", selected))}}
 
@@ -651,7 +659,8 @@ def build_b3_summary(library: dict, tasks: list[dict], selected: dict, reference
     and keeps missing attempts in their planned denominators. No file or device I/O.
     """
     warm = build_warm_summary(library, b2_tasks, b2_selected, references,
-                             b1_tasks=b1_tasks, b1_selected=b1_selected, settings=settings)
+                             b1_tasks=b1_tasks, b1_selected=b1_selected, settings=settings,
+                             include_comparisons=False)
     settings = warm["settings"]
     graphs = {row["iso_class_id"]: row for row in library["graphs"]
               if row["tier"] == 2 and row["graph_split"] == "evaluation"}
@@ -737,3 +746,213 @@ def build_b3_summary(library: dict, tasks: list[dict], selected: dict, reference
                 method: {str(p): _costs([attempts[task["task_id"]] for task in planned if task["p"] == p
                                         and task["task_id"] in attempts and task["task_id"] in used]) for p in sorted(depths)}
                 for method, planned, attempts in selected_inputs}}
+
+
+B4_ANALYSIS_VERSION = "plan-a-b4-analysis-v1"
+_B4_CASE_FIELDS = ("regime", "fold", "p", "feature_group", "shuffle_seed")
+
+
+def _prediction_comparison(rows, settings, baseline="constant"):
+    """Bootstrap paired graph losses, recomputing RMSE after each draw."""
+    complete = bool(rows) and all(row["observed"] is not None for row in rows)
+    draws = np.random.default_rng(settings["bootstrap_seed"]).integers(
+        len(rows), size=(settings["bootstrap_samples"], len(rows))) if complete and len(rows) > 1 else None
+    metrics = {}
+    for name in ("rmse", "mae"):
+        def score(errors, axis=None):
+            return np.sqrt(np.mean(errors**2, axis=axis)) if name == "rmse" else np.mean(np.abs(errors), axis=axis)
+        values, intervals, errors = {}, {}, {}
+        for method in ("B4", baseline):
+            errors[method] = (np.asarray([row[method] - row["observed"] for row in rows])
+                              if complete else None)
+            values[method] = float(score(errors[method])) if complete else None
+            intervals[method] = (np.quantile(score(errors[method][draws], axis=1), [0.025, 0.975]).tolist()
+                                 if draws is not None else None)
+        difference = values["B4"] - values[baseline] if complete else None
+        paired = (score(errors["B4"][draws], axis=1) - score(errors[baseline][draws], axis=1)
+                  if draws is not None else None)
+        metrics[name] = {**values, f"difference_B4_minus_{baseline}": difference,
+                         "ci95": intervals, "paired_bootstrap_ci95": np.quantile(paired, [0.025, 0.975]).tolist()
+                         if paired is not None else None,
+                         "ci_status": "provisional" if not complete else "available" if draws is not None else "fewer_than_two_graphs"}
+    return {"graphs": len(rows), "valid_labels": sum(row["observed"] is not None for row in rows),
+            "complete": complete, "provisional": not complete, "metrics": metrics,
+            "bootstrap": {"unit": "paired iso_class_id", "seed": settings["bootstrap_seed"],
+                          "samples": settings["bootstrap_samples"], "interval": "percentile 95%",
+                          "scope": "unstratified graphs; fixed predictions and training mean; RMSE recalculated per draw"},
+            "target": "observed s/50, not noiseless latent success probability"}
+
+
+def build_b4_summary(library, tasks, selected, references, *, b1_tasks, b1_selected,
+                     b2_tasks, b2_selected, b3_tasks, b3_selected, predictions,
+                     success_models, settings=None):
+    """Read frozen B4 predictions and B1/B2/B3 attempts, with no refit or I/O.
+
+    The caller audits artifact hashes, training provenance, batch design,
+    reference bindings and numerical compatibility. Success models declare all
+    planned cases: each must have exactly one B4 task/prediction on every
+    eligible evaluation graph. Missing attempts/labels retain planned graphs.
+    A prediction row joins both model heads using fit_id/success_fit_id.
+    Costs and execution provenance may be added by the read-only CLI.
+    """
+    from .learning import select_b2_graphs
+
+    settings = _warm_settings(settings)
+    graphs = {g["iso_class_id"]: g for g in library["graphs"]
+              if g["tier"] == 2 and g["graph_split"] == "evaluation"}
+    models = {}
+    for model in success_models:
+        key = (model["regime"], model["fold"], model["p"], model["group"], model["shuffle_seed"])
+        if (key in models or model["head"] != "success" or model["p"] not in (1, 2)
+                or model["group"] not in ("L", "U", "F", "J+U", "J+U+S")
+                or not _finite(model["training_mean"]) or not 0 <= model["training_mean"] <= 1
+                or (model["shuffle_seed"] is not None and
+                    (key[:2] != ("random", None) or model["group"] != "F"
+                     or model["shuffle_seed"] not in (20260922, 20260923, 20260924)))):
+            raise ValueError("Invalid or duplicate B4 success-model case.")
+        models[key] = model
+    if not models or len({model["fit_id"] for model in models.values()}) != len(models):
+        raise ValueError("B4 needs distinct frozen success models declaring every planned case.")
+    expected = {key: {g["iso_class_id"] for g in select_b2_graphs(library, key[0], key[1], "evaluation")}
+                for key in models}
+    if any(not ids for ids in expected.values()):
+        raise ValueError("A declared B4 case has no eligible evaluation graphs.")
+    target_pairs = {(identity, key[2]) for key, ids in expected.items() for identity in ids}
+    by_method, seen = {}, set()
+    for method, planned, attempts in (("B1", b1_tasks, b1_selected), ("B2", b2_tasks, b2_selected),
+                                     ("B3", b3_tasks, b3_selected), ("B4", tasks, selected)):
+        identities = {task["task_id"] for task in planned}
+        if len(identities) != len(planned) or identities & seen or set(attempts) - identities:
+            raise ValueError("B4 comparison has duplicate or unplanned task identities.")
+        seen.update(identities)
+        rows = []
+        for task in sorted(planned, key=lambda row: row["task_id"]):
+            identity, p = task["iso_class_id"], task["p"]
+            ref, attempt = references.get((identity, p)), attempts.get(task["task_id"])
+            if (identity not in graphs or (identity, p) not in target_pairs or task["method"] != method
+                    or task["library_id"] != library["library_id"] or task["graph_split"] != "evaluation"
+                    or task["kind"] != "optimization"
+                    or task["experiment_role"] != ("evaluation" if method == "B1" else "warm_start")
+                    or (method != "B1" and task["restart_id"] != 0)
+                    or (attempt is not None and attempt["task_id"] != task["task_id"])):
+                raise ValueError("B4 comparison task/attempt identity, split or role disagrees.")
+            if ref is not None and (any(ref.get(name) != value for name, value in
+                    (("library_id", library["library_id"]), ("iso_class_id", identity), ("p", p)))
+                    or (method != "B1" and task.get("reference_id") != ref.get("reference_id"))):
+                raise ValueError("B4 comparison scoring reference disagrees.")
+            row = _warm_restart(task, attempt, ref, graphs[identity], settings["epsilon"])
+            row.update({name: task.get(name) for name in (*_B4_CASE_FIELDS, "prediction_id")})
+            if method == "B3":
+                row.update({name: task.get(name) for name in ("rule_id", "initialization_id", "initialization_set_id")})
+            rows.append(row)
+        by_method[method] = rows
+    baseline_groups = defaultdict(list)
+    for method in ("B1", "B2", "B3"):
+        for row in by_method[method]:
+            scope = (row["regime"], row["fold"], row["variant"]) if method == "B2" else (None, None, None)
+            baseline_groups[method, *scope, row["iso_class_id"], row["p"]].append(row)
+    required = {("B1", None, None, None, identity, p) for identity, p in target_pairs}
+    required |= {("B3", None, None, None, identity, p) for identity, p in target_pairs}
+    required |= {("B2", key[0], key[1], variant, identity, key[2]) for key, ids in expected.items()
+                 for identity in ids for variant in ("medoid", "aligned_median")}
+    if set(baseline_groups) != required:
+        raise ValueError("B4 comparison requires every declared B1/B2/B3 baseline graph/depth.")
+    baseline_pools, labels = {}, {}
+    for key, rows in baseline_groups.items():
+        if (len(rows) != (50 if key[0] == "B1" else 1)
+                or (key[0] == "B1" and {row["restart_id"] for row in rows} != set(range(50)))):
+            raise ValueError("B4 needs all 50 planned B1 restarts and one B2/B3 start per variant.")
+        baseline_pools[key] = _b3_pool(rows, key[0])
+        if key[0] == "B1":
+            labels[key[-2:]] = pool_statistics(rows)
+    prediction_by_id = {row["prediction_id"]: row for row in predictions}
+    if len(prediction_by_id) != len(predictions) or set(prediction_by_id) != {t["prediction_id"] for t in tasks}:
+        raise ValueError("B4 prediction coverage differs from its task plan.")
+    groups = defaultdict(dict)
+    for row in by_method["B4"]:
+        key = tuple(row[name] for name in _B4_CASE_FIELDS)
+        if key not in models or row["iso_class_id"] in groups[key]:
+            raise ValueError("Duplicate or undeclared B4 graph/model case.")
+        groups[key][row["iso_class_id"]] = row
+    if set(groups) != set(models) or any(set(groups[key]) != ids for key, ids in expected.items()):
+        raise ValueError("B4 tasks omit or add a declared model or evaluation graph.")
+    graph_rows, diagnostics, comparisons, prediction_comparisons = [], [], [], []
+    warm_pools, prediction_rows = {}, {}
+    for key, group in sorted(groups.items(), key=lambda item: repr(item[0])):
+        model = models[key]
+        fit_ids = {row["fit_id"] for row in group.values()}
+        if len(fit_ids) != 1 or None in fit_ids:
+            raise ValueError("Each B4 case requires one frozen angle fit.")
+        metadata = {**dict(zip(_B4_CASE_FIELDS, key)), "fit_id": next(iter(fit_ids)),
+                    "success_fit_id": model["fit_id"]}
+        pools, success_rows = {}, []
+        for identity, row in sorted(group.items()):
+            prediction = prediction_by_id[row["prediction_id"]]
+            if (prediction["fit_id"] != row["fit_id"] or prediction["success_fit_id"] != model["fit_id"]
+                    or prediction["iso_class_id"] != identity or prediction["theta0"] != row["theta0"]
+                    or any(prediction[name] != row[name] for name in _B4_CASE_FIELDS)
+                    or np.shape(prediction["rho"]) != (2 * key[2],)
+                    or not all(_finite(v) and v >= 0 for v in prediction["rho"])
+                    or type(prediction["fallback"]) is not bool
+                    or not _finite(prediction["success_probability"])
+                    or not 0 <= prediction["success_probability"] <= 1
+                    or type(prediction["unseen_type_count"]) is not int or prediction["unseen_type_count"] < 0
+                    or not _finite(prediction["unseen_type_fraction"]) or not 0 <= prediction["unseen_type_fraction"] <= 1):
+                raise ValueError("B4 frozen prediction, model or diagnostics disagree.")
+            pools[identity] = _b3_pool([row], "B4")
+            label = labels[identity, key[2]]
+            graph_rows.append({**metadata, "iso_class_id": identity, "n": graphs[identity]["n"],
+                "library_id": library["library_id"], "graph_split": "evaluation", "reference_id": row["reference_id"],
+                "B4": pools[identity], "complete": pools[identity]["complete"], "provisional": pools[identity]["provisional"]})
+            diagnostics.append({**metadata, "iso_class_id": identity, "task_id": row["task_id"],
+                "prediction_id": row["prediction_id"], **{name: prediction[name] for name in
+                    ("rho", "fallback", "trigger_coordinates", "unseen_type_count", "unseen_type_fraction", "success_probability")},
+                "observed_success": label, "training_mean": model["training_mean"]})
+            success_rows.append({"iso_class_id": identity, "observed": label["success_rate_label"],
+                                 "B4": prediction["success_probability"], "constant": model["training_mean"]})
+        warm_pools[key], prediction_rows[key] = pools, success_rows
+        prediction_comparisons.append({**metadata, **_prediction_comparison(success_rows, settings)})
+        for method, variant in (("B1", None), ("B2", "medoid"), ("B2", "aligned_median"), ("B3", None)):
+            pairs = []
+            for identity, pool in pools.items():
+                base_key = (method, key[0] if method == "B2" else None,
+                            key[1] if method == "B2" else None, variant, identity, key[2])
+                if any(base["budget"] != group[identity]["budget"] for base in baseline_groups[base_key]):
+                    raise ValueError("B4 and baseline optimizer budgets differ.")
+                base = baseline_pools[base_key]
+                pairs.append({method: base, "B4": pool, "complete": base["complete"] and pool["complete"]})
+            comparison = _warm_comparison(pairs, settings, baseline_method=method, warm_method="B4",
+                                           metrics_names=(*_WARM_METRICS, "objective_calls"))
+            comparisons.append({**metadata, "baseline_method": method, "baseline_variant": variant,
+                "primary": key[0] == "random" and key[3:] == ("F", None), **comparison,
+                "success_intervals": {name: _b3_success_intervals(pairs, name, settings) for name in (method, "B4")}})
+    feature_comparisons, success_feature_comparisons = [], []
+    for key in groups:
+        controls = [(key[3], seed) for seed in (20260922, 20260923, 20260924)] if key[3:] == ("F", None) else []
+        if key[4] is None and key[3] in ("F", "J+U+S"):
+            controls.append(("U" if key[3] == "F" else "J+U", None))
+        for feature, shuffle in controls:
+            other = (*key[:3], feature, shuffle)
+            if other not in groups:
+                continue
+            pairs = [{"B4": warm_pools[key][identity], "B4_control": warm_pools[other][identity],
+                      "complete": warm_pools[key][identity]["complete"] and warm_pools[other][identity]["complete"]}
+                     for identity in sorted(expected[key])]
+            metadata = {**dict(zip(_B4_CASE_FIELDS, key)), "fit_id": next(iter(groups[key].values()))["fit_id"],
+                        "success_fit_id": models[key]["fit_id"], "baseline_success_fit_id": models[other]["fit_id"],
+                        "baseline_feature_group": feature, "baseline_shuffle_seed": shuffle,
+                        "baseline_fit_id": next(iter(groups[other].values()))["fit_id"],
+                        "comparison_kind": "shuffled_control" if shuffle is not None else "feature_group"}
+            feature_comparisons.append({**metadata, **_warm_comparison(pairs, settings,
+                baseline_method="B4_control", warm_method="B4", metrics_names=(*_WARM_METRICS, "objective_calls"))})
+            control = {row["iso_class_id"]: row["B4"] for row in prediction_rows[other]}
+            paired_predictions = [{**row, "B4_control": control[row["iso_class_id"]]} for row in prediction_rows[key]]
+            success_feature_comparisons.append({**metadata, **_prediction_comparison(
+                paired_predictions, settings, baseline="B4_control")})
+    complete = all(row["complete"] for row in (*comparisons, *prediction_comparisons))
+    return {"analysis_version": B4_ANALYSIS_VERSION, "library_id": library["library_id"], "settings": settings,
+            "graph_qaoa": graph_rows, "restarts": [row for rows in by_method.values() for row in rows],
+            "diagnostics": diagnostics, "comparisons": comparisons, "feature_comparisons": feature_comparisons,
+            "success_prediction_comparisons": prediction_comparisons,
+            "success_feature_comparisons": success_feature_comparisons, "complete": complete, "provisional": not complete,
+            "uncertainty_scope": "unstratified graph bootstrap conditional on frozen fits; no training resampling or simultaneous coverage"}

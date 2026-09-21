@@ -17,6 +17,9 @@ dependencies = [
     "scipy==1.16.3",
     "networkx==3.5",
     "pyarrow==21.0.0",
+    "scikit-learn==1.7.2",
+    "joblib==1.5.2",
+    "threadpoolctl==3.6.0",
 ]
 
 [project.optional-dependencies]
