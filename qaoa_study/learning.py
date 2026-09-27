@@ -258,6 +258,25 @@ B4_RULES = {
     "shuffle": "whole training X rows only; SHA256(seed,scope,fold); independent of depth/head",
 }
 
+B5_MODEL_VERSION = "b5-xgboost-v1"
+B5_GRID = tuple({"max_depth": depth, "num_boost_round": rounds}
+                for depth in (1, 2, 3) for rounds in (100, 300))
+B5_PARAMETERS = {
+    "objective": "reg:squarederror", "booster": "gbtree", "device": "cpu",
+    "tree_method": "hist", "eta": .05, "min_child_weight": 5., "reg_lambda": 1.,
+    "reg_alpha": 0., "min_split_loss": 0., "subsample": 1., "colsample_bytree": 1.,
+    "colsample_bylevel": 1., "colsample_bynode": 1., "max_bin": 256,
+    "grow_policy": "depthwise", "num_parallel_tree": 1, "max_delta_step": 0.,
+    "nthread": 1, "seed": 20260927,
+}
+B5_RULES = {key: deepcopy(value) for key, value in B4_RULES.items()
+            if key not in ("ridge", "lambda_tie")}
+B5_RULES.update(
+    tree="scalar CPU hist XGBoost 3.4.1; dense float32 features/targets; explicit training-mean base_score",
+    candidate_tie="smallest depth then fewest rounds within 1e-12 of minimum graph OOF loss",
+    parameters=B5_PARAMETERS, candidate_grid=list(B5_GRID),
+    shap="native exact TreeSHAP training-path cover; raw success margin including bias")
+
 
 def b4_angle_orbit(theta, parity):
     """Exact MaxCut symmetries; odd-degree shifts reverse beta from that layer.
@@ -429,6 +448,56 @@ def _b4_index(rows, ids, description):
     return [keyed[identity] for identity in ids]
 
 
+def _b5_settings(settings):
+    settings = {} if settings is None else dict(settings)
+    grid = settings.pop("candidate_grid", list(B5_GRID))
+    result = _b4_settings(settings)
+    if (not isinstance(grid, (list, tuple)) or not grid or
+            any(not isinstance(row, dict) or set(row) != {"max_depth", "num_boost_round"} or
+                type(row["max_depth"]) is not int or not 1 <= row["max_depth"] <= 3 or
+                type(row["num_boost_round"]) is not int or row["num_boost_round"] < 1
+                for row in grid)):
+        raise ValueError("Invalid B5 candidate grid.")
+    ordered = sorted(grid, key=lambda row: (row["max_depth"], row["num_boost_round"]))
+    if list(grid) != ordered or len({(row["max_depth"], row["num_boost_round"]) for row in grid}) != len(grid):
+        raise ValueError("B5 candidates must be unique and ordered by depth then rounds.")
+    if not result["development"] and list(grid) != list(B5_GRID):
+        raise ValueError("Production B5 requires the fixed six-candidate grid.")
+    return {**result, "candidate_grid": deepcopy(list(grid))}
+
+
+def _b5_dmatrix(matrix, names, target=None):
+    """Create independent dense float32 native storage; zero is never missing."""
+    import xgboost as xgb
+
+    values = np.asarray(matrix, dtype=np.float64)
+    dense = np.asarray(values, dtype=np.float32)
+    label = None if target is None else np.asarray(target, dtype=np.float32)
+    if not np.isfinite(dense).all() or (label is not None and not np.isfinite(label).all()):
+        raise ValueError("B5 float32 conversion produced nonfinite values.")
+    errors = {"feature_float32_max_abs_error": float(np.max(np.abs(values - dense), initial=0.))}
+    if label is not None:
+        errors["target_float32_max_abs_error"] = float(np.max(np.abs(target - label), initial=0.))
+    return xgb.DMatrix(dense, label=label, feature_names=names, nthread=1), errors
+
+
+def _b5_trees(matrix, target, candidate, names):
+    import xgboost as xgb
+
+    if xgb.__version__ != "3.4.1":
+        raise ValueError("B5 requires the frozen XGBoost 3.4.1 numerical version.")
+    means = np.mean(target, axis=0)
+    boosters, conversions = [], []
+    for column, base in enumerate(means):
+        training, conversion = _b5_dmatrix(matrix, names, target[:, column])
+        booster = xgb.train({**B5_PARAMETERS, "base_score": float(base),
+                            "max_depth": candidate["max_depth"]}, training,
+                           num_boost_round=candidate["num_boost_round"])
+        boosters.append(booster)
+        conversions.append(conversion)
+    return boosters, {"base_scores": means.tolist(), "float32_conversion": conversions}
+
+
 def fit_b4_model(graph_rows, feature_rows, reference_candidates, success_labels, *,
                  p, group, regime, fold=None, head="angles", shuffle_seed=None, settings=None):
     """Fit a JSON numerical model on an already selected complete training scope.
@@ -441,11 +510,31 @@ def fit_b4_model(graph_rows, feature_rows, reference_candidates, success_labels,
     No objective or optimization call is made here. Development may use fewer
     random CV folds; production settings remain five random or three LOFO folds.
     """
+    return _fit_learning_model(graph_rows, feature_rows, reference_candidates, success_labels,
+        p=p, group=group, regime=regime, fold=fold, head=head,
+        shuffle_seed=shuffle_seed, settings=settings, boosted=False)
+
+
+def fit_b5_model(graph_rows, feature_rows, reference_candidates, success_labels, *,
+                 p, group, regime, fold=None, head="angles", shuffle_seed=None, settings=None):
+    """Return frozen numerical metadata and scalar Boosters, with training-only CV.
+
+    Uses the B4 graph/label contract. Only explicit development settings may
+    reduce the six-candidate grid; these settings remain in the saved metadata.
+    The caller stores native UBJSON and binds source/reference provenance.
+    """
+    return _fit_learning_model(graph_rows, feature_rows, reference_candidates, success_labels,
+        p=p, group=group, regime=regime, fold=fold, head=head,
+        shuffle_seed=shuffle_seed, settings=settings, boosted=True)
+
+
+def _fit_learning_model(graph_rows, feature_rows, reference_candidates, success_labels, *,
+                        p, group, regime, fold, head, shuffle_seed, settings, boosted):
     from .features import B4_FEATURE_VERSION, b4_feature_matrix, b4_feature_names
     import sklearn
 
     start = perf_counter()
-    settings = _b4_settings(settings)
+    settings = _b5_settings(settings) if boosted else _b4_settings(settings)
     if type(p) is not int or p not in (1, 2) or head not in ("angles", "success"):
         raise ValueError("B4 supports p=1/2 and angles/success heads.")
     rows = sorted(graph_rows, key=lambda row: row["iso_class_id"])
@@ -495,6 +584,13 @@ def fit_b4_model(graph_rows, feature_rows, reference_candidates, success_labels,
                 "permuted_feature_graph_ids": [train_ids[i] for i in permutation],
                 "seen_joint_types": np.any(np.array([features[i]["joint_counts"] for i in indices]) > 0,
                                             axis=0).tolist()}
+        if boosted:
+            values = matrix[indices]
+            observed = np.isfinite(values).any(axis=0)
+            part["training_feature_ranges"] = {
+                "minimum": np.where(observed, np.min(np.where(np.isfinite(values), values, np.inf), axis=0), 0.).tolist(),
+                "maximum": np.where(observed, np.max(np.where(np.isfinite(values), values, -np.inf), axis=0), 0.).tolist(),
+                "observed": observed.tolist()}
         if head == "angles":
             anchor = fixed_angles([candidates[i] for i in indices])["medoid"]
             alignment = [{"iso_class_id": ids[i], **b4_align_label(
@@ -505,17 +601,27 @@ def fit_b4_model(graph_rows, feature_rows, reference_candidates, success_labels,
             target = rates[indices]
         return part, transformed[permutation], target
 
-    losses = np.zeros((len(B4_LAMBDAS), len(rows)))
-    folds, diagnostics = [], [[] for _ in B4_LAMBDAS]
+    choices = settings["candidate_grid"] if boosted else B4_LAMBDAS
+    score_key, choice_key = ("candidate_scores", "candidate") if boosted else ("lambda_scores", "lambda")
+    losses = np.zeros((len(choices), len(rows)))
+    folds, diagnostics = [], [[] for _ in choices]
     cv_start = perf_counter()
     for marker, train, valid in _b4_inner_folds(rows, regime, settings):
         part, train_matrix, target = prepare(train, marker)
         validation_matrix = _b4_transform(matrix[valid], part["preprocessing"], names)
         part.update(fold=marker, validation_graph_ids=[ids[i] for i in valid])
-        part["lambda_scores"] = []
-        for k, regularization in enumerate(B4_LAMBDAS):
-            ridge = _b4_ridge(train_matrix, target, regularization)
-            raw = validation_matrix @ np.array(ridge["coef"]).T + ridge["intercept"]
+        part[score_key] = []
+        if boosted:
+            validation_native, conversion = _b5_dmatrix(validation_matrix, names)
+            part["validation_float32_conversion"] = conversion
+        for k, choice in enumerate(choices):
+            if boosted:
+                trees, fit_details = _b5_trees(train_matrix, target, choice, names)
+                raw = np.column_stack([tree.predict(validation_native, output_margin=True) for tree in trees])
+                part.update(fit_details)
+            else:
+                ridge = _b4_ridge(train_matrix, target, choice)
+                raw = validation_matrix @ np.array(ridge["coef"]).T + ridge["intercept"]
             for index, prediction in zip(valid, raw):
                 if head == "angles":
                     decoded = b4_decode_angles(prediction, part["anchor"]["theta"])
@@ -527,24 +633,29 @@ def fit_b4_model(graph_rows, feature_rows, reference_candidates, success_labels,
                     losses[k, index] = (value - rates[index, 0])**2
                     diagnostics[k].append({"iso_class_id": ids[index], "success_probability": value,
                                            "raw_prediction": float(prediction[0])})
-            part["lambda_scores"].append({"lambda": regularization,
+            part[score_key].append({choice_key: choice,
                 "mean_loss": float(losses[k, valid].mean())})
         folds.append(part)
     scores = losses.mean(axis=1)
     eligible = np.flatnonzero(scores <= scores.min() + _DISTANCE_TIE)
-    chosen = int(eligible[-1])
+    chosen = int(eligible[0] if boosted else eligible[-1])
     cv_seconds = perf_counter() - cv_start
     final_start = perf_counter()
     final, train_matrix, target = prepare(np.arange(len(rows)), "final-fit")
-    final.update(_b4_ridge(train_matrix, target, B4_LAMBDAS[chosen]))
+    if boosted:
+        boosters, fit_details = _b5_trees(train_matrix, target, choices[chosen], names)
+        final.update(fit_details)
+    else:
+        final.update(_b4_ridge(train_matrix, target, choices[chosen]))
     final_fit_seconds = perf_counter() - final_start
-    model = {"version": B4_MODEL_VERSION, "rules": deepcopy(B4_RULES), "feature_version": B4_FEATURE_VERSION,
+    model = {"version": B5_MODEL_VERSION if boosted else B4_MODEL_VERSION,
+             "rules": deepcopy(B5_RULES if boosted else B4_RULES), "feature_version": B4_FEATURE_VERSION,
              "feature_names": names, "p": p, "group": group, "regime": regime, "fold": fold,
              "head": head, "shuffle_seed": shuffle_seed, "settings": settings, "training_graph_ids": ids,
-             "selected_lambda": B4_LAMBDAS[chosen], "model": final,
-             "cv": {"folds": folds, "lambda_scores": [{"lambda": value, "mean_loss": float(scores[k]),
-                     "loss_by_graph": losses[k].tolist()} for k, value in enumerate(B4_LAMBDAS)],
-                    "lambda_tie": len(eligible) > 1, "loss_graph_ids": ids,
+             "selected_" + choice_key: choices[chosen], "model": final,
+             "cv": {"folds": folds, score_key: [{choice_key: value, "mean_loss": float(scores[k]),
+                     "loss_by_graph": losses[k].tolist()} for k, value in enumerate(choices)],
+                    choice_key + "_tie": len(eligible) > 1, "loss_graph_ids": ids,
                     "selected_oof_predictions": sorted(diagnostics[chosen], key=lambda row: row["iso_class_id"])},
              "reference_candidates": deepcopy(candidates),
              "learning_environment": {"numpy": np.__version__, "sklearn": sklearn.__version__},
@@ -552,6 +663,12 @@ def fit_b4_model(graph_rows, feature_rows, reference_candidates, success_labels,
              "fit_seconds": perf_counter() - start}
     if rates is not None:
         model.update(training_mean=float(rates.mean()), success_labels=deepcopy(labels))
+    if boosted:
+        import xgboost
+
+        model["learning_environment"]["xgboost"] = xgboost.__version__
+        validate_b5_model(model, boosters)
+        return model, boosters
     validate_b4_model(model)
     return model
 
@@ -564,6 +681,10 @@ def validate_b4_model(model):
     Raw reference identity and discrete decisions remain exact. These checks
     do not replace the caller's exact serialized-content/hash validation.
     """
+    return _validate_learning_model(model, boosted=False)
+
+
+def _validate_learning_model(model, *, boosted):
     from .features import B4_FEATURE_VERSION, B4_JOINT_TYPES, b4_feature_names
 
     def finite_numeric(value, shape):
@@ -575,14 +696,17 @@ def validate_b4_model(model):
 
     try:
         json.dumps(model, allow_nan=False)
-        if (model["version"] != B4_MODEL_VERSION or model["rules"] != B4_RULES or
+        version, rules = (B5_MODEL_VERSION, B5_RULES) if boosted else (B4_MODEL_VERSION, B4_RULES)
+        if (model["version"] != version or model["rules"] != rules or
                 model["feature_version"] != B4_FEATURE_VERSION or
                 model["feature_names"] != list(b4_feature_names(model["group"]))):
             raise ValueError("B4 model version, rules or feature order differs.")
+        settings = _b5_settings(model["settings"]) if boosted else _b4_settings(model["settings"])
+        choices = settings["candidate_grid"] if boosted else B4_LAMBDAS
+        score_key, choice_key = ("candidate_scores", "candidate") if boosted else ("lambda_scores", "lambda")
         if (type(model["p"]) is not int or model["p"] not in (1, 2) or
                 model["head"] not in ("angles", "success") or
-                model["selected_lambda"] not in B4_LAMBDAS or
-                _b4_settings(model["settings"]) != model["settings"]):
+                model["selected_" + choice_key] not in choices or settings != model["settings"]):
             raise ValueError("Invalid B4 model scope or hyperparameters.")
         if ((model["regime"] == "random" and model["fold"] is not None) or
                 (model["regime"] == "lofo" and model["fold"] not in ("regular", "er", "ba", "sbm")) or
@@ -598,8 +722,9 @@ def validate_b4_model(model):
         n_features = len(model["feature_names"])
         n_outputs = 4 * model["p"] if model["head"] == "angles" else 1
         final = model["model"]
-        if (not finite_numeric(final["coef"], (n_outputs, n_features)) or
-                not finite_numeric(final["intercept"], (n_outputs,)) or final["training_graph_ids"] != ids):
+        if final["training_graph_ids"] != ids or (not boosted and (
+                not finite_numeric(final["coef"], (n_outputs, n_features)) or
+                not finite_numeric(final["intercept"], (n_outputs,)))):
             raise ValueError("Invalid B4 coefficient dimensions.")
         if any(not finite_numeric(model["timings"][key], ()) or model["timings"][key] < 0
                for key in ("cv_seconds", "final_fit_seconds")):
@@ -655,6 +780,30 @@ def validate_b4_model(model):
                             not same_recomputed(alignment["lift"], expected["lift"]) or
                             not same_recomputed(alignment["distance"], expected["distance"])):
                         raise ValueError("B4 saved label gauge disagrees with its reference and anchor.")
+            if boosted:
+                ranges = part["training_feature_ranges"]
+                if (set(ranges) != {"minimum", "maximum", "observed"} or
+                        any(not finite_numeric(ranges[key], (n_features,)) for key in ("minimum", "maximum")) or
+                        len(ranges["observed"]) != n_features or any(type(v) is not bool for v in ranges["observed"]) or
+                        np.any(np.array(ranges["minimum"]) > ranges["maximum"]) or
+                        any(not value and (model["feature_names"][i] != "degree_assortativity" or
+                            ranges["minimum"][i] != 0. or ranges["maximum"][i] != 0.)
+                            for i, value in enumerate(ranges["observed"]))):
+                    raise ValueError("Invalid B5 raw training feature ranges.")
+                target = (np.array([b4_encode_angles(row["lift"]) for row in part["label_alignment"]])
+                          if model["head"] == "angles" else np.array([
+                              row["successes"] / 50 for row in _b4_index(
+                                  [row for row in model["success_labels"] if row["iso_class_id"] in training],
+                                  training, "fold success labels")])[:, None])
+                if not finite_numeric(part["base_scores"], (n_outputs,)) or not same_recomputed(
+                        part["base_scores"], target.mean(axis=0)):
+                    raise ValueError("B5 base scores must be the current training target means.")
+                conversions = part["float32_conversion"]
+                if len(conversions) != n_outputs or any(
+                        set(row) != {"feature_float32_max_abs_error", "target_float32_max_abs_error"} or
+                        any(not finite_numeric(value, ()) or value < 0 for value in row.values())
+                        for row in conversions):
+                    raise ValueError("Invalid B5 float32 conversion evidence.")
             if part is not final:
                 valid = part["validation_graph_ids"]
                 if set(training) & set(valid) or set(training) | set(valid) != set(ids):
@@ -667,10 +816,10 @@ def validate_b4_model(model):
                 [part["seen_joint_types"] for part in parts[:-1]], axis=0)):
             raise ValueError("B4 final type mask differs from the union of inner training masks.")
         cv = model["cv"]
-        if cv["loss_graph_ids"] != ids or [row["lambda"] for row in cv["lambda_scores"]] != list(B4_LAMBDAS):
+        if cv["loss_graph_ids"] != ids or [row[choice_key] for row in cv[score_key]] != list(choices):
             raise ValueError("Invalid B4 CV score coverage.")
         scores = []
-        for row in cv["lambda_scores"]:
+        for row in cv[score_key]:
             values = row["loss_by_graph"]
             if not finite_numeric(values, (len(ids),)) or min(values) < 0 or not np.isclose(
                     np.mean(values), row["mean_loss"], rtol=1e-12, atol=1e-15):
@@ -679,19 +828,21 @@ def validate_b4_model(model):
         id_index = {identity: i for i, identity in enumerate(ids)}
         validation_fold = {}
         for part in cv["folds"]:
-            if [row["lambda"] for row in part["lambda_scores"]] != list(B4_LAMBDAS):
+            if [row[choice_key] for row in part[score_key]] != list(choices):
                 raise ValueError("Invalid B4 inner-fold lambda score coverage.")
             indices = [id_index[identity] for identity in part["validation_graph_ids"]]
-            for local, overall in zip(part["lambda_scores"], cv["lambda_scores"], strict=True):
+            for local, overall in zip(part[score_key], cv[score_key], strict=True):
                 if not finite_numeric(local["mean_loss"], ()) or not np.isclose(local["mean_loss"],
                         np.mean(np.array(overall["loss_by_graph"])[indices]), rtol=1e-12, atol=1e-15):
                     raise ValueError("B4 inner-fold lambda score disagrees with global OOF losses.")
             validation_fold.update({identity: part for identity in part["validation_graph_ids"]})
-        selected = max(value for value, score in zip(B4_LAMBDAS, scores) if score <= min(scores) + _DISTANCE_TIE)
-        if selected != model["selected_lambda"]:
+        eligible = [i for i, score in enumerate(scores) if score <= min(scores) + _DISTANCE_TIE]
+        selected_index = eligible[0] if boosted else eligible[-1]
+        selected = choices[selected_index]
+        if selected != model["selected_" + choice_key]:
             raise ValueError("B4 selected lambda disagrees with CV.")
         expected_tie = sum(score <= min(scores) + _DISTANCE_TIE for score in scores) > 1
-        if type(cv["lambda_tie"]) is not bool or cv["lambda_tie"] != expected_tie:
+        if type(cv[choice_key + "_tie"]) is not bool or cv[choice_key + "_tie"] != expected_tie:
             raise ValueError("Invalid B4 lambda tie status.")
         if model["head"] == "success":
             labels = _b4_index(model["success_labels"], ids, "saved success labels")
@@ -707,7 +858,7 @@ def validate_b4_model(model):
         predictions = cv["selected_oof_predictions"]
         if [row["iso_class_id"] for row in predictions] != ids:
             raise ValueError("B4 selected OOF predictions must cover each training graph once in ID order.")
-        selected_losses = cv["lambda_scores"][B4_LAMBDAS.index(selected)]["loss_by_graph"]
+        selected_losses = cv[score_key][selected_index]["loss_by_graph"]
         for index, prediction in enumerate(predictions):
             identity = prediction["iso_class_id"]
             if model["head"] == "angles":
@@ -742,18 +893,66 @@ def predict_b4_model(model, feature_rows):
     from .features import b4_feature_matrix
 
     validate_b4_model(model)
+    return _predict_learning_model(model, feature_rows)
+
+
+def validate_b5_model(model, boosters=None):
+    """Audit numerical metadata and, when supplied, persisted scalar tree identity.
+
+    Native saved models omit training parameters; these are frozen in metadata.
+    Byte hashes are bound by the I/O layer, not reconstructed from tree dumps.
+    """
+    _validate_learning_model(model, boosted=True)
+    if model["learning_environment"].get("xgboost") != "3.4.1":
+        raise ValueError("Invalid B5 frozen learning environment.")
+    if boosters is not None:
+        outputs = 4 * model["p"] if model["head"] == "angles" else 1
+        if len(boosters) != outputs:
+            raise ValueError("B5 scalar booster count differs from output dimensions.")
+        for column, booster in enumerate(boosters):
+            config = json.loads(booster.save_config())["learner"]
+            base = json.loads(config["learner_model_param"]["base_score"])[0]
+            if (booster.feature_names != model["feature_names"] or
+                    booster.num_features() != len(model["feature_names"]) or
+                    booster.num_boosted_rounds() != model["selected_candidate"]["num_boost_round"] or
+                    config["learner_train_param"]["objective"] != "reg:squarederror" or
+                    config["learner_model_param"]["num_target"] != "1" or
+                    config["gradient_booster"]["name"] != "gbtree" or
+                    not np.isclose(base, model["model"]["base_scores"][column], rtol=1e-7, atol=1e-8)):
+                raise ValueError("B5 native booster dimensions, objective or base score disagree.")
+    return model
+
+
+def predict_b5_model(model, boosters, feature_rows):
+    """Predict using topology features and saved trees, without reference access."""
+    validate_b5_model(model, boosters)
+    return _predict_learning_model(model, feature_rows, boosters)
+
+
+def _predict_learning_model(model, feature_rows, boosters=None):
+    from .features import b4_feature_matrix
+
     if not feature_rows:
         return []
     ids = [row["iso_class_id"] for row in feature_rows]
     if len(set(ids)) != len(ids):
         raise ValueError("B4 predictions require unique graph identities.")
     fitted = model["model"]
-    matrix = _b4_transform(b4_feature_matrix(feature_rows, model["group"]), fitted["preprocessing"],
+    original = b4_feature_matrix(feature_rows, model["group"])
+    matrix = _b4_transform(original, fitted["preprocessing"],
                            model["feature_names"])
-    raw = matrix @ np.array(fitted["coef"]).T + fitted["intercept"]
+    if boosters is None:
+        raw = matrix @ np.array(fitted["coef"]).T + fitted["intercept"]
+        conversion = None
+    else:
+        native, conversion = _b5_dmatrix(matrix, model["feature_names"])
+        raw = np.column_stack([tree.predict(native, output_margin=True) for tree in boosters]).astype(np.float64)
+        ranges = fitted["training_feature_ranges"]
+        outside = np.isfinite(original) & ((~np.array(ranges["observed"], dtype=bool)) |
+            (original < ranges["minimum"]) | (original > ranges["maximum"]))
     unseen = ~np.array(fitted["seen_joint_types"], dtype=bool)
     result = []
-    for feature, prediction in zip(feature_rows, raw):
+    for index, (feature, prediction) in enumerate(zip(feature_rows, raw)):
         if not np.isfinite(prediction).all():
             raise ValueError("B4 prediction is not finite.")
         if model["head"] == "angles":
@@ -765,5 +964,71 @@ def predict_b4_model(model, feature_rows):
         row.update(iso_class_id=feature["iso_class_id"],
                    unseen_type_count=int(np.count_nonzero(counts[unseen])),
                    unseen_type_fraction=float(counts[unseen].sum() / counts.sum()))
+        if conversion is not None:
+            row["float32_conversion"] = conversion
+            coordinates = np.flatnonzero(outside[index]).tolist()
+            row.update(out_of_training_range_coordinates=coordinates,
+                       out_of_training_range_features=[model["feature_names"][i] for i in coordinates],
+                       out_of_training_range_count=len(coordinates),
+                       out_of_training_range_fraction=len(coordinates) / len(model["feature_names"]))
         result.append(row)
     return result
+
+
+def load_b5_boosters(payloads):
+    """Load native UBJSON bytes; numerical/provenance validation follows at caller."""
+    import xgboost as xgb
+
+    if xgb.__version__ != "3.4.1":
+        raise ValueError("B5 requires XGBoost 3.4.1 for model reload.")
+    boosters = []
+    for payload in payloads:
+        tree = xgb.Booster(params={"nthread": 1, "device": "cpu"})
+        tree.load_model(bytearray(payload))
+        boosters.append(tree)
+    return boosters
+
+
+def b5_model_bytes(model, boosters, feature_rows):
+    """Serialize UBJSON and require bit-identical raw predictions after reload."""
+    if not feature_rows:
+        raise ValueError("B5 readback verification requires nonempty feature rows.")
+    expected = predict_b5_model(model, boosters, feature_rows)
+    payloads = [bytes(tree.save_raw(raw_format="ubj")) for tree in boosters]
+    reloaded = predict_b5_model(model, load_b5_boosters(payloads), feature_rows)
+    if [row["raw_prediction"] for row in expected] != [row["raw_prediction"] for row in reloaded]:
+        raise ValueError("B5 UBJSON raw predictions changed on same-environment reload.")
+    return payloads
+
+
+def explain_b5_model(model, boosters, feature_rows):
+    """Exact native TreeSHAP for unshuffled F success models, explaining raw margin.
+
+    Values use training-path cover semantics, not an interventional background.
+    The tolerance accounts for native float32 tree/contribution accumulation;
+    actual absolute errors and per-row bounds are retained rather than rounded.
+    """
+    from .features import b4_feature_matrix
+
+    validate_b5_model(model, boosters)
+    if model["head"] != "success" or model["group"] != "F" or model["shuffle_seed"] is not None:
+        raise ValueError("B5 explanations are restricted to unshuffled F success models.")
+    if not feature_rows:
+        return []
+    if len({row["iso_class_id"] for row in feature_rows}) != len(feature_rows):
+        raise ValueError("B5 explanations require unique graph identities.")
+    matrix = _b4_transform(b4_feature_matrix(feature_rows, "F"),
+                           model["model"]["preprocessing"], model["feature_names"])
+    native, conversion = _b5_dmatrix(matrix, model["feature_names"])
+    tree = boosters[0]
+    raw = tree.predict(native, output_margin=True).astype(np.float64)
+    values = tree.predict(native, pred_contribs=True, approx_contribs=False).astype(np.float64)
+    errors = np.abs(values.sum(axis=1) - raw)
+    bounds = 1e-5 + 1e-6 * np.abs(raw)
+    if (values.shape != (len(feature_rows), len(model["feature_names"]) + 1) or
+            not np.isfinite(values).all() or not np.isfinite(raw).all() or np.any(errors > bounds)):
+        raise ValueError("B5 native SHAP additivity failed.")
+    return [{"iso_class_id": row["iso_class_id"], "raw_prediction": float(raw[i]),
+             "bias": float(values[i, -1]), "contributions": values[i, :-1].tolist(),
+             "additivity_error": float(errors[i]), "additivity_tolerance": float(bounds[i]),
+             "float32_conversion": conversion} for i, row in enumerate(feature_rows)]

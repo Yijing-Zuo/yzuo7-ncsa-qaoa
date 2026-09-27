@@ -6,8 +6,8 @@ single-run L-BFGS-B optimization, frozen graph libraries, reproducible B1
 task/reference/evaluation pools, read-only labels and diagnostics, and
 training-derived B2 fixed starts and graph-only B3 theoretical starts with single-start comparisons.
 Supplied production and pilot configurations are candidates; use the frozen
-batch manifests for adopted settings. Machine learning and B4–B7 remain
-outside the current implementation.
+batch manifests for adopted settings. B4 Ridge and B5 CPU XGBoost are implemented;
+B6–B7 remain outside the current implementation.
 
 Use Python 3.12. From the repository root, install the pinned environment
 in Windows PowerShell:
@@ -340,3 +340,47 @@ or backend-validation evidence inside the checkpoint; paths must stay inside
 the project and cannot include the whole project or previous canonical archives.
 CV and final fitting are timed separately. Unmeasured historical/offline I/O
 costs are reported as unknown, rather than treated as zero.
+
+## B5 XGBoost initialization
+
+B5 preserves B4's labels, angle symmetries, features, inner folds and optimizer
+budgets. Each sine/cosine coordinate and success rate uses a scalar CPU
+XGBoost model. The six candidates are depths 1/2/3 and 100/300 rounds, selected
+using training-only decoded angle loss or clipped success MSE. Dense feature
+zeros remain values. Native learning uses float32; angle decoding and QAOA use
+float64. Python 3.12+ and `xgboost-cpu==3.4.1` are pinned.
+
+```bash
+python scripts/experiment.py fit-b5 --batch B1_BATCH --attempts B1_ATTEMPTS \
+  --references B1_REFERENCES --config configs/b5-candidate.json --output B5_FITS
+python scripts/experiment.py predict-b5 --fits B5_FITS --library ORIGINAL_LIBRARY \
+  --output B5_PREDICTIONS.json
+python scripts/experiment.py plan-b5 --batch B1_BATCH --attempts B1_ATTEMPTS \
+  --references B1_REFERENCES --predictions B5_PREDICTIONS.json \
+  --config configs/b5-candidate.json --output B5_BATCH
+```
+
+Complete UBJSON model groups resume after provenance checks. Trees and CV
+records stay in the fit directory; predictions contain compact summaries.
+`predict-b5` also writes `B5_PREDICTIONS.shap.json`, explaining the unshuffled
+F success models' raw outputs with exact native TreeSHAP. This does not explain
+clipped probabilities or establish causal feature effects. The full design
+declares 392 scalar models, 5,200 warm tasks and 800 explanations.
+
+Use the existing `run --execute --partitioned --graph-id ID` worker for one
+graph at a time. A B5 graph worker verifies its bound topology, tasks, global
+plan metadata, source and compute environment without reading models or CV.
+Valid completed attempts are retained even before a graph is sealed; normal
+nonconvergence or a threshold miss is not retried.
+
+`summarize-b5` takes the B4 summary arguments above plus
+`--b4-batch/--b4-attempts`. It includes matched B4 comparisons, fixed-start
+controls, success prediction errors, feature/null comparisons, graph bootstrap
+intervals and SHAP summaries. Missing attempts or explanations cannot produce
+a complete result. `snapshot.py --checkpoint-b5 --fits B5_FITS` retains native
+models, CV, explanations and complete attempts with read-only reproduction;
+its external dependencies must name canonical B1/B2/B3/B4 archives.
+
+The full research fits and optimization pools are explicit user operations.
+Development tests use small declared grids and graphs; they establish software
+correctness, not B5 efficacy or readiness of an untested Linux/GPU environment.

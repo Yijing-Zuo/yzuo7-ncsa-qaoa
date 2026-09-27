@@ -7,7 +7,7 @@ name = "qaoa-study"
 version = "0.1.0"
 description = "Numerical core for the NCSA SPIN shallow MaxCut QAOA study"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "PennyLane==0.43.0",
     "PennyLane-Lightning==0.43.0",
@@ -20,6 +20,7 @@ dependencies = [
     "scikit-learn==1.7.2",
     "joblib==1.5.2",
     "threadpoolctl==3.6.0",
+    "xgboost-cpu==3.4.1",
 ]
 
 [project.optional-dependencies]

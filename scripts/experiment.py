@@ -15,6 +15,7 @@ from qaoa_study.experiments import (
     attempt_cost_totals, read_b2_inputs, save_b2_fit, save_b2_batch, validate_b1_comparison,
     read_b3_inputs, save_b3_initializations, save_b3_batch,
     read_b4_inputs, save_b4_fits, save_b4_predictions, save_b4_batch,
+    read_b5_inputs, read_b5_explanations, save_b5_fits, save_b5_predictions, save_b5_batch,
 )
 from qaoa_study.records import evaluate_trace, execution_failed, read_json, write_once_json
 
@@ -446,13 +447,27 @@ def summarize_b3_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_case
 
 
 def summarize_b4_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_cases, b3_batch, b3_attempts):
-    """Read graph-sized validated traces; no prediction, training or quantum calls."""
-    from qaoa_study.analysis import build_b4_summary
+    return _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts,
+                                     b2_cases, b3_batch, b3_attempts)
 
+
+def summarize_b5_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_cases,
+                       b3_batch, b3_attempts, b4_batch, b4_attempts):
+    return _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts,
+        b2_cases, b3_batch, b3_attempts, b4_batch=b4_batch, b4_attempts=b4_attempts)
+
+
+def _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_cases,
+                              b3_batch, b3_attempts, *, b4_batch=None, b4_attempts=None):
+    """Read graph-sized validated traces; no prediction, training or quantum calls."""
+    from qaoa_study.analysis import build_b4_summary, build_b5_summary
+
+    kind = "b4" if b4_batch is None else "b5"
+    method = kind.upper()
     manifest, library, tasks = read_batch(batch)
-    if manifest["config"].get("kind") != "b4":
-        raise ValueError("summarize-b4 requires a B4 batch.")
-    prepared, binding = read_b4_inputs(batch, manifest)
+    if manifest["config"].get("kind") != kind:
+        raise ValueError(f"summarize-{kind} requires a {method} batch.")
+    prepared, binding = (read_b4_inputs if kind == "b4" else read_b5_inputs)(batch, manifest)
     references = {(r["iso_class_id"], r["p"]): r for r in binding["references"]}
     targets = {(t["iso_class_id"], t["p"]) for t in tasks}
     selected, execution, audit = _warm_attempt_views(manifest, tasks, attempts_directory,
@@ -505,10 +520,29 @@ def summarize_b4_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_case
         other_refs, b3_tasks, reference_pairs=set(), by_depth=True)
     validate_b1_comparison(manifest, other, compare_execution,
                            b3_execution or {"environment": b3_prepared["environment"]})
-    summary = build_b4_summary(library, tasks, selected, references, b1_tasks=requested, b1_selected=b1_selected,
+    extra = {}
+    if kind == "b5":
+        fourth, _, b4_tasks = read_batch(b4_batch)
+        if fourth["config"].get("kind") != "b4" or fourth["issues"]:
+            raise ValueError("B5 requires its valid original B4 comparison batch.")
+        b4_prepared, b4_binding = read_b4_inputs(b4_batch, fourth)
+        other_refs = {(r["iso_class_id"], r["p"]): r for r in b4_binding["references"]}
+        if (b4_binding["source_batch_id"] != baseline["batch_id"]
+                or any(other_refs.get(key) != references[key] for key in targets)):
+            raise ValueError("B5/B4 scoring references differ.")
+        b4_selected, b4_execution, b4_audit = _warm_attempt_views(fourth, b4_tasks, b4_attempts,
+            other_refs, b4_tasks, reference_pairs=set(), by_depth=True)
+        validate_b1_comparison(manifest, fourth, compare_execution,
+                              b4_execution or {"environment": b4_prepared["compute_environment"]})
+        extra = {"b4_tasks": b4_tasks, "b4_selected": b4_selected,
+            "b4_predictions": b4_prepared["predictions"],
+            "b4_success_models": [m for m in b4_prepared["models"] if m["head"] == "success"],
+            "explanations": read_b5_explanations(batch, prepared)["rows"]}
+    summary = (build_b4_summary if kind == "b4" else build_b5_summary)(
+        library, tasks, selected, references, b1_tasks=requested, b1_selected=b1_selected,
         b2_tasks=b2_tasks, b2_selected=b2_selected, b3_tasks=b3_tasks, b3_selected=b3_selected,
         predictions=prepared["predictions"], success_models=[m for m in prepared["models"] if m["head"] == "success"],
-        settings=manifest["config"].get("analysis"))
+        settings=manifest["config"].get("analysis"), **extra)
     original_training = {(r["iso_class_id"], r["p"]): r for f in fits for r in f["reference_binding"]["references"]}
     if any(original_training.get((r["iso_class_id"], r["p"])) != r for r in prepared["training_binding"]["references"]):
         raise ValueError("B4 and B2 disagree on shared original training references.")
@@ -520,7 +554,7 @@ def summarize_b4_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_case
         b2_cases=cases, analysis_source=source_identity(), batch_issues=manifest["issues"],
         comparison_inputs={"b1_batch": str(b1_batch), "b1_attempts": str(b1_attempts),
             "b2_cases": [[str(b), str(a)] for b, a in b2_cases], "b3_batch": str(b3_batch), "b3_attempts": str(b3_attempts)},
-        input_audits={"B4": audit, "B1": b1_audit, "B2": audits, "B3": b3_audit},
+        input_audits={method: audit, "B1": b1_audit, "B2": audits, "B3": b3_audit},
         shared_training_reference_costs=training_costs, success_label_costs=prepared["success_label_costs"],
         b3_preparation_costs=b3_prepared["preparation"],
         evaluation_reference_costs_by_depth=b1_audit["reference_attempt_costs_by_depth"],
@@ -532,6 +566,13 @@ def summarize_b4_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_case
         cost_scope="B1 reference attempts form a shared union across B2/B4; never sum per-model copies. "
             "Original training evaluation pools are shared success-label overhead. B3 external constant cost and "
             "historical feature construction are unmeasured. Full actual attempts include retained faults/retries.")
+    if kind == "b5":
+        summary["b4_batch_id"] = fourth["batch_id"]
+        summary["b4_execution_id"] = b4_execution["execution_id"] if b4_execution else None
+        summary["input_audits"]["B4"] = b4_audit
+        summary["comparison_inputs"].update(b4_batch=str(b4_batch), b4_attempts=str(b4_attempts))
+        summary["learning_costs"]["explanations"] = prepared["explanation_timings"]
+        summary["cost_scope"] = summary["cost_scope"].replace("B2/B4", "B2/B4/B5")
     summary["complete"] = summary["complete"] and not manifest["issues"]
     summary["provisional"] = not summary["complete"]
     return summary
@@ -544,19 +585,23 @@ def main(argv=None):
     plan.add_argument("--library", required=True)
     plan.add_argument("--config", required=True)
     plan.add_argument("--output", required=True)
-    b4_fit = commands.add_parser("fit-b4", help="Fit the declared CPU Ridge models from original training graphs only")
-    for option in ("batch", "attempts", "references", "config", "output"):
-        b4_fit.add_argument("--" + option, required=True)
-    b4_predict = commands.add_parser("predict-b4", help="Freeze predictions before reading evaluation references")
-    for option in ("fits", "library", "output"):
-        b4_predict.add_argument("--" + option, required=True)
-    b4_plan = commands.add_parser("plan-b4", help="Bind frozen B4 predictions to original scoring references")
-    for option in ("batch", "attempts", "references", "predictions", "config", "output"):
-        b4_plan.add_argument("--" + option, required=True)
-    b4_summary = commands.add_parser("summarize-b4", help="Read all declared B4 outputs and B1/B2/B3 controls")
-    for option in ("batch", "attempts", "b1-batch", "b1-attempts", "b3-batch", "b3-attempts", "output"):
-        b4_summary.add_argument("--" + option, required=True)
-    b4_summary.add_argument("--b2-case", nargs=2, action="append", required=True, metavar=("BATCH", "ATTEMPTS"))
+    for method, learner, controls in (("b4", "Ridge", "B1/B2/B3"), ("b5", "XGBoost", "B1/B2/B3/B4")):
+        fit = commands.add_parser(f"fit-{method}", help=f"Fit the declared CPU {learner} models on training graphs only")
+        for option in ("batch", "attempts", "references", "config", "output"):
+            fit.add_argument("--" + option, required=True)
+        predict = commands.add_parser(f"predict-{method}", help="Freeze predictions before evaluation references")
+        for option in ("fits", "library", "output"):
+            predict.add_argument("--" + option, required=True)
+        plan_learned = commands.add_parser(f"plan-{method}", help="Bind frozen predictions to original references")
+        for option in ("batch", "attempts", "references", "predictions", "config", "output"):
+            plan_learned.add_argument("--" + option, required=True)
+        summary = commands.add_parser(f"summarize-{method}", help=f"Read frozen outputs and {controls} controls")
+        options = ["batch", "attempts", "b1-batch", "b1-attempts", "b3-batch", "b3-attempts", "output"]
+        if method == "b5":
+            options += ["b4-batch", "b4-attempts"]
+        for option in options:
+            summary.add_argument("--" + option, required=True)
+        summary.add_argument("--b2-case", nargs=2, action="append", required=True, metavar=("BATCH", "ATTEMPTS"))
     for command in ("fit-b2", "plan-b2"):
         sub = commands.add_parser(command, help="Fit or freeze B2 using complete original training references")
         for option in ("batch", "attempts", "references", "output"):
@@ -602,24 +647,26 @@ def main(argv=None):
             sub.add_argument("--partitioned-output", action="store_true", help="Write bounded-memory per-graph tables and a root index")
     args = parser.parse_args(argv)
     try:
-        if args.command not in ("run", "fit-b4") and Path(args.output).exists():
+        if args.command not in ("run", "fit-b4", "fit-b5") and Path(args.output).exists():
             raise FileExistsError("Choose a new output path; frozen outputs are not overwritten.")
-        if args.command == "fit-b4":
-            result = save_b4_fits(args.output, args.batch, args.references, args.attempts, read_json(args.config))
+        if args.command in ("fit-b4", "fit-b5"):
+            result = (save_b4_fits if args.command == "fit-b4" else save_b5_fits)(args.output, args.batch, args.references, args.attempts, read_json(args.config))
             print(json.dumps({"fit_set_id": result["manifest"]["fit_set_id"], "models": len(result["models"])}))
             return 0
-        if args.command == "predict-b4":
-            result = save_b4_predictions(args.output, args.fits, args.library)
+        if args.command in ("predict-b4", "predict-b5"):
+            result = (save_b4_predictions if args.command == "predict-b4" else save_b5_predictions)(args.output, args.fits, args.library)
             print(json.dumps({"preparation_id": result["preparation_id"], "predictions": len(result["predictions"])}))
             return 0
-        if args.command == "plan-b4":
-            manifest = save_b4_batch(args.output, args.predictions, args.batch, args.references,
+        if args.command in ("plan-b4", "plan-b5"):
+            manifest = (save_b4_batch if args.command == "plan-b4" else save_b5_batch)(args.output, args.predictions, args.batch, args.references,
                                     args.attempts, read_json(args.config))
             print(json.dumps({k: manifest[k] for k in ("batch_id", "task_count", "issues")}))
             return 2 if manifest["issues"] else 0
-        if args.command == "summarize-b4":
-            summary = summarize_b4_batch(args.batch, args.attempts, args.b1_batch, args.b1_attempts,
-                                         args.b2_case, args.b3_batch, args.b3_attempts)
+        if args.command in ("summarize-b4", "summarize-b5"):
+            summarizer = summarize_b4_batch if args.command == "summarize-b4" else summarize_b5_batch
+            extra = {} if args.command == "summarize-b4" else {"b4_batch": args.b4_batch, "b4_attempts": args.b4_attempts}
+            summary = summarizer(args.batch, args.attempts, args.b1_batch, args.b1_attempts,
+                                 args.b2_case, args.b3_batch, args.b3_attempts, **extra)
             save_summary(args.output, summary)
             print(json.dumps({"complete": summary["complete"], "comparisons": len(summary["comparisons"])}))
             return 0 if summary["complete"] else 2

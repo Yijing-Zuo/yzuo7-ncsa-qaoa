@@ -1,8 +1,8 @@
-"""Create or verify a runtime snapshot or a complete, local B3/B4 checkpoint.
+"""Create or verify a runtime snapshot or a complete, local B3/B4/B5 checkpoint.
 
 The archive excludes Git history, notes, tests, credentials and environments.
 Runtime snapshots include the selected frozen library under data/library.
-B3/B4 checkpoints retain the original relative paths of selected run data;
+B3/B4/B5 checkpoints retain the original relative paths of selected run data;
 canonical earlier archives remain external, with explicit paths and hashes.
 Creation/verification reads that library without recomputing exact answers,
 features, QAOA values or diagnostics. Transfer and execution remain manual.
@@ -17,10 +17,11 @@ import tempfile
 import zipfile
 
 from qaoa_study.experiments import (
-    _writer_lock, digest, load_attempts, read_b4_fits, read_b4_inputs, read_batch,
-    runtime_files, source_identity,
+    _b5_model_summary, _writer_lock, digest, load_attempts, read_b4_fits, read_b4_inputs,
+    read_b5_explanations, read_b5_fits, read_b5_inputs, read_batch,
+    runtime_files, select_attempts, source_identity,
 )
-from qaoa_study.records import read_json, read_library
+from qaoa_study.records import execution_failed, read_json, read_library
 
 
 LIBRARY_FILES = ("graphs.parquet", "config.json", "generation.jsonl", "splits.json", "manifest.json")
@@ -129,17 +130,21 @@ def _tree_files(root, directory):
 def _dependencies(value, external_root=None, *, kind="b3"):
     """Validate portable external references; optionally verify the canonical bytes."""
     checkpoints, inputs = value["checkpoints"], value["comparison_inputs"]
-    roles = ["B1", "B2", "B3"] if kind == "b4" else ["B1", "B2"]
+    roles = ["B1", "B2"] + (["B3"] if kind in ("b4", "b5") else []) + (["B4"] if kind == "b5" else [])
     expected = {"b1_batch", "b1_attempts", "b2_cases"}
-    if kind == "b4":
+    if kind in ("b4", "b5"):
         expected |= {"b3_batch", "b3_attempts"}
+    if kind == "b5":
+        expected |= {"b4_batch", "b4_attempts"}
     if value.get("dependency_version") != 1 or sorted(row["role"] for row in checkpoints) != roles:
         raise ValueError(f"Checkpoint dependencies require exactly canonical {roles} entries.")
     if set(inputs) != expected or not inputs["b2_cases"]:
         raise ValueError("Checkpoint comparison inputs do not match the declared stage.")
     paths = [inputs["b1_batch"], inputs["b1_attempts"]]
-    if kind == "b4":
+    if kind in ("b4", "b5"):
         paths.extend([inputs["b3_batch"], inputs["b3_attempts"]])
+    if kind == "b5":
+        paths.extend([inputs["b4_batch"], inputs["b4_attempts"]])
     for case in inputs["b2_cases"]:
         if len(case) != 2:
             raise ValueError("Each B2 case must give its batch and attempts paths.")
@@ -162,7 +167,7 @@ def _dependencies(value, external_root=None, *, kind="b3"):
 
 def _checkpoint_state(root, manifest, external_root=None, *, dependencies=None):
     """Read frozen records/models; never initialize, fit or rebuild references."""
-    if manifest.get("kind") not in ("b3-checkpoint-v1", "b4-checkpoint-v1"):
+    if manifest.get("kind") not in ("b3-checkpoint-v1", "b4-checkpoint-v1", "b5-checkpoint-v1"):
         raise ValueError("Unsupported result checkpoint kind.")
     kind = manifest["kind"].split("-")[0]
     batch, library, tasks = read_batch(_payload_path(root, manifest["batch_path"]))
@@ -183,25 +188,37 @@ def _checkpoint_state(root, manifest, external_root=None, *, dependencies=None):
             summary.get("execution_id") != execution["execution_id"] or
             summary.get("analysis_source") != batch["source"]):
         raise ValueError("Checkpoint summary, execution or analysis source mismatch.")
-    keys = ("preparation_id", "reference_binding_digest") if kind == "b4" else (
+    keys = ("preparation_id", "reference_binding_digest") if kind in ("b4", "b5") else (
         "initialization_set_id", "reference_binding_digest")
     if (any(summary.get(key) != batch["config"][kind + "_inputs"][key] for key in keys) or
             summary["input_audits"][kind.upper()]["input_digest"] != digest(audit.get("file_hashes", {}))):
         raise ValueError("Checkpoint summary does not describe the frozen initialization/binding and retained attempts.")
-    if kind == "b4":
+    if kind in ("b4", "b5"):
         if manifest.get("fits_path") not in manifest["result_trees"]:
-            raise ValueError("B4 checkpoint must retain the complete fit tree.")
-        prepared, _ = read_b4_inputs(_payload_path(root, manifest["batch_path"]), batch)
-        fits = read_b4_fits(_payload_path(root, manifest["fits_path"]))
+            raise ValueError(f"{kind.upper()} checkpoint must retain the complete fit tree.")
+        prepared, _ = (read_b4_inputs if kind == "b4" else read_b5_inputs)(
+            _payload_path(root, manifest["batch_path"]), batch)
+        fits = (read_b4_fits if kind == "b4" else read_b5_fits)(_payload_path(root, manifest["fits_path"]))
         fit_manifest = fits["manifest"]
-        if (fit_manifest != prepared["fit_set_manifest"] or fits["models"] != prepared["models"]
+        models = fits["models"] if kind == "b4" else [_b5_model_summary(model) for model in fits["models"]]
+        if (fit_manifest != prepared["fit_set_manifest"] or models != prepared["models"]
                 or fit_manifest["fit_set_id"] != prepared["fit_set_id"]
                 or fit_manifest["fit_set_id"] != summary.get("fit_set_id")
                 or fit_manifest["source"] != batch["source"]
                 or fit_manifest["library_id"] != library["library_id"]
                 or fits["features"]["feature_artifact_id"] != prepared["feature_artifact_id"]
                 or fits["training"]["reference_binding"] != prepared["training_binding"]):
-            raise ValueError("B4 checkpoint fitting artifacts disagree with frozen predictions or summary.")
+            raise ValueError(f"{kind.upper()} checkpoint fitting artifacts disagree with frozen predictions or summary.")
+        if kind == "b5":
+            explanations = read_b5_explanations(_payload_path(root, manifest["batch_path"]), prepared)
+            chosen = select_attempts(attempts)
+            if (set(chosen) != {task["task_id"] for task in tasks}
+                    or any(not row.get("run_completed") or execution_failed(row) for row in chosen.values())
+                    or summary.get("warm_compute_complete") is not True or summary.get("analysis_complete") is not True
+                    or summary.get("shap_coverage", {}).get("complete") is not True
+                    or summary["shap_coverage"].get("observed_rows") != len(explanations["rows"])
+                    or summary["shap_coverage"].get("planned_rows") != len(explanations["rows"])):
+                raise ValueError("B5 complete checkpoint requires all valid planned tasks and complete SHAP analysis.")
     if dependencies is None:
         dependencies = read_json(_payload_path(root, "checkpoint/dependencies.json"))
     inputs = _dependencies(dependencies, external_root, kind=kind)
@@ -216,12 +233,18 @@ def _checkpoint_state(root, manifest, external_root=None, *, dependencies=None):
                 baseline_execution["execution_id"] != summary["b1_execution_id"] or
                 sorted(cases) != sorted((row["batch_id"], row["execution_id"]) for row in summary["b2_cases"])):
             raise ValueError("External comparison batches disagree with the saved summary.")
-        if kind == "b4":
+        if kind in ("b4", "b5"):
             b3, _, _ = read_batch(_payload_path(external_root, inputs["b3_batch"]))
             b3_execution = read_json(_payload_path(external_root, inputs["b3_attempts"] + "/manifest.json"))
             if (b3["batch_id"] != summary["b3_batch_id"] or
                     b3_execution["execution_id"] != summary["b3_execution_id"]):
-                raise ValueError("External B3 comparison disagrees with the saved B4 summary.")
+                raise ValueError(f"External B3 comparison disagrees with the saved {kind.upper()} summary.")
+        if kind == "b5":
+            b4, _, _ = read_batch(_payload_path(external_root, inputs["b4_batch"]))
+            b4_execution = read_json(_payload_path(external_root, inputs["b4_attempts"] + "/manifest.json"))
+            if (b4["batch_id"] != summary["b4_batch_id"] or
+                    b4_execution["execution_id"] != summary["b4_execution_id"]):
+                raise ValueError("External B4 comparison disagrees with the saved B5 summary.")
     return {"batch_id": batch["batch_id"], "retained_completed_attempts": len(attempts),
             "summary_complete": summary.get("complete"), "external_dependencies_verified": external_root is not None}
 
@@ -235,7 +258,7 @@ import sys
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root))
 from scripts.snapshot import verify_snapshot
-from scripts.experiment import summarize_b3_batch, summarize_b4_batch
+from scripts.experiment import summarize_b3_batch, summarize_b4_batch, summarize_b5_batch
 from qaoa_study.records import write_once_json
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -249,7 +272,10 @@ external = args.external_root.resolve()
 arguments = [root / manifest["batch_path"], root / manifest["attempts_path"],
     external / inputs["b1_batch"], external / inputs["b1_attempts"],
     [(external / batch, external / attempts) for batch, attempts in inputs["b2_cases"]]]
-if manifest["kind"] == "b4-checkpoint-v1":
+if manifest["kind"] == "b5-checkpoint-v1":
+    summary = summarize_b5_batch(*arguments, external / inputs["b3_batch"], external / inputs["b3_attempts"],
+                                external / inputs["b4_batch"], external / inputs["b4_attempts"])
+elif manifest["kind"] == "b4-checkpoint-v1":
     summary = summarize_b4_batch(*arguments, external / inputs["b3_batch"], external / inputs["b3_attempts"])
 else:
     summary = summarize_b3_batch(*arguments)
@@ -284,6 +310,19 @@ def create_b4_checkpoint(output, library_path, config_path, batch, attempts_dire
                               support_paths=support_paths, root=root, external_root=external_root)
 
 
+def create_b5_checkpoint(output, library_path, config_path, batch, attempts_directory,
+                         summary_path, dependencies_path, *, fits_directory, support_paths=(),
+                         root=None, external_root=None):
+    """Preserve B5 native models/CV once, graph inputs, SHAP and all run attempts.
+
+    B1/B2/B3/B4 canonical archives remain external dependencies. Completion
+    requires independently audited logical tasks and the full frozen SHAP set.
+    """
+    return _create_checkpoint(output, library_path, config_path, batch, attempts_directory,
+                              summary_path, dependencies_path, kind="b5", fits_directory=fits_directory,
+                              support_paths=support_paths, root=root, external_root=external_root)
+
+
 def _create_checkpoint(output, library_path, config_path, batch, attempts_directory,
                        summary_path, dependencies_path, *, kind, fits_directory=None, support_paths=(),
                        root=None, external_root=None):
@@ -299,7 +338,7 @@ def _create_checkpoint(output, library_path, config_path, batch, attempts_direct
     if _payload_path(root, summary_tree).is_dir():
         locations["summary_path"] += "/summary.json"
     trees = [locations["batch_path"], locations["attempts_path"], summary_tree]
-    if kind == "b4":
+    if kind in ("b4", "b5"):
         locations["fits_path"] = Path(fits_directory).resolve().relative_to(root).as_posix()
         trees.append(locations["fits_path"])
         for path in support_paths:
@@ -309,7 +348,7 @@ def _create_checkpoint(output, library_path, config_path, batch, attempts_direct
                 raise FileNotFoundError(support)
             trees.append(name)
     elif support_paths:
-        raise ValueError("Support paths are only supported for B4 checkpoints.")
+        raise ValueError("Support paths are only supported for B4/B5 checkpoints.")
     if any(name == "." for name in trees):
         raise ValueError("Select individual result directories, not the whole source root.")
     if any(output.is_relative_to(_payload_path(root, name)) for name in trees):
@@ -363,7 +402,7 @@ def verify_snapshot(directory, *, external_root=None):
     expected_library = {manifest["library_path"] + "/" + name for name in LIBRARY_FILES}
     expected = expected_runtime | expected_library
     if manifest["snapshot_version"] == 2:
-        if manifest.get("kind") not in ("b3-checkpoint-v1", "b4-checkpoint-v1"):
+        if manifest.get("kind") not in ("b3-checkpoint-v1", "b4-checkpoint-v1", "b5-checkpoint-v1"):
             raise ValueError("Unsupported result checkpoint kind.")
         expected |= {name for tree in manifest["result_trees"] for name in _tree_files(directory, tree)}
         expected |= {manifest["config_path"], "checkpoint/dependencies.json", "checkpoint/reproduce.py"}
@@ -398,38 +437,40 @@ def main(argv=None):
     parser.add_argument("--verify", type=Path, help="Verify an already extracted snapshot directory.")
     parser.add_argument("--checkpoint", action="store_true", help="Capture complete B3 results and external dependency declarations.")
     parser.add_argument("--checkpoint-b4", action="store_true", help="Capture complete B4 results, fits and dependencies.")
+    parser.add_argument("--checkpoint-b5", action="store_true", help="Capture complete B5 native fits, SHAP and dependencies.")
     parser.add_argument("--support", type=Path, action="append", default=[],
-                        help="Explicit B4 support file/directory inside the source root; repeat as needed.")
+                        help="Explicit B4/B5 support file/directory inside the source root; repeat as needed.")
     for name in ("batch", "attempts", "summary", "dependencies", "external-root", "fits"):
         parser.add_argument("--" + name, type=Path)
     args = parser.parse_args(argv)
     if args.verify is not None:
-        if args.checkpoint or args.checkpoint_b4 or args.support or any(value is not None for value in
+        if args.checkpoint or args.checkpoint_b4 or args.checkpoint_b5 or args.support or any(value is not None for value in
                 (args.output, args.library, args.config, args.batch, args.attempts, args.summary, args.dependencies, args.fits)):
             parser.error("--verify is separate from snapshot creation options")
         result = verify_snapshot(args.verify, external_root=args.external_root)
     else:
         if any(value is None for value in (args.output, args.library, args.config)):
             parser.error("snapshot creation requires --output, --library and --config")
-        if args.checkpoint and args.checkpoint_b4:
+        if sum((args.checkpoint, args.checkpoint_b4, args.checkpoint_b5)) > 1:
             parser.error("Select only one checkpoint stage")
-        if args.checkpoint or args.checkpoint_b4:
+        if args.checkpoint or args.checkpoint_b4 or args.checkpoint_b5:
             if any(value is None for value in (args.batch, args.attempts, args.summary, args.dependencies)):
                 parser.error("Checkpoint requires --batch, --attempts, --summary and --dependencies")
-            if args.checkpoint_b4:
+            if args.checkpoint_b4 or args.checkpoint_b5:
                 if args.fits is None:
-                    parser.error("B4 checkpoint requires --fits")
-                result = create_b4_checkpoint(args.output, args.library, args.config, args.batch, args.attempts,
+                    parser.error("B4/B5 checkpoint requires --fits")
+                creator = create_b5_checkpoint if args.checkpoint_b5 else create_b4_checkpoint
+                result = creator(args.output, args.library, args.config, args.batch, args.attempts,
                     args.summary, args.dependencies, fits_directory=args.fits, support_paths=args.support,
                     external_root=args.external_root)
             else:
                 if args.fits is not None or args.support:
-                    parser.error("--fits and --support require --checkpoint-b4")
+                    parser.error("--fits and --support require --checkpoint-b4 or --checkpoint-b5")
                 result = create_b3_checkpoint(args.output, args.library, args.config, args.batch, args.attempts,
                                              args.summary, args.dependencies, external_root=args.external_root)
         else:
             if args.support or any(value is not None for value in (args.batch, args.attempts, args.summary, args.dependencies, args.external_root, args.fits)):
-                parser.error("Result options require --checkpoint or --checkpoint-b4")
+                parser.error("Result options require --checkpoint, --checkpoint-b4 or --checkpoint-b5")
             result = create_snapshot(args.output, args.library, args.config)
     print(json.dumps(result, indent=2))
     return 0

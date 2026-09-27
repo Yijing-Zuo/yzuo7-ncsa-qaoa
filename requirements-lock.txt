@@ -34,3 +34,4 @@ tomlkit==0.15.1
 typing_extensions==4.16.0
 urllib3==2.7.0
 wheel==0.48.0
+xgboost-cpu==3.4.1

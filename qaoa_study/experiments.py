@@ -229,11 +229,24 @@ def library_issues(library, config):
 
 
 def save_batch(directory, library_path, config, *, b2_fit=None, reference_binding=None, b3_initializations=None,
-               b4_prepared=None):
+               b4_prepared=None, b5_prepared=None, b5_explanations=None):
     """Freeze task JSONL and metadata. This operation performs no scientific computation."""
     directory, library_path = Path(directory), Path(library_path).resolve()
     library = read_library(library_path)
-    if b4_prepared is not None:
+    graph_inputs = {}
+    if b5_prepared is not None:
+        config = {**config, "b5_inputs": {"preparation_id": b5_prepared["preparation_id"],
+                  "prepared_digest": digest(b5_prepared), "reference_binding_digest": digest(reference_binding)}}
+        tasks = build_b5_tasks(library, config, b5_prepared, reference_binding)
+        graphs = {g["iso_class_id"]: g for g in library["graphs"]}
+        for (identity, _), group in _task_groups(tasks).items():
+            graph_inputs[identity] = {"version": "b5-graph-input-v1", "graph": graphs[identity], "tasks": group,
+                "library_id": library["library_id"], "source_id": b5_prepared["source"]["source_id"],
+                "compute_environment": b5_prepared["compute_environment"]}
+        index = {identity: {"path": "graphs/" + digest(identity) + ".json", "digest": digest(value)}
+                 for identity, value in graph_inputs.items()}
+        config["b5_inputs"]["execution_inputs_digest"] = digest(index)
+    elif b4_prepared is not None:
         config = {**config, "b4_inputs": {"preparation_id": b4_prepared["preparation_id"],
                   "prepared_digest": digest(b4_prepared), "reference_binding_digest": digest(reference_binding)}}
         tasks = build_b4_tasks(library, config, b4_prepared, reference_binding)
@@ -250,7 +263,7 @@ def save_batch(directory, library_path, config, *, b2_fit=None, reference_bindin
                   "fit_digest": digest(b2_fit), "reference_binding_digest": digest(reference_binding)}}
         tasks = build_b2_tasks(library, config, b2_fit, reference_binding)
     else:
-        if config.get("kind") in ("b2", "b3", "b4"):
+        if config.get("kind") in ("b2", "b3", "b4", "b5"):
             raise ValueError("Warm planning requires frozen initialization inputs and audited reference binding.")
         tasks = build_tasks(library, config)
     content = "".join(json.dumps(task, sort_keys=True, allow_nan=False) + "\n" for task in tasks).encode()
@@ -259,6 +272,14 @@ def save_batch(directory, library_path, config, *, b2_fit=None, reference_bindin
         raise ValueError("B3 source changed since preparation; prepare again with the final source.")
     if b4_prepared is not None and b4_prepared["source"] != source:
         raise ValueError("B4 source changed since preparation; use the final frozen source.")
+    if b5_prepared is not None and b5_prepared["source"] != source:
+        raise ValueError("B5 source changed since preparation; use the final frozen source.")
+    if b5_prepared is not None:
+        config["b5_inputs"]["plan_metadata_digest"] = digest({
+            "issues": library_issues(library, config), "task_count": len(tasks),
+            "counts": dict(Counter(task["experiment_role"] for task in tasks)),
+            "coverage": graph_split_coverage(library["graphs"], library.get("cells")),
+            "attempt_selection_rule": ATTEMPT_RULE})
     identity = {"library_id": library["library_id"], "config": config, "source_id": source["source_id"],
                 "tasks_sha256": hashlib.sha256(content).hexdigest()}
     manifest = {**identity, "batch_id": digest(identity), "source": source,
@@ -275,6 +296,13 @@ def save_batch(directory, library_path, config, *, b2_fit=None, reference_bindin
         write_once_json(directory / "initializations.json", b3_initializations)
     if b4_prepared is not None:
         write_once_json(directory / "prepared.json", b4_prepared)
+    if b5_prepared is not None:
+        write_once_json(directory / "prepared.json", b5_prepared)
+        _validate_b5_explanations(b5_explanations, b5_prepared)
+        write_once_json(directory / "explanations.json", b5_explanations)
+        write_once_json(directory / "execution-inputs.json", index)
+        for identity, value in graph_inputs.items():
+            write_once_json(directory / index[identity]["path"], value)
     if reference_binding is not None:
         write_once_json(directory / "reference_binding.json", reference_binding)
     (directory / "tasks.jsonl").write_bytes(content)
@@ -324,6 +352,20 @@ def read_batch(directory):
         prepared, binding = read_b4_inputs(directory, manifest)
         if build_b4_tasks(library, manifest["config"], prepared, binding) != tasks:
             raise ValueError("B4 tasks disagree with frozen prediction/reference inputs.")
+    elif manifest["config"].get("kind") == "b5":
+        prepared, binding = read_b5_inputs(directory, manifest)
+        if build_b5_tasks(library, manifest["config"], prepared, binding) != tasks:
+            raise ValueError("B5 tasks disagree with frozen prediction/reference inputs.")
+        read_b5_explanations(directory, prepared)
+        index = _b5_execution_index(directory, manifest)
+        groups = _task_groups(tasks)
+        if set(index) != {key[0] for key in groups}:
+            raise ValueError("B5 graph execution coverage changed.")
+        for identity in index:
+            _, partial, group, compute = read_b5_worker_input(directory, identity, manifest=manifest, index=index)
+            graph = next(g for g in library["graphs"] if g["iso_class_id"] == identity)
+            if partial["graphs"] != [graph] or group != groups[identity, "warm_start"] or compute != prepared["compute_environment"]:
+                raise ValueError("B5 graph execution input disagrees with the full frozen plan.")
     return manifest, library, tasks
 
 
@@ -878,7 +920,14 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
     Partitioned execution has one writer. Graph selection limits record reads,
     not task identity, budgets or seeds; reports explicitly describe that scope.
     """
-    manifest, library, tasks = read_batch(batch_directory)
+    header = (read_json(Path(batch_directory) / "manifest.json")
+              if partitioned and graph_ids is not None and len(graph_ids) == 1 else None)
+    compact = header is not None and header["config"].get("kind") == "b5"
+    bound_compute = None
+    if compact:
+        manifest, library, tasks, bound_compute = read_b5_worker_input(batch_directory, next(iter(graph_ids)), manifest=header)
+    else:
+        manifest, library, tasks = read_batch(batch_directory)
     groups = _task_groups(tasks)
     if roles is not None and not set(roles) <= {"tier1", "reference", "evaluation", "gradient_diagnostic", "warm_start"}:
         raise ValueError("Unknown experiment role.")
@@ -914,7 +963,12 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
         prepared, _ = read_b4_inputs(batch_directory, manifest)
         if prepared["compute_environment"] != runtime:
             issues.append({"mismatch": "B4_bound_compute_environment_changed"})
-    report = {"dry_run": not execute, "batch_id": manifest["batch_id"], "planned": len(tasks),
+    if manifest["config"].get("kind") == "b5":
+        if bound_compute is None:
+            bound_compute = read_b5_inputs(batch_directory, manifest)[0]["compute_environment"]
+        if bound_compute != runtime:
+            issues.append({"mismatch": "B5_bound_compute_environment_changed"})
+    report = {"dry_run": not execute, "batch_id": manifest["batch_id"], "planned": manifest["task_count"] if compact else len(tasks),
               "shard_tasks": len(work), "issues": issues,
               "completed_scope": "selected_groups" if partitioned else "entire_batch",
               "work_scope": {"roles": sorted(roles) if roles is not None else "all",
@@ -939,7 +993,9 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
                                   backend=backend, device_identity=device_identity, max_tasks=max_tasks)
                     if execute else report)
         if output.exists():
-            _check_partition_paths(output, groups)
+            allowed_groups = ({(identity, "warm_start"): [] for identity in _b5_execution_index(batch_directory, manifest)}
+                              if compact else groups)
+            _check_partition_paths(output, allowed_groups)
             if old is None and any((output / name).exists() for name in ("active", "sealed")):
                 raise ValueError("Partitioned records have no root execution manifest.")
         if execute and old is None:
@@ -1421,6 +1477,16 @@ def b4_specifications(settings):
     return specs
 
 
+def b5_specifications(settings):
+    """Same predeclared feature/scope design, with a separate tree learner contract."""
+    from .learning import _b5_settings
+    if settings.get("kind") != "b5":
+        raise ValueError("B5 requires its own study kind.")
+    learning = _b5_settings(settings.get("learning"))
+    shared = {key: learning[key] for key in ("development", "random_n_splits")}
+    return b4_specifications({**settings, "kind": "b4", "learning": shared})
+
+
 def _b4_check_identity(value, key):
     if value.get(key) != digest({k: v for k, v in value.items() if k != key}):
         raise ValueError(f"B4 {key} checksum mismatch.")
@@ -1456,6 +1522,14 @@ def _b4_training_labels(manifest, tasks, attempts_directory, binding, ids):
 
 
 def save_b4_fits(output, batch, references_directory, attempts_directory, settings):
+    return _save_learning_fits(output, batch, references_directory, attempts_directory, settings, kind="b4")
+
+
+def save_b5_fits(output, batch, references_directory, attempts_directory, settings):
+    return _save_learning_fits(output, batch, references_directory, attempts_directory, settings, kind="b5")
+
+
+def _save_learning_fits(output, batch, references_directory, attempts_directory, settings, *, kind):
     """Fit the declared CPU models, resuming only complete immutable model artifacts.
 
     Features are topology-only; only original global-training reference/outcome
@@ -1466,7 +1540,12 @@ def save_b4_fits(output, batch, references_directory, attempts_directory, settin
     from .features import B4_FEATURE_VERSION, b4_feature_row
     from .learning import fit_b4_model, select_b2_graphs, validate_b4_model
 
-    specs = b4_specifications(settings)
+    tree = kind == "b5"
+    specs = b5_specifications(settings) if tree else b4_specifications(settings)
+    reader = read_b5_fits if tree else read_b4_fits
+    if tree:
+        from .learning import fit_b5_model, b5_model_bytes, validate_b5_model
+    validator = validate_b5_model if tree else validate_b4_model
     output = Path(output)
     artifact_writes = {}
 
@@ -1481,7 +1560,7 @@ def save_b4_fits(output, batch, references_directory, attempts_directory, settin
     ids = [g["iso_class_id"] for g in training]
     if not ids:
         raise ValueError("B4 training set is empty.")
-    setup = {"version": "b4-fitting-v1", "source": source, "settings": settings,
+    setup = {"version": kind + "-fitting-v1", "source": source, "settings": settings,
              "library_id": library["library_id"], "library_manifest_sha256": manifest["library_manifest_sha256"],
              "split_digest": digest(library["split_summary"]), "source_batch_id": manifest["batch_id"],
              "reference_manifest_sha256": hashlib.sha256((Path(references_directory) / "manifest.json").read_bytes()).hexdigest(),
@@ -1498,8 +1577,10 @@ def save_b4_fits(output, batch, references_directory, attempts_directory, settin
                 if unexpected:
                     raise ValueError("B4 fitting directory contains unbound files.")
             save_artifact(output / "setup.json", setup)
+        if tree and (output / "models").exists():
+            _discard_b5_stages(output / "models")
         if (output / "manifest.json").exists():
-            return read_b4_fits(output)
+            return reader(output)
         feature_path = output / "features.json"
         if feature_path.exists():
             features = read_json(feature_path)
@@ -1534,8 +1615,13 @@ def save_b4_fits(output, batch, references_directory, attempts_directory, settin
         learning_environment = {"python": platform.python_version(),
             "packages": {name: version(name) for name in ("numpy", "scipy", "scikit-learn", "joblib", "threadpoolctl")},
             "blas_threads": 1, "thread_limit": "threadpoolctl context during fitting"}
+        if tree:
+            import xgboost
+            learning_environment["xgboost"] = xgboost.__version__
+            learning_environment["packages"]["xgboost-cpu"] = version("xgboost-cpu")
+            learning_environment["xgboost_build"] = {k: v for k, v in xgboost.build_info().items() if k != "libxgboost"}
         feature_lookup = {r["iso_class_id"]: r for r in features["rows"]}
-        model_paths = []
+        model_paths, booster_paths, summaries = [], [], {}
         (output / "models").mkdir(exist_ok=True)
         for spec in specs:
             graphs = select_b2_graphs(library, spec["regime"], spec["fold"], "training")
@@ -1545,13 +1631,17 @@ def save_b4_fits(output, batch, references_directory, attempts_directory, settin
                           for r in binding["references"] if r["p"] == spec["p"] and r["iso_class_id"] in wanted]
             outcomes = [r for r in labels if r["p"] == spec["p"] and r["iso_class_id"] in wanted]
             for head in ("angles", "success"):
-                name = "models/" + digest({**spec, "head": head}) + ".json"
+                name = "models/" + digest({**spec, "head": head}) + ("/model.json" if tree else ".json")
                 model_paths.append(name)
                 path = output / name
                 if path.exists():
                     model = read_json(path)
                     _b4_check_identity(model, "fit_id")
-                    validate_b4_model(model)
+                    if tree:
+                        _read_b5_booster_group(path, model)
+                        booster_paths.extend(str(Path(name).parent / member).replace("\\", "/") for member in model["booster_files"])
+                        summaries[name] = digest(_b5_model_summary(model))
+                    validator(model)
                     if (model["source"] != source or model["training_binding_digest"] != digest(training_data)
                             or model["learning_environment"] != learning_environment
                             or any(model.get(k) != v for k, v in {**spec, "head": head}.items())):
@@ -1559,17 +1649,32 @@ def save_b4_fits(output, batch, references_directory, attempts_directory, settin
                     continue
                 start = perf_counter()
                 with threadpool_limits(limits=1):
-                    model = fit_b4_model(graphs, [feature_lookup[g["iso_class_id"]] for g in graphs],
+                    fit_features = [feature_lookup[g["iso_class_id"]] for g in graphs]
+                    fitted = (fit_b5_model if tree else fit_b4_model)(graphs, fit_features,
                         candidates, outcomes, **spec, head=head, settings=settings.get("learning"))
+                    if tree:
+                        model, boosters = fitted
+                        payloads = b5_model_bytes(model, boosters, fit_features)
+                        model["booster_files"] = {f"scalar-{i}.ubj": hashlib.sha256(value).hexdigest()
+                                                  for i, value in enumerate(payloads)}
+                    else:
+                        model = fitted
                 model.update(source=source, library_id=library["library_id"], split_digest=setup["split_digest"],
                     training_binding_digest=digest(training_data), feature_artifact_id=features["feature_artifact_id"],
                     learning_environment=learning_environment, fit_seconds=perf_counter() - start)
                 model["fit_id"] = digest(model)
-                validate_b4_model(model)
-                save_artifact(path, model)
+                validator(model)
+                if tree:
+                    writes = _write_b5_group(path, model, payloads)
+                    artifact_writes.update({(Path(name).parent / member).as_posix(): seconds
+                                            for member, seconds in writes.items()})
+                    booster_paths.extend(str(Path(name).parent / member).replace("\\", "/") for member in model["booster_files"])
+                    summaries[name] = digest(_b5_model_summary(model))
+                else:
+                    save_artifact(path, model)
         if source_identity() != source:
             raise ValueError("Source changed while fitting; do not finalize this B4 fit set.")
-        names = ["setup.json", "features.json", "training.json", *model_paths]
+        names = ["setup.json", "features.json", "training.json", *model_paths, *booster_paths]
         result = {**setup, "model_files": model_paths, "compute_environment": execution["environment"],
                   "artifact_io": {"write_seconds_by_file": artifact_writes,
                       "unmeasured_preexisting_files": sorted(set(names) - set(artifact_writes)),
@@ -1577,9 +1682,11 @@ def save_b4_fits(output, batch, references_directory, attempts_directory, settin
                       "scope": "Measured immutable artifact writes in the final fitting invocation only; "
                                "reads, final manifest and interrupted earlier invocations are unmeasured."},
                   "files": {name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in names}}
+        if tree:
+            result["summary_digests"] = summaries
         result["fit_set_id"] = digest(result)
         write_once_json(output / "manifest.json", result)
-    return read_b4_fits(output)
+    return reader(output)
 
 
 def _b4_fit_manifest(manifest):
@@ -1698,18 +1805,27 @@ def read_b4_inputs(directory, manifest):
 
 
 def build_b4_tasks(library, config, prepared, binding):
+    return _build_learning_tasks(library, config, prepared, binding, kind="b4")
+
+
+def build_b5_tasks(library, config, prepared, binding):
+    return _build_learning_tasks(library, config, prepared, binding, kind="b5")
+
+
+def _build_learning_tasks(library, config, prepared, binding, *, kind):
     """Plan from frozen predictions only; no refit, inference or score-based selection."""
     from .learning import _b4_settings, b4_decode_angles, select_b2_graphs, validate_b4_model
 
-    specs = b4_specifications(config)
+    tree = kind == "b5"
+    specs = b5_specifications(config) if tree else b4_specifications(config)
     _b4_check_identity(prepared, "preparation_id")
     fit_manifest = prepared["fit_set_manifest"]
-    _b4_fit_manifest(fit_manifest)
+    (_b5_fit_manifest if tree else _b4_fit_manifest)(fit_manifest)
     if (any(fit_manifest.get(k) != prepared[k] for k in ("fit_set_id", "source", "library_id",
             "library_manifest_sha256", "split_digest", "settings", "compute_environment"))
             or fit_manifest["source_batch_id"] != prepared["training_binding"]["source_batch_id"]):
         raise ValueError("B4 embedded fit manifest/provenance changed.")
-    if (prepared["version"] != "b4-prepared-v1" or prepared["library_id"] != library["library_id"]
+    if (prepared["version"] != kind + "-prepared-v1" or prepared["library_id"] != library["library_id"]
             or prepared["split_digest"] != digest(library["split_summary"])
             or any(config.get(k) != v for k, v in prepared["settings"].items())
             or binding["library_id"] != library["library_id"]
@@ -1721,15 +1837,19 @@ def build_b4_tasks(library, config, prepared, binding):
     lookup = {}
     for model, spec, name in zip(models, [{**s, "head": h} for s in specs for h in ("angles", "success")],
                                  fit_manifest["model_files"], strict=True):
-        _b4_check_identity(model, "fit_id")
-        validate_b4_model(model)
+        if tree:
+            if digest(model) != fit_manifest["summary_digests"][name]:
+                raise ValueError("B5 compact model identity changed.")
+        else:
+            _b4_check_identity(model, "fit_id")
+            validate_b4_model(model)
         ids = [g["iso_class_id"] for g in select_b2_graphs(library, spec["regime"], spec["fold"], "training")]
         if (any(model.get(k) != v for k, v in spec.items()) or model["training_graph_ids"] != ids
-                or model["source"] != prepared["source"] or model["library_id"] != library["library_id"]
+                or (model["source_id"] != prepared["source"]["source_id"] if tree else model["source"] != prepared["source"]) or model["library_id"] != library["library_id"]
                 or model["split_digest"] != prepared["split_digest"]
-                or model["settings"] != _b4_settings(config.get("learning"))
-                or hashlib.sha256((json.dumps(model, indent=2, allow_nan=False) + "\n").encode()).hexdigest()
-                   != fit_manifest["files"][name]
+                or (not tree and model["settings"] != _b4_settings(config.get("learning")))
+                or (not tree and hashlib.sha256((json.dumps(model, indent=2, allow_nan=False) + "\n").encode()).hexdigest()
+                   != fit_manifest["files"][name])
                 or model["feature_artifact_id"] != prepared["feature_artifact_id"]):
             raise ValueError("B4 model training membership/source/design mismatch.")
         lookup[model["fit_id"]] = model
@@ -1780,9 +1900,9 @@ def build_b4_tasks(library, config, prepared, binding):
         ref = refs.get((graph["iso_class_id"], p))
         if ref is None:
             raise ValueError("B4 evaluation scoring reference missing.")
-        task = {"task_version": "plan-a-b4-tasks-v1", "library_id": library["library_id"],
+        task = {"task_version": "plan-a-" + kind + "-tasks-v1", "library_id": library["library_id"],
             "iso_class_id": graph["iso_class_id"], "n": graph["n"], "p": p, "graph_split": "evaluation",
-            "kind": "optimization", "experiment_role": "warm_start", "pool": None, "method": "B4",
+            "kind": "optimization", "experiment_role": "warm_start", "pool": None, "method": kind.upper(),
             "restart_id": 0, "seed": int(digest({"namespace": config["seed_namespace"], "seed": config["seed"],
                 "prediction_id": row["prediction_id"]})[:32], 16), "theta0": row["theta0"], "budget": budget,
             "protocol_version": config["protocol_version"], "regime": row["regime"], "fold": row["fold"],
@@ -1794,6 +1914,14 @@ def build_b4_tasks(library, config, prepared, binding):
 
 
 def save_b4_batch(output, predictions_path, batch, references_directory, attempts_directory, settings):
+    return _save_learning_batch(output, predictions_path, batch, references_directory, attempts_directory, settings, kind="b4")
+
+
+def save_b5_batch(output, predictions_path, batch, references_directory, attempts_directory, settings):
+    return _save_learning_batch(output, predictions_path, batch, references_directory, attempts_directory, settings, kind="b5")
+
+
+def _save_learning_batch(output, predictions_path, batch, references_directory, attempts_directory, settings, *, kind):
     prepared = read_json(predictions_path)
     source, library, _ = read_batch(batch)
     if prepared["library_manifest_sha256"] != source["library_manifest_sha256"]:
@@ -1808,5 +1936,277 @@ def save_b4_batch(output, predictions_path, batch, references_directory, attempt
     validate_b1_comparison({"library_id": library["library_id"], "source": prepared["source"],
         "config": {**inherited, **settings}}, source, {"environment": prepared["compute_environment"]},
         read_json(Path(attempts_directory) / "manifest.json"))
+    arguments = ({"b5_prepared": prepared, "b5_explanations": read_json(Path(predictions_path).with_suffix(".shap.json"))}
+                 if kind == "b5" else {"b4_prepared": prepared})
     return save_batch(output, (Path(batch) / source["library_path"]).resolve(), {**inherited, **settings},
-                      b4_prepared=prepared, reference_binding=binding)
+                      reference_binding=binding, **arguments)
+
+
+def _b5_model_summary(model):
+    """Only deployment identity/diagnostics; trees, transforms and CV stay at the fit."""
+    names = ("fit_id", "library_id", "split_digest", "training_binding_digest", "feature_artifact_id",
+             "head", "p", "regime", "fold", "group", "shuffle_seed", "training_graph_ids", "feature_names",
+             "training_mean", "fit_seconds", "timings", "learning_environment", "selected_candidate", "booster_files")
+    result = {key: model[key] for key in names if key in model}
+    result["source_id"] = model["source"]["source_id"]
+    result["model"] = {"anchor": model["model"].get("anchor")}
+    return result
+
+
+def _write_b5_group(path, model, payloads):
+    """Publish a whole model group after exact UBJSON reload verification."""
+    from tempfile import TemporaryDirectory
+    path = Path(path)
+    if path.parent.exists():
+        raise FileExistsError(path.parent)
+    timings = {}
+    with TemporaryDirectory(prefix=".fit-", dir=path.parent.parent) as temporary:
+        stage = Path(temporary)
+        for name, payload in zip(model["booster_files"], payloads, strict=True):
+            start = perf_counter()
+            with (stage / name).open("xb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            timings[name] = perf_counter() - start
+        start = perf_counter()
+        write_once_json(stage / "model.json", model)
+        timings["model.json"] = perf_counter() - start
+        stage.rename(path.parent)
+    return timings
+
+
+def _discard_b5_stages(directory):
+    """Remove only this writer's unpublished flat stages after resume identity checks."""
+    directory = Path(directory).resolve()
+    for stage in directory.glob(".fit-*"):
+        members = list(stage.iterdir()) if stage.is_dir() else []
+        if (stage.is_symlink() or stage.is_junction() or not stage.is_dir()
+                or stage.resolve().parent != directory
+                or len(stage.name) != 13 or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in stage.name[5:])
+                or any(not p.is_file() or p.is_symlink() or p.is_junction()
+                       or not (p.name in {"model.json", *(f"scalar-{i}.ubj" for i in range(8))}
+                               or record_temporary(p.name)) for p in members)):
+            raise ValueError("Unexpected B5 unpublished stage; inspect its path before cleanup.")
+        for member in members:
+            member.unlink()
+        stage.rmdir()
+
+
+def _read_b5_booster_group(path, model):
+    from .learning import load_b5_boosters, validate_b5_model
+    _b4_check_identity(model, "fit_id")
+    count = 4 * model["p"] if model["head"] == "angles" else 1
+    if list(model["booster_files"]) != [f"scalar-{i}.ubj" for i in range(count)]:
+        raise ValueError("B5 scalar model coverage or order changed.")
+    payloads = [(Path(path).parent / name).read_bytes() for name in model["booster_files"]]
+    if any(hashlib.sha256(value).hexdigest() != expected for value, expected in
+           zip(payloads, model["booster_files"].values(), strict=True)):
+        raise ValueError("B5 native model checksum changed.")
+    boosters = load_b5_boosters(payloads)
+    validate_b5_model(model, boosters)
+    return boosters
+
+
+def _b5_fit_manifest(manifest):
+    _b4_check_identity(manifest, "fit_set_id")
+    specs = [{**s, "head": head} for s in b5_specifications(manifest["settings"]) for head in ("angles", "success")]
+    names = ["models/" + digest(s) + "/model.json" for s in specs]
+    files = {"setup.json", "features.json", "training.json", *names}
+    for name, spec in zip(names, specs, strict=True):
+        files.update((Path(name).parent / f"scalar-{i}.ubj").as_posix()
+                     for i in range(4 * spec["p"] if spec["head"] == "angles" else 1))
+    if (manifest.get("version") != "b5-fitting-v1" or manifest["model_files"] != names
+            or set(manifest["files"]) != files or set(manifest["summary_digests"]) != set(names)):
+        raise ValueError("B5 fit manifest must bind every planned artifact exactly once.")
+    return specs
+
+
+def read_b5_fits(directory):
+    """Audit complete fit metadata and native bytes once at a full-read boundary."""
+    from .features import B4_FEATURE_VERSION, b4_feature_matrix
+    from .learning import _b5_settings
+    directory = Path(directory)
+    manifest = read_json(directory / "manifest.json")
+    specs = _b5_fit_manifest(manifest)
+    expected_groups = {Path(name).parent.name for name in manifest["model_files"]}
+    groups = list((directory / "models").iterdir())
+    expected_root = {"setup.json", "features.json", "training.json", "manifest.json", "models", "writer.lock"}
+    if (any(p.name not in expected_root or p.is_symlink() or p.is_junction() for p in directory.iterdir())
+            or {p.name for p in groups} != expected_groups
+            or any(not p.is_dir() or p.is_symlink() or p.is_junction() for p in groups)):
+        raise ValueError("B5 fit inventory contains unpublished or unbound files.")
+    actual_files = {p.relative_to(directory).as_posix() for group in groups for p in group.iterdir()}
+    expected_files = {name for name in manifest["files"] if name.startswith("models/")}
+    if actual_files != expected_files or any(not p.is_file() or p.is_symlink() for group in groups for p in group.iterdir()):
+        raise ValueError("B5 fit inventory contains unpublished or unbound model files.")
+    for name, expected in manifest["files"].items():
+        if hashlib.sha256((directory / name).read_bytes()).hexdigest() != expected:
+            raise ValueError("B5 fitting file checksum mismatch.")
+    setup, features, training = (read_json(directory / name) for name in ("setup.json", "features.json", "training.json"))
+    _b4_check_identity(features, "feature_artifact_id")
+    if (any(manifest.get(k) != v for k, v in setup.items()) or features["version"] != B4_FEATURE_VERSION
+            or any(features[k] != manifest[k] for k in ("source", "library_id", "split_digest"))
+            or len({r["iso_class_id"] for r in features["rows"]}) != len(features["rows"])
+            or training["reference_binding"]["library_id"] != manifest["library_id"]
+            or training["reference_binding"]["source_batch_id"] != manifest["source_batch_id"]):
+        raise ValueError("B5 training/feature sidecar provenance changed.")
+    b4_feature_matrix(features["rows"], "F")
+    models, boosters = [], []
+    for name, spec in zip(manifest["model_files"], specs, strict=True):
+        model = read_json(directory / name)
+        native = _read_b5_booster_group(directory / name, model)
+        if (any(model.get(k) != v for k, v in spec.items()) or model["source"] != manifest["source"]
+                or model["library_id"] != manifest["library_id"] or model["split_digest"] != manifest["split_digest"]
+                or model["training_binding_digest"] != digest(training)
+                or model["feature_artifact_id"] != features["feature_artifact_id"]
+                or model["settings"] != _b5_settings(manifest["settings"].get("learning"))
+                or digest(_b5_model_summary(model)) != manifest["summary_digests"][name]):
+            raise ValueError("B5 model identity/design/provenance changed.")
+        models.append(model)
+        boosters.append(native)
+    return {"manifest": manifest, "features": features, "training": training, "models": models, "boosters": boosters}
+
+
+def save_b5_predictions(output, fits_directory, library_path):
+    """Freeze topology-only predictions and separate raw TreeSHAP evidence."""
+    from .learning import predict_b5_model, explain_b5_model, select_b2_graphs
+    output = Path(output)
+    explanation_path = output.with_suffix(".shap.json")
+    if output.exists():
+        raise FileExistsError(output)
+    loaded = read_b5_fits(fits_directory)
+    manifest, models = loaded["manifest"], loaded["models"]
+    library = read_library(library_path)
+    if (source_identity() != manifest["source"] or library["library_id"] != manifest["library_id"]
+            or digest(library["split_summary"]) != manifest["split_digest"]
+            or hashlib.sha256((Path(library_path) / "manifest.json").read_bytes()).hexdigest() != manifest["library_manifest_sha256"]):
+        raise ValueError("B5 prediction source/library changed since fitting.")
+    rows = {r["iso_class_id"]: r for r in loaded["features"]["rows"]}
+    topology = {g["iso_class_id"]: digest({"n": g["n"], "edges": g["edges"]}) for g in library["graphs"] if g["tier"] == 2}
+    if set(rows) != set(topology) or any(rows[k]["topology_hash"] != v for k, v in topology.items()):
+        raise ValueError("B5 frozen feature topology changed.")
+    predictions, explanations, timings, explanation_timings = [], [], [], []
+    for i in range(0, len(models), 2):
+        angle, success = models[i:i + 2]
+        targets = select_b2_graphs(library, angle["regime"], angle["fold"], "evaluation")
+        if not targets:
+            raise ValueError("B5 evaluation scope is empty.")
+        features = [rows[g["iso_class_id"]] for g in targets]
+        start = perf_counter()
+        initial = predict_b5_model(angle, loaded["boosters"][i], features)
+        probabilities = predict_b5_model(success, loaded["boosters"][i + 1], features)
+        timings.append({"fit_id": angle["fit_id"], "success_fit_id": success["fit_id"],
+                        "graphs": len(targets), "prediction_seconds": perf_counter() - start})
+        case_predictions = []
+        for graph, point, probability in zip(targets, initial, probabilities, strict=True):
+            row = {**point, "success_probability": probability["success_probability"],
+                "raw_success_prediction": probability["raw_prediction"], "iso_class_id": graph["iso_class_id"],
+                "p": angle["p"], "regime": angle["regime"], "fold": angle["fold"], "feature_group": angle["group"],
+                "shuffle_seed": angle["shuffle_seed"], "fit_id": angle["fit_id"], "success_fit_id": success["fit_id"],
+                "feature_artifact_id": loaded["features"]["feature_artifact_id"], "topology_hash": rows[graph["iso_class_id"]]["topology_hash"]}
+            row["prediction_id"] = digest(row)
+            predictions.append(row)
+            case_predictions.append(row)
+        if success["group"] == "F" and success["shuffle_seed"] is None:
+            start = perf_counter()
+            contributions = explain_b5_model(success, loaded["boosters"][i + 1], features)
+            for row, explanation in zip(case_predictions, contributions, strict=True):
+                explanations.append({**explanation, **{key: row[key] for key in
+                    ("success_fit_id", "prediction_id", "iso_class_id", "regime", "fold", "p", "feature_group", "shuffle_seed", "topology_hash")},
+                    "columns": success["feature_names"], "booster_files": success["booster_files"]})
+            explanation_timings.append({"success_fit_id": success["fit_id"], "graphs": len(targets), "seconds": perf_counter() - start})
+    explained = {"version": "b5-shap-v1", "fit_set_id": manifest["fit_set_id"], "rows": explanations}
+    explained["explanation_id"] = digest(explained)
+    prepared = {"version": "b5-prepared-v1", "library_id": library["library_id"],
+        "library_manifest_sha256": manifest["library_manifest_sha256"], "split_digest": manifest["split_digest"],
+        "source": manifest["source"], "settings": manifest["settings"], "fit_set_id": manifest["fit_set_id"],
+        "fit_set_manifest": manifest, "compute_environment": manifest["compute_environment"],
+        "feature_artifact_id": loaded["features"]["feature_artifact_id"], "models": [_b5_model_summary(m) for m in models],
+        "training_binding": loaded["training"]["reference_binding"], "training_reference_costs": loaded["training"]["reference_costs"],
+        "success_label_costs": loaded["training"]["success_label_costs"],
+        "feature_costs": {k: loaded["features"][k] for k in ("construction_seconds", "historical_feature_seconds")},
+        "artifact_io": {"fitting": manifest["artifact_io"], "prediction_file_write_seconds": None},
+        "predictions": predictions, "prediction_timings": timings, "explanation_timings": explanation_timings,
+        "explanation_id": explained["explanation_id"]}
+    prepared["preparation_id"] = digest(prepared)
+    _validate_b5_explanations(explained, prepared)
+    if explanation_path.exists():
+        if read_json(explanation_path) != explained:
+            raise ValueError("B5 interrupted prediction SHAP sidecar changed.")
+    else:
+        write_once_json(explanation_path, explained)
+    write_once_json(output, prepared)
+    return prepared
+
+
+def _validate_b5_explanations(explained, prepared):
+    _b4_check_identity(explained, "explanation_id")
+    if (explained.get("version") != "b5-shap-v1" or explained["fit_set_id"] != prepared["fit_set_id"]
+            or explained["explanation_id"] != prepared["explanation_id"]):
+        raise ValueError("B5 SHAP provenance changed.")
+    wanted = {r["prediction_id"]: r for r in prepared["predictions"] if r["feature_group"] == "F" and r["shuffle_seed"] is None}
+    models = {m["fit_id"]: m for m in prepared["models"] if m["head"] == "success"}
+    if len(explained["rows"]) != len(wanted) or {r["prediction_id"] for r in explained["rows"]} != set(wanted):
+        raise ValueError("B5 SHAP requires complete unique planned coverage.")
+    for row in explained["rows"]:
+        prediction = wanted[row["prediction_id"]]
+        model = models[prediction["success_fit_id"]]
+        values = np.asarray(row["contributions"], dtype=float)
+        if (row["columns"] != model["feature_names"] or row["booster_files"] != model["booster_files"]
+                or values.shape != (len(row["columns"]),) or not np.isfinite(values).all()
+                or any(row[k] != prediction[k] for k in ("success_fit_id", "iso_class_id", "regime", "fold", "p", "feature_group", "shuffle_seed", "topology_hash"))
+                or not math.isfinite(row["bias"]) or row["raw_prediction"] != prediction["raw_success_prediction"]
+                or not np.isclose(row["bias"] + values.sum(), row["raw_prediction"], atol=1e-5, rtol=1e-6)):
+            raise ValueError("B5 SHAP column/model/raw additivity mismatch.")
+
+
+def read_b5_explanations(directory, prepared):
+    value = read_json(Path(directory) / "explanations.json")
+    _validate_b5_explanations(value, prepared)
+    return value
+
+
+def read_b5_inputs(directory, manifest):
+    prepared = read_json(Path(directory) / "prepared.json")
+    binding = read_json(Path(directory) / "reference_binding.json")
+    _b4_check_identity(prepared, "preparation_id")
+    expected = {"preparation_id": prepared["preparation_id"], "prepared_digest": digest(prepared), "reference_binding_digest": digest(binding)}
+    if (any(manifest["config"]["b5_inputs"].get(k) != v for k, v in expected.items()) or prepared["source"] != manifest["source"]):
+        raise ValueError("B5 preparation/source/reference binding changed.")
+    return prepared, binding
+
+
+def _b5_execution_index(directory, manifest):
+    index = read_json(Path(directory) / "execution-inputs.json")
+    if digest(index) != manifest["config"]["b5_inputs"]["execution_inputs_digest"]:
+        raise ValueError("B5 graph input index changed.")
+    if any(value["path"] != "graphs/" + digest(identity) + ".json" for identity, value in index.items()):
+        raise ValueError("B5 graph input path changed.")
+    return index
+
+
+def read_b5_worker_input(directory, identity, *, manifest=None, index=None):
+    """Read one bound graph, never the native models, CV, predictions or full library."""
+    directory = Path(directory)
+    manifest = manifest or read_json(directory / "manifest.json")
+    identity_fields = {key: manifest[key] for key in ("library_id", "config", "source_id", "tasks_sha256")}
+    if (manifest["config"].get("kind") != "b5" or digest(identity_fields) != manifest["batch_id"]
+            or digest(manifest["source"]["files"]) != manifest["source_id"]
+            or manifest["source"]["source_id"] != manifest["source_id"]):
+        raise ValueError("B5 batch/source identity changed.")
+    derived = {key: manifest[key] for key in ("issues", "task_count", "counts", "coverage", "attempt_selection_rule")}
+    if digest(derived) != manifest["config"]["b5_inputs"]["plan_metadata_digest"]:
+        raise ValueError("B5 global plan metadata changed.")
+    index = index if index is not None else _b5_execution_index(directory, manifest)
+    if identity not in index:
+        raise ValueError("Requested graph is absent from this batch.")
+    value = read_json(directory / index[identity]["path"])
+    if (digest(value) != index[identity]["digest"] or value["version"] != "b5-graph-input-v1"
+            or value["source_id"] != manifest["source_id"] or value["library_id"] != manifest["library_id"]
+            or value["graph"]["iso_class_id"] != identity or not value["tasks"]):
+        raise ValueError("B5 graph input identity changed.")
+    for task in value["tasks"]:
+        if task["iso_class_id"] != identity or digest({k: v for k, v in task.items() if k != "task_id"}) != task["task_id"]:
+            raise ValueError("B5 graph task identity changed.")
+    return manifest, {"library_id": manifest["library_id"], "graphs": [value["graph"]]}, value["tasks"], value["compute_environment"]
