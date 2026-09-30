@@ -21,7 +21,7 @@ from qaoa_study.experiments import (
     read_b5_explanations, read_b5_fits, read_b5_inputs, read_batch,
     runtime_files, select_attempts, source_identity,
 )
-from qaoa_study.records import execution_failed, read_json, read_library
+from qaoa_study.records import execution_failed, read_json, read_library, resolve_success_metric
 
 
 LIBRARY_FILES = ("graphs.parquet", "config.json", "generation.jsonl", "splits.json", "manifest.json")
@@ -138,8 +138,12 @@ def _dependencies(value, external_root=None, *, kind="b3"):
         expected |= {"b4_batch", "b4_attempts"}
     if value.get("dependency_version") != 1 or sorted(row["role"] for row in checkpoints) != roles:
         raise ValueError(f"Checkpoint dependencies require exactly canonical {roles} entries.")
-    if set(inputs) != expected or not inputs["b2_cases"]:
+    overlay_keys = {"success_overlay"} if kind == "b4" else {"success_overlay", "b4_success_overlay"} if kind == "b5" else set()
+    if not expected <= set(inputs) <= expected | overlay_keys or not inputs["b2_cases"]:
         raise ValueError("Checkpoint comparison inputs do not match the declared stage.")
+    analysis_files = value.get("analysis_files", {})
+    if set(analysis_files) != {inputs[key] for key in overlay_keys & set(inputs)}:
+        raise ValueError("Every analysis overlay must have exactly one declared checksum.")
     paths = [inputs["b1_batch"], inputs["b1_attempts"]]
     if kind in ("b4", "b5"):
         paths.extend([inputs["b3_batch"], inputs["b3_attempts"]])
@@ -153,6 +157,10 @@ def _dependencies(value, external_root=None, *, kind="b3"):
         if len(row["sha256"]) != 64 or any(c not in "0123456789abcdef" for c in row["sha256"]):
             raise ValueError("Canonical checkpoint sha256 is invalid.")
         paths.append(row["path"])
+    for name, checksum in analysis_files.items():
+        if len(checksum) != 64 or any(c not in "0123456789abcdef" for c in checksum):
+            raise ValueError("Analysis overlay sha256 is invalid.")
+        paths.append(name)
     for name in paths:
         relative = PurePosixPath(name)
         if relative.is_absolute() or ".." in relative.parts or "\\" in name or ":" in name:
@@ -162,6 +170,9 @@ def _dependencies(value, external_root=None, *, kind="b3"):
         for row in checkpoints:
             if _file_hash(_payload_path(base, row["path"])) != row["sha256"]:
                 raise ValueError(f"Canonical {row['role']} checkpoint checksum mismatch.")
+        for name, checksum in analysis_files.items():
+            if _file_hash(_payload_path(base, name)) != checksum:
+                raise ValueError("Analysis overlay checksum mismatch.")
     return inputs
 
 
@@ -222,6 +233,13 @@ def _checkpoint_state(root, manifest, external_root=None, *, dependencies=None):
     if dependencies is None:
         dependencies = read_json(_payload_path(root, "checkpoint/dependencies.json"))
     inputs = _dependencies(dependencies, external_root, kind=kind)
+    overlay_methods = {key: method for key, method in
+                       (("success_overlay", kind.upper()), ("b4_success_overlay", "B4")) if key in inputs}
+    saved_overlays = summary.get("success_prediction_overlays", {})
+    if (set(saved_overlays) != set(overlay_methods.values()) or any(
+            saved_overlays[method].get("sha256") != dependencies["analysis_files"][inputs[key]]
+            for key, method in overlay_methods.items())):
+        raise ValueError("Checkpoint analysis overlay differs from the saved summary.")
     if external_root is not None:
         external_root = Path(external_root).resolve()
         baseline, _, _ = read_batch(_payload_path(external_root, inputs["b1_batch"]))
@@ -245,6 +263,17 @@ def _checkpoint_state(root, manifest, external_root=None, *, dependencies=None):
             if (b4["batch_id"] != summary["b4_batch_id"] or
                     b4_execution["execution_id"] != summary["b4_execution_id"]):
                 raise ValueError("External B4 comparison disagrees with the saved B5 summary.")
+        for key, method in overlay_methods.items():
+            from scripts.experiment import _success_prediction_overlay
+            baseline_overlay = key == "b4_success_overlay"
+            overlay_batch = _payload_path(external_root, inputs["b4_batch"]) if baseline_overlay else _payload_path(root, manifest["batch_path"])
+            overlay_manifest = b4 if baseline_overlay else batch
+            reader = read_b5_inputs if method == "B5" else read_b4_inputs
+            overlay_prepared, _ = reader(overlay_batch, overlay_manifest)
+            view = _success_prediction_overlay(_payload_path(external_root, inputs[key]), overlay_batch,
+                overlay_manifest, overlay_prepared, resolve_success_metric(summary["settings"]))
+            if view["analysis_overlay"]["overlay_id"] != saved_overlays[method].get("overlay_id"):
+                raise ValueError("Checkpoint analysis overlay identity differs from the saved summary.")
     return {"batch_id": batch["batch_id"], "retained_completed_attempts": len(attempts),
             "summary_complete": summary.get("complete"), "external_dependencies_verified": external_root is not None}
 
@@ -268,17 +297,23 @@ args = parser.parse_args()
 verify_snapshot(root, external_root=args.external_root)
 manifest = json.loads((root / "snapshot.json").read_text())
 inputs = json.loads((root / "checkpoint/dependencies.json").read_text())["comparison_inputs"]
+saved_summary = json.loads((root / manifest["summary_path"]).read_text())
+analysis_settings = saved_summary["settings"]
 external = args.external_root.resolve()
 arguments = [root / manifest["batch_path"], root / manifest["attempts_path"],
     external / inputs["b1_batch"], external / inputs["b1_attempts"],
     [(external / batch, external / attempts) for batch, attempts in inputs["b2_cases"]]]
 if manifest["kind"] == "b5-checkpoint-v1":
     summary = summarize_b5_batch(*arguments, external / inputs["b3_batch"], external / inputs["b3_attempts"],
-                                external / inputs["b4_batch"], external / inputs["b4_attempts"])
+        external / inputs["b4_batch"], external / inputs["b4_attempts"], analysis_settings=analysis_settings,
+        success_overlay=external / inputs["success_overlay"] if "success_overlay" in inputs else None,
+        b4_success_overlay=external / inputs["b4_success_overlay"] if "b4_success_overlay" in inputs else None)
 elif manifest["kind"] == "b4-checkpoint-v1":
-    summary = summarize_b4_batch(*arguments, external / inputs["b3_batch"], external / inputs["b3_attempts"])
+    summary = summarize_b4_batch(*arguments, external / inputs["b3_batch"], external / inputs["b3_attempts"],
+        analysis_settings=analysis_settings,
+        success_overlay=external / inputs["success_overlay"] if "success_overlay" in inputs else None)
 else:
-    summary = summarize_b3_batch(*arguments)
+    summary = summarize_b3_batch(*arguments, analysis_settings=analysis_settings)
 write_once_json(args.output, summary)
 print(json.dumps({"complete": summary["complete"], "batch_id": summary["batch_id"]}))
 '''

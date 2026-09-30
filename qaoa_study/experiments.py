@@ -27,7 +27,8 @@ from .graphs import SPLIT_VERSION, graph_from_record, graph_split_coverage
 from .optimize import OptimizerSettings, failure_record, optimize_qaoa, random_angles
 from .qaoa import make_qaoa, p1_expectation_grid, qaoa_loss_and_gradient
 from .records import (execution_failed, read_json, read_library, read_run, save_run, write_once_json,
-                      read_record_bundle, record_temporary, seal_record_bundle)
+                      read_record_bundle, record_temporary, seal_record_bundle,
+                      DEFAULT_SUCCESS_METRIC, LEGACY_SUCCESS_METRIC, resolve_success_metric, success_threshold)
 
 
 TASK_VERSION = "plan-a-tasks-v1"
@@ -129,11 +130,23 @@ def environment(backend):
                 ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}}
 
 
+def _success_settings(settings):
+    """Read either frozen absolute settings or the adopted normalized metric."""
+    metric = resolve_success_metric(settings)
+    if metric not in (LEGACY_SUCCESS_METRIC, DEFAULT_SUCCESS_METRIC):
+        raise ValueError("Planning requires the adopted primary success metric.")
+    analysis = settings.get("analysis", {})
+    if any(key in analysis for key in ("epsilon", "success_metric")) and resolve_success_metric(analysis) != metric:
+        raise ValueError("Planning and analysis success metrics differ.")
+    return metric
+
+
 def validate_config(config):
     """Validate the small study configuration once at the planning boundary."""
     if config["depths"] != [1, 2]:
         raise ValueError("Plan A requires p=1 and p=2.")
-    if config["epsilon"] != 0.5 or config["reference"]["p2_candidate"] != "best_seen_valid_execution":
+    _success_settings(config)
+    if config["reference"]["p2_candidate"] != "best_seen_valid_execution":
         raise ValueError("Reference and success definitions must follow this protocol version.")
     for count in (config["tier1_restarts"], config["reference"]["p2_restarts"],
                   config["evaluation_restarts"], config["gradient_samples"], config["max_attempts"]):
@@ -1209,7 +1222,8 @@ def build_b2_tasks(library, config, fit, binding):
 
     if digest({k: v for k, v in fit.items() if k != "fit_id"}) != fit.get("fit_id"):
         raise ValueError("B2 fit identity changed.")
-    if (config.get("kind") != "b2" or config["depths"] != [1, 2] or config["epsilon"] != 0.5 or
+    _success_settings(config)
+    if (config.get("kind") != "b2" or config["depths"] != [1, 2] or
             config["variants"] != ["medoid", "aligned_median"] or
             type(config["max_attempts"]) is not int or config["max_attempts"] < 1):
         raise ValueError("B2 requires both depths, both frozen variants and the adopted single-start budget.")
@@ -1276,7 +1290,7 @@ def save_b2_batch(output, fit_path, batch, references_directory, attempts_direct
 
 
 def validate_b1_comparison(warm, baseline, warm_execution, baseline_execution):
-    """Compare existing B1 traces only under the declared identical numerical contract."""
+    """Check execution compatibility; a common analysis metric is applied separately."""
     if warm["library_id"] != baseline["library_id"]:
         raise ValueError("B1 comparison library mismatch.")
     for name in ("qaoa_study/qaoa.py", "qaoa_study/exact.py", "qaoa_study/optimize.py"):
@@ -1284,7 +1298,6 @@ def validate_b1_comparison(warm, baseline, warm_execution, baseline_execution):
             raise ValueError("B1 optimizer/objective source is not comparable.")
     depths = warm["config"]["depths"]
     if (not depths or not set(depths) <= set(baseline["config"]["depths"])
-            or warm["config"]["epsilon"] != baseline["config"]["epsilon"]
             or any(warm["config"]["optimizer"][str(p)] != baseline["config"]["optimizer"][str(p)] for p in depths)):
         raise ValueError("B1 single-start comparison settings differ.")
     if warm_execution and baseline_execution and warm_execution["environment"] != baseline_execution["environment"]:
@@ -1292,10 +1305,11 @@ def validate_b1_comparison(warm, baseline, warm_execution, baseline_execution):
 
 
 def _validate_b3_settings(settings):
+    _success_settings(settings)
     depths = settings["depths"]
     if (settings.get("kind") != "b3" or not depths or depths != sorted(set(depths))
-            or any(type(p) is not int or p not in (1, 2) for p in depths) or settings["epsilon"] != 0.5):
-        raise ValueError("B3 requires a nonempty ordered subset of p=1/2 and epsilon=0.5.")
+            or any(type(p) is not int or p not in (1, 2) for p in depths)):
+        raise ValueError("B3 requires a nonempty ordered subset of p=1/2.")
     cases = settings["comparison_cases"]
     keys = [(row["regime"], row["fold"]) for row in cases]
     if (len(set(keys)) != len(keys) or ("random", None) not in keys or
@@ -1492,7 +1506,7 @@ def _b4_check_identity(value, key):
         raise ValueError(f"B4 {key} checksum mismatch.")
 
 
-def _b4_training_labels(manifest, tasks, attempts_directory, binding, ids):
+def _b4_training_labels(manifest, tasks, attempts_directory, binding, ids, graphs, metric):
     """Use complete original evaluation pools on training graphs, never held-out labels."""
     if manifest["config"]["evaluation_restarts"] != 50:
         raise ValueError("B4 success labels require all 50 original evaluation restarts.")
@@ -1510,8 +1524,12 @@ def _b4_training_labels(manifest, tasks, attempts_directory, binding, ids):
                     or any(r is None or execution_failed(r) or not r.get("run_completed") for r in rows)):
                 raise ValueError(f"B4 needs every successful execution receipt in the training pool: {identity}, p={p}.")
             reference = refs[identity, p]
-            successes = sum(r["C_final"] >= reference["C_ref"] - .5 for r in rows)
+            graph = graphs[identity]
+            C_star = graph.get("C_star") if graph.get("exact_status") == "computed" else None
+            threshold = success_threshold(reference["C_ref"], C_star, metric)
+            successes = sum(r["C_final"] >= threshold for r in rows)
             labels.append({"iso_class_id": identity, "p": p, "successes": successes, "trials": 50,
+                           "success_metric": dict(metric), "C_star": C_star, "threshold": threshold,
                            "reference_id": reference["reference_id"],
                            "attempt_ids": [r["attempt_id"] for r in rows]})
     used = [r for r in attempts if r["experiment_role"] == "evaluation" and r["iso_class_id"] in ids]
@@ -1602,9 +1620,11 @@ def _save_learning_fits(output, batch, references_directory, attempts_directory,
             features["feature_artifact_id"] = digest(features)
             save_artifact(feature_path, features)
         _, _, binding, costs = audit_b2_references(batch, references_directory, attempts_directory, ids)
-        labels, execution, label_costs = _b4_training_labels(manifest, tasks, attempts_directory, binding, ids)
+        metric = _success_settings(settings)
+        labels, execution, label_costs = _b4_training_labels(manifest, tasks, attempts_directory, binding, ids,
+            {g["iso_class_id"]: g for g in library["graphs"]}, metric)
         training_data = {"reference_binding": binding, "reference_costs": costs, "success_labels": labels,
-                         "success_label_costs": label_costs}
+                         "success_label_costs": label_costs, "success_metric": metric}
         training_path = output / "training.json"
         if training_path.exists():
             saved = read_json(training_path)
@@ -1651,7 +1671,7 @@ def _save_learning_fits(output, batch, references_directory, attempts_directory,
                 with threadpool_limits(limits=1):
                     fit_features = [feature_lookup[g["iso_class_id"]] for g in graphs]
                     fitted = (fit_b5_model if tree else fit_b4_model)(graphs, fit_features,
-                        candidates, outcomes, **spec, head=head, settings=settings.get("learning"))
+                        candidates, outcomes, **spec, head=head, settings=settings.get("learning"), success_metric=metric)
                     if tree:
                         model, boosters = fitted
                         payloads = b5_model_bytes(model, boosters, fit_features)
@@ -1730,6 +1750,8 @@ def read_b4_fits(directory):
         validate_b4_model(model)
         if (any(model.get(k) != v for k, v in spec.items()) or model["source"] != manifest["source"]
                 or model["library_id"] != manifest["library_id"] or model["split_digest"] != manifest["split_digest"]
+                or (model["head"] == "success" and resolve_success_metric(
+                    model.get("success_metric", LEGACY_SUCCESS_METRIC)) != _success_settings(manifest["settings"]))
                 or model["settings"] != _b4_settings(manifest["settings"].get("learning"))
                 or model["training_binding_digest"] != digest(training)
                 or model["feature_artifact_id"] != features["feature_artifact_id"]):
@@ -1769,6 +1791,7 @@ def save_b4_predictions(output, fits_directory, library_path):
                         "graphs": len(targets), "prediction_seconds": perf_counter() - start})
         for graph, point, probability in zip(targets, initial, probabilities, strict=True):
             row = {**point, "success_probability": probability["success_probability"],
+                   "success_metric": resolve_success_metric(success.get("success_metric", LEGACY_SUCCESS_METRIC)),
                    "raw_success_prediction": probability["raw_prediction"],
                    "iso_class_id": graph["iso_class_id"], "p": angle["p"], "regime": angle["regime"],
                    "fold": angle["fold"], "feature_group": angle["group"], "shuffle_seed": angle["shuffle_seed"],
@@ -1845,6 +1868,8 @@ def _build_learning_tasks(library, config, prepared, binding, *, kind):
             validate_b4_model(model)
         ids = [g["iso_class_id"] for g in select_b2_graphs(library, spec["regime"], spec["fold"], "training")]
         if (any(model.get(k) != v for k, v in spec.items()) or model["training_graph_ids"] != ids
+                or (model["head"] == "success" and resolve_success_metric(
+                    model.get("success_metric", LEGACY_SUCCESS_METRIC)) != _success_settings(config))
                 or (model["source_id"] != prepared["source"]["source_id"] if tree else model["source"] != prepared["source"]) or model["library_id"] != library["library_id"]
                 or model["split_digest"] != prepared["split_digest"]
                 or (not tree and model["settings"] != _b4_settings(config.get("learning")))
@@ -1875,6 +1900,8 @@ def _build_learning_tasks(library, config, prepared, binding, *, kind):
         graph = expected[row["fit_id"], row["iso_class_id"]]
         p = model["p"]
         if (success is None or success["head"] != "success" or any(success[k] != model[k] for k in ("group", "p", "regime", "fold", "shuffle_seed"))
+                or resolve_success_metric(row.get("success_metric", LEGACY_SUCCESS_METRIC)) !=
+                    resolve_success_metric(success.get("success_metric", LEGACY_SUCCESS_METRIC))
                 or any(row[k] != model[k] for k in ("p", "regime", "fold", "shuffle_seed"))
                 or row["feature_group"] != model["group"] or row["feature_artifact_id"] != prepared["feature_artifact_id"]
                 or row["topology_hash"] != digest({"n": graph["n"], "edges": graph["edges"]})
@@ -1945,8 +1972,9 @@ def _save_learning_batch(output, predictions_path, batch, references_directory, 
 def _b5_model_summary(model):
     """Only deployment identity/diagnostics; trees, transforms and CV stay at the fit."""
     names = ("fit_id", "library_id", "split_digest", "training_binding_digest", "feature_artifact_id",
-             "head", "p", "regime", "fold", "group", "shuffle_seed", "training_graph_ids", "feature_names",
-             "training_mean", "fit_seconds", "timings", "learning_environment", "selected_candidate", "booster_files")
+              "head", "p", "regime", "fold", "group", "shuffle_seed", "training_graph_ids", "feature_names",
+              "training_mean", "fit_seconds", "timings", "learning_environment", "selected_candidate", "booster_files",
+              "success_metric")
     result = {key: model[key] for key in names if key in model}
     result["source_id"] = model["source"]["source_id"]
     result["model"] = {"anchor": model["model"].get("anchor")}
@@ -2058,6 +2086,8 @@ def read_b5_fits(directory):
         native = _read_b5_booster_group(directory / name, model)
         if (any(model.get(k) != v for k, v in spec.items()) or model["source"] != manifest["source"]
                 or model["library_id"] != manifest["library_id"] or model["split_digest"] != manifest["split_digest"]
+                or (model["head"] == "success" and resolve_success_metric(
+                    model.get("success_metric", LEGACY_SUCCESS_METRIC)) != _success_settings(manifest["settings"]))
                 or model["training_binding_digest"] != digest(training)
                 or model["feature_artifact_id"] != features["feature_artifact_id"]
                 or model["settings"] != _b5_settings(manifest["settings"].get("learning"))
@@ -2101,6 +2131,7 @@ def save_b5_predictions(output, fits_directory, library_path):
         case_predictions = []
         for graph, point, probability in zip(targets, initial, probabilities, strict=True):
             row = {**point, "success_probability": probability["success_probability"],
+                "success_metric": resolve_success_metric(success.get("success_metric", LEGACY_SUCCESS_METRIC)),
                 "raw_success_prediction": probability["raw_prediction"], "iso_class_id": graph["iso_class_id"],
                 "p": angle["p"], "regime": angle["regime"], "fold": angle["fold"], "feature_group": angle["group"],
                 "shuffle_seed": angle["shuffle_seed"], "fit_id": angle["fit_id"], "success_fit_id": success["fit_id"],
@@ -2114,6 +2145,7 @@ def save_b5_predictions(output, fits_directory, library_path):
             for row, explanation in zip(case_predictions, contributions, strict=True):
                 explanations.append({**explanation, **{key: row[key] for key in
                     ("success_fit_id", "prediction_id", "iso_class_id", "regime", "fold", "p", "feature_group", "shuffle_seed", "topology_hash")},
+                    "success_metric": row["success_metric"],
                     "columns": success["feature_names"], "booster_files": success["booster_files"]})
             explanation_timings.append({"success_fit_id": success["fit_id"], "graphs": len(targets), "seconds": perf_counter() - start})
     explained = {"version": "b5-shap-v1", "fit_set_id": manifest["fit_set_id"], "rows": explanations}
@@ -2154,6 +2186,8 @@ def _validate_b5_explanations(explained, prepared):
         model = models[prediction["success_fit_id"]]
         values = np.asarray(row["contributions"], dtype=float)
         if (row["columns"] != model["feature_names"] or row["booster_files"] != model["booster_files"]
+                or resolve_success_metric(row.get("success_metric", LEGACY_SUCCESS_METRIC)) !=
+                    resolve_success_metric(model.get("success_metric", LEGACY_SUCCESS_METRIC))
                 or values.shape != (len(row["columns"]),) or not np.isfinite(values).all()
                 or any(row[k] != prediction[k] for k in ("success_fit_id", "iso_class_id", "regime", "fold", "p", "feature_group", "shuffle_seed", "topology_hash"))
                 or not math.isfinite(row["bias"]) or row["raw_prediction"] != prediction["raw_success_prediction"]

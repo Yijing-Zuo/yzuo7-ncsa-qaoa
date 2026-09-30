@@ -12,12 +12,13 @@ import numpy as np
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
-from .records import evaluate_trace, execution_failed
+from .records import (DEFAULT_SUCCESS_METRIC, LEGACY_SUCCESS_METRIC, evaluate_trace,
+                      execution_failed, resolve_success_metric, success_threshold)
 
 
-ANALYSIS_VERSION = "plan-a-analysis-v2"
+ANALYSIS_VERSION = "plan-a-analysis-v3"
 DEFAULT_ANALYSIS_SETTINGS = {
-    "epsilon": 0.5,
+    "success_metric": DEFAULT_SUCCESS_METRIC,
     "evaluation_restarts": 50,
     "cluster_threshold": 0.05,
     "cluster_sensitivity": [0.025, 0.1],
@@ -27,6 +28,15 @@ DEFAULT_ANALYSIS_SETTINGS = {
 
 def _finite(value):
     return value is not None and math.isfinite(value)
+
+
+def _analysis_settings(defaults, settings):
+    supplied = settings or {}
+    metric = resolve_success_metric(supplied if any(k in supplied for k in ("epsilon", "success_metric"))
+                                    else defaults["success_metric"])
+    return {**{k: v for k, v in defaults.items() if k != "success_metric"},
+            **{k: v for k, v in supplied.items() if k not in ("epsilon", "success_metric")},
+            "success_metric": metric}
 
 
 def wilson_interval(successes: int, planned: int) -> list | None:
@@ -45,8 +55,12 @@ def wilson_interval(successes: int, planned: int) -> list | None:
 
 
 def evaluate_restart(task: dict, attempt: dict | None, reference: dict | None,
-                     epsilon: float = 0.5) -> dict:
+                     epsilon: float | None = None, *, C_star: float | None = None,
+                     metric: dict | None = None) -> dict:
     """Separate terminal success, first finite hit, and execution completeness."""
+    if epsilon is not None and metric is not None:
+        raise ValueError("Specify metric or legacy epsilon, not both.")
+    metric = resolve_success_metric(epsilon if epsilon is not None else metric)
     row = {key: task.get(key) for key in (
         "task_id", "library_id", "iso_class_id", "p", "experiment_role", "pool",
         "method", "restart_id", "seed", "theta0", "budget", "protocol_version", "graph_split",
@@ -58,7 +72,11 @@ def evaluate_restart(task: dict, attempt: dict | None, reference: dict | None,
         reference_id=reference.get("reference_id") if reference else None,
         reference_complete=reference_ready,
         C_ref=reference.get("C_ref") if reference_ready else None,
-        epsilon=epsilon, C_final=None, theta_final=None, best_seen=None, best_theta=None,
+        success_metric=metric, C_star=C_star,
+        threshold=success_threshold(reference["C_ref"], C_star, metric) if reference_ready else None,
+        epsilon=metric["tolerance"] * (C_star if metric["kind"] == "normalized_gap" else 1.0)
+            if metric["kind"] == "absolute" or C_star is not None else None,
+        C_final=None, theta_final=None, best_seen=None, best_theta=None,
         final_call_id=None, best_call_id=None,
         stop_reason=None, counts=None, elapsed_seconds=None, execution_valid=False,
         cost_status=None, cost_unavailable=None,
@@ -74,7 +92,7 @@ def evaluate_restart(task: dict, attempt: dict | None, reference: dict | None,
                  and _finite(attempt.get("C_final")))
     row.update(execution_valid=valid, execution_fault=not valid)
     if reference_ready:
-        row.update(evaluate_trace(attempt, reference["C_ref"], epsilon))
+        row.update(evaluate_trace(attempt, reference["C_ref"], C_star=C_star, metric=metric))
         # Incomplete/corrupt attempts cannot become terminal successes even if
         # they happen to carry a finite endpoint. Their finite trace is retained.
         row["terminal_success"] = bool(valid and row["terminal_success"])
@@ -315,9 +333,7 @@ def build_summary(library: dict, tasks: list[dict], selected_attempts: dict,
     a complete frozen reference, and every logical restart execution-valid.
     Only training graphs can supply model-fitting labels.
     """
-    settings = {**DEFAULT_ANALYSIS_SETTINGS, **(analysis_settings or {})}
-    if settings["epsilon"] != 0.5:
-        raise ValueError("The primary Plan A success threshold is fixed at epsilon=0.5.")
+    settings = _analysis_settings(DEFAULT_ANALYSIS_SETTINGS, analysis_settings)
     graph_by_id = {row["iso_class_id"]: row for row in library["graphs"]}
     task_by_id = {task["task_id"]: task for task in tasks}
     if len(task_by_id) != len(tasks):
@@ -350,18 +366,21 @@ def build_summary(library: dict, tasks: list[dict], selected_attempts: dict,
             if "batch_id" in reference and any(attempt.get("batch_id") != reference["batch_id"]
                                                for task in group if (attempt := selected_attempts.get(task["task_id"]))):
                 raise ValueError("Reference and selected attempt batches disagree.")
-        rows = [evaluate_restart(task, selected_attempts.get(task["task_id"]), reference, settings["epsilon"])
+        C_star = graph.get("C_star") if graph.get("exact_status") == "computed" else None
+        rows = [evaluate_restart(task, selected_attempts.get(task["task_id"]), reference,
+                                 C_star=C_star, metric=settings["success_metric"])
                 for task in group if task["kind"] == "optimization"]
         evaluation = [row for row in rows if row["experiment_role"] == "evaluation"]
         tier1 = [row for row in rows if row["experiment_role"] == "tier1"]
         valid_tier1 = [row for row in tier1 if row["execution_valid"] and _finite(row["best_seen"])]
         best = min(valid_tier1, key=lambda row: (-row["best_seen"], row["task_id"])) if valid_tier1 else None
         C_ref = reference.get("C_ref") if reference and reference.get("complete") else None
-        C_star = graph.get("C_star") if graph.get("exact_status") == "computed" else None
         for row in rows:
             row.update(C_star=C_star, C_source="selected_attempt_C_final",
                        ratio_exact=row["C_final"] / C_star if _finite(row["C_final"]) and C_star else None,
-                       gap_ref=C_ref - row["C_final"] if _finite(C_ref) and _finite(row["C_final"]) else None)
+                       gap_ref=C_ref - row["C_final"] if _finite(C_ref) and _finite(row["C_final"]) else None,
+                       gap_ratio=(C_ref - row["C_final"]) / C_star
+                       if _finite(C_ref) and _finite(row["C_final"]) and C_star else None)
         restart_rows.extend(rows)
         pool = pool_statistics(evaluation, settings["evaluation_restarts"])
         provenance = {"library_id": library["library_id"], "iso_class_id": identity, "p": p,
@@ -372,6 +391,7 @@ def build_summary(library: dict, tasks: list[dict], selected_attempts: dict,
         graph_rows.append({
             **provenance, "graph_split": graph["graph_split"], "n": graph["n"],
             "C_star": C_star, "exact_status": graph.get("exact_status"), "C_ref": C_ref,
+            "success_metric": settings["success_metric"],
             "evaluation": pool,
             "training_label_eligible": bool(graph["graph_split"] == "training" and pool["scientific_label_complete"]),
             "tier1": {"C_source": "tier1_selected_valid_attempt_trace_best_seen", "planned": len(tier1),
@@ -425,34 +445,36 @@ def build_summary(library: dict, tasks: list[dict], selected_attempts: dict,
             "graph_qaoa": graph_rows, "restarts": restart_rows, "diagnostics": diagnostics}
 
 
-WARM_ANALYSIS_VERSION = "plan-a-warm-analysis-v1"
-DEFAULT_WARM_SETTINGS = {"epsilon": 0.5, "bootstrap_seed": 20260912, "bootstrap_samples": 2000}
+WARM_ANALYSIS_VERSION = "plan-a-warm-analysis-v2"
+DEFAULT_WARM_SETTINGS = {"success_metric": DEFAULT_SUCCESS_METRIC, "bootstrap_seed": 20260912, "bootstrap_samples": 2000}
 _WARM_METRICS = ("C_initial", "C_final", "ratio_initial_exact", "ratio_final_exact",
-                 "gap_initial_ref", "gap_final_ref", "terminal_success_fraction", "hit_fraction")
+                 "gap_initial_ref", "gap_final_ref", "gap_initial_ratio", "gap_final_ratio",
+                 "terminal_success_fraction", "hit_fraction")
 
 
 def _warm_settings(settings):
-    settings = {**DEFAULT_WARM_SETTINGS, **(settings or {})}
-    if (settings["epsilon"] != 0.5 or type(settings["bootstrap_samples"]) is not int or
+    settings = _analysis_settings(DEFAULT_WARM_SETTINGS, settings)
+    if (type(settings["bootstrap_samples"]) is not int or
             settings["bootstrap_samples"] < 1 or type(settings["bootstrap_seed"]) is not int or settings["bootstrap_seed"] < 0):
-        raise ValueError("Warm analysis requires epsilon=0.5 and fixed positive bootstrap count/nonnegative integer seed.")
+        raise ValueError("Warm analysis requires a positive bootstrap count and nonnegative integer seed.")
     return settings
 
 
-def _warm_restart(task, attempt, reference, graph, epsilon):
-    row = evaluate_restart(task, attempt, reference, epsilon)
+def _warm_restart(task, attempt, reference, graph, metric):
+    exact = graph.get("C_star") if graph.get("exact_status") == "computed" else None
+    row = evaluate_restart(task, attempt, reference, C_star=exact, metric=resolve_success_metric(metric))
     row.update({key: task.get(key) for key in ("regime", "fold", "variant", "fit_id")})
     first = next(iter(attempt.get("trace", [])), None) if attempt else None
     if first and (first["call_id"] != 1 or first.get("theta") != task["theta0"]):
         raise ValueError("Warm comparison requires the actual first call at frozen theta0.")
     initial = first["C"] if first and _finite(first.get("C")) else None
-    exact = graph.get("C_star") if graph.get("exact_status") == "computed" else None
     row.update(C_initial=initial, initial_call_id=1 if initial is not None else None,
                initial_score_source="trace[0].C at frozen theta0; no new objective evaluation",
                initial_score_available=initial is not None, C_star=exact)
     for name, score in (("initial", initial), ("final", row["C_final"])):
         row[f"ratio_{name}_exact"] = score / exact if _finite(score) and exact else None
         row[f"gap_{name}_ref"] = row["C_ref"] - score if _finite(score) and row["reference_complete"] else None
+        row[f"gap_{name}_ratio"] = row[f"gap_{name}_ref"] / exact if row[f"gap_{name}_ref"] is not None and exact else None
     return row
 
 
@@ -463,7 +485,7 @@ def _warm_pool(rows):
     ready = all(row["reference_complete"] for row in rows)
     complete = valid == planned and ready and all(row["initial_score_available"] for row in rows)
     metrics, observed = {}, {}
-    for name in _WARM_METRICS[:6]:
+    for name in _WARM_METRICS[:-2]:
         values = [row[name] for row in rows if row["execution_valid"] and _finite(row[name])]
         mean = math.fsum(values) / len(values) if values else None
         metrics[name] = mean if len(values) == planned else None
@@ -588,9 +610,9 @@ def build_warm_summary(library: dict, tasks: list[dict], selected: dict, referen
                 raise ValueError("Warm reference and target graph/depth identities disagree.")
             if (identity, p) not in evaluated_b1:
                 evaluated_b1[identity, p] = [_warm_restart(row, b1_selected.get(row["task_id"]), reference,
-                                                         graphs[identity], settings["epsilon"]) for row in baseline]
+                                                         graphs[identity], settings["success_metric"]) for row in baseline]
                 restarts.extend(evaluated_b1[identity, p])
-            warm = _warm_restart(task, selected.get(task["task_id"]), reference, graphs[identity], settings["epsilon"])
+            warm = _warm_restart(task, selected.get(task["task_id"]), reference, graphs[identity], settings["success_metric"])
             restarts.append(warm)
             b1, b2 = _warm_pool(evaluated_b1[identity, p]), _warm_pool([warm])
             row = {**metadata, "library_id": library["library_id"], "iso_class_id": identity,
@@ -611,7 +633,7 @@ def build_warm_summary(library: dict, tasks: list[dict], selected: dict, referen
                                          for method, attempts in (("B1", b1_selected), ("B2", selected))}}
 
 
-B3_ANALYSIS_VERSION = "plan-a-b3-comparison-v1"
+B3_ANALYSIS_VERSION = "plan-a-b3-comparison-v2"
 
 
 def _b3_pool(rows, method):
@@ -682,7 +704,7 @@ def build_b3_summary(library: dict, tasks: list[dict], selected: dict, reference
                 or (task["task_id"] in selected and selected[task["task_id"]]["task_id"] != task["task_id"])):
             raise ValueError("B3 task, rule, initialization, reference or selected attempt identity disagrees.")
         rules[task["p"]].add(task["rule_id"])
-        row = _warm_restart(task, selected.get(task["task_id"]), reference, graphs[key[0]], settings["epsilon"])
+        row = _warm_restart(task, selected.get(task["task_id"]), reference, graphs[key[0]], settings["success_metric"])
         row.update({name: task.get(name) for name in ("rule_id", "initialization_id", "initialization_set_id")})
         b3_rows.append(row)
     if any(len(values) != 1 for values in rules.values()):
@@ -748,8 +770,8 @@ def build_b3_summary(library: dict, tasks: list[dict], selected: dict, reference
                 for method, planned, attempts in selected_inputs}}
 
 
-B4_ANALYSIS_VERSION = "plan-a-b4-analysis-v1"
-B5_ANALYSIS_VERSION = "plan-a-b5-analysis-v1"
+B4_ANALYSIS_VERSION = "plan-a-b4-analysis-v2"
+B5_ANALYSIS_VERSION = "plan-a-b5-analysis-v2"
 _B4_CASE_FIELDS = ("regime", "fold", "p", "feature_group", "shuffle_seed")
 
 
@@ -803,6 +825,8 @@ def _build_learning_summary(library, tasks, selected, references, *, b1_tasks, b
               if g["tier"] == 2 and g["graph_split"] == "evaluation"}
     models = {}
     for model in success_models:
+        if resolve_success_metric(model.get("success_metric", LEGACY_SUCCESS_METRIC)) != settings["success_metric"]:
+            raise ValueError("Success-model metric differs from analysis; use matching re-scored labels and fits.")
         key = (model["regime"], model["fold"], model["p"], model["group"], model["shuffle_seed"])
         if (key in models or model["head"] != "success" or model["p"] not in (1, 2)
                 or model["group"] not in ("L", "U", "F", "J+U", "J+U+S")
@@ -841,7 +865,7 @@ def _build_learning_summary(library, tasks, selected, references, *, b1_tasks, b
                     (("library_id", library["library_id"]), ("iso_class_id", identity), ("p", p)))
                     or (method != "B1" and task.get("reference_id") != ref.get("reference_id"))):
                 raise ValueError(f"{warm_method} comparison scoring reference disagrees.")
-            row = _warm_restart(task, attempt, ref, graphs[identity], settings["epsilon"])
+            row = _warm_restart(task, attempt, ref, graphs[identity], settings["success_metric"])
             row.update({name: task.get(name) for name in (*_B4_CASE_FIELDS, "prediction_id")})
             if method == "B3":
                 row.update({name: task.get(name) for name in ("rule_id", "initialization_id", "initialization_set_id")})
@@ -890,6 +914,7 @@ def _build_learning_summary(library, tasks, selected, references, *, b1_tasks, b
         for identity, row in sorted(group.items()):
             prediction = prediction_by_id[row["prediction_id"]]
             if (prediction["fit_id"] != row["fit_id"] or prediction["success_fit_id"] != model["fit_id"]
+                    or resolve_success_metric(prediction.get("success_metric", LEGACY_SUCCESS_METRIC)) != settings["success_metric"]
                     or prediction["iso_class_id"] != identity or prediction["theta0"] != row["theta0"]
                     or any(prediction[name] != row[name] for name in _B4_CASE_FIELDS)
                     or np.shape(prediction["rho"]) != (2 * key[2],)
@@ -992,6 +1017,8 @@ def _b5_shap_summary(predictions, explanations, success_models):
         columns, values = row["columns"], np.asarray(row["contributions"], dtype=float)
         raw, bias = row["raw_prediction"], row["bias"]
         if (columns != models[row["success_fit_id"]]["feature_names"]
+                or resolve_success_metric(row.get("success_metric", LEGACY_SUCCESS_METRIC)) !=
+                    resolve_success_metric(models[row["success_fit_id"]].get("success_metric", LEGACY_SUCCESS_METRIC))
                 or not columns or len(set(columns)) != len(columns) or not all(isinstance(c, str) for c in columns)
                 or values.shape != (len(columns),) or not np.all(np.isfinite(values))
                 or not _finite(raw) or not _finite(bias) or not _finite(row["additivity_error"])

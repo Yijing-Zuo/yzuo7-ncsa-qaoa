@@ -1,12 +1,14 @@
 """Plan, explicitly execute, freeze and summarize the same Plan A task list."""
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 from itertools import groupby
 import json
 import math
 from pathlib import Path
 import sys
+import zipfile
 
 from qaoa_study.analysis import build_summary, build_warm_summary, build_b3_summary
 from qaoa_study.experiments import (
@@ -17,7 +19,8 @@ from qaoa_study.experiments import (
     read_b4_inputs, save_b4_fits, save_b4_predictions, save_b4_batch,
     read_b5_inputs, read_b5_explanations, save_b5_fits, save_b5_predictions, save_b5_batch,
 )
-from qaoa_study.records import evaluate_trace, execution_failed, read_json, write_once_json
+from qaoa_study.records import (evaluate_trace, execution_failed, read_json, write_once_json,
+                                LEGACY_SUCCESS_METRIC, resolve_success_metric)
 
 
 def save_summary(output, summary):
@@ -95,16 +98,28 @@ def _iter_graph_results(manifest, tasks, attempts_directory):
         yield identity, graph_tasks, attempts, graph_audit, execution
 
 
-def _empty_summary(library, manifest):
-    summary = build_summary(library, [], {}, {}, manifest["config"].get("analysis"))
+def _scoring_settings(manifest, override=None):
+    settings = dict(manifest["config"].get("analysis", {}))
+    if not any(k in settings for k in ("epsilon", "success_metric")):
+        settings["success_metric"] = resolve_success_metric(manifest["config"])
+    if override is not None:
+        if any(key in override for key in ("success_metric", "epsilon")):
+            settings.pop("epsilon", None)
+            settings.pop("success_metric", None)
+        settings.update(override)
+    return settings
+
+
+def _empty_summary(library, manifest, analysis_settings=None):
+    summary = build_summary(library, [], {}, {}, _scoring_settings(manifest, analysis_settings))
     summary.update(all_attempt_costs_by_role={}, selected_attempts={})
     return summary
 
 
-def _append_graph_summary(summary, library, graph, manifest, tasks, attempts, references, audit, completed_ids):
+def _append_graph_summary(summary, library, graph, manifest, tasks, attempts, references, audit, completed_ids, analysis_settings=None):
     selected = select_attempts(attempts)
     part = build_summary({**library, "graphs": [graph]}, tasks, selected, references,
-                         manifest["config"].get("analysis"))
+                         _scoring_settings(manifest, analysis_settings))
     for key in ("graph_qaoa", "restarts", "diagnostics"):
         summary[key].extend(part[key])
     summary["selected_attempts"].update({key: row["attempt_id"] for key, row in selected.items()})
@@ -180,21 +195,21 @@ def _finish_summary(summary, manifest, execution, audit, completed_ids, source):
                        "SHA256 of sorted logical relative path + NUL + SHA256(file) + newline")
 
 
-def summarize_batch(batch, attempts_directory, references_directory):
+def summarize_batch(batch, attempts_directory, references_directory, *, analysis_settings=None):
     """Reconstruct one graph at a time; return the legacy combined tables."""
     manifest, library, tasks, references = _summary_inputs(batch, references_directory)
     graphs = {graph["iso_class_id"]: graph for graph in library["graphs"]}
-    summary = _empty_summary(library, manifest)
+    summary = _empty_summary(library, manifest, analysis_settings)
     audit, completed_ids, execution = {}, set(), None
     for identity, graph_tasks, attempts, graph_audit, execution in _iter_graph_results(manifest, tasks, attempts_directory):
         _append_graph_summary(summary, library, graphs[identity], manifest, graph_tasks, attempts,
-                              references, graph_audit, completed_ids)
+                              references, graph_audit, completed_ids, analysis_settings)
         _merge_audit(audit, graph_audit)
     _finish_summary(summary, manifest, execution, audit, completed_ids, source_identity())
     return summary
 
 
-def save_partitioned_summary(output, batch, attempts_directory, references_directory):
+def save_partitioned_summary(output, batch, attempts_directory, references_directory, *, analysis_settings=None):
     """Export graph-sized JSON/Parquet tables; publish the index only after all writes succeed."""
     manifest, library, tasks, references = _summary_inputs(batch, references_directory)
     output = Path(output)
@@ -205,9 +220,9 @@ def save_partitioned_summary(output, batch, attempts_directory, references_direc
     row_counts = {key: 0 for key in ("graph_qaoa", "restarts", "diagnostics")}
     entries, completed_ids, execution = [], set(), None
     for identity, graph_tasks, attempts, audit, execution in _iter_graph_results(manifest, tasks, attempts_directory):
-        summary = _empty_summary(library, manifest)
+        summary = _empty_summary(library, manifest, analysis_settings)
         counts = _append_graph_summary(summary, library, graphs[identity], manifest, graph_tasks, attempts,
-                                       references, audit, completed_ids)
+                                       references, audit, completed_ids, analysis_settings)
         _finish_summary(summary, manifest, execution, audit, completed_ids, source)
         name = "graphs/" + digest(identity)
         save_summary(output / name, summary)
@@ -224,7 +239,7 @@ def save_partitioned_summary(output, batch, attempts_directory, references_direc
     index = {"format": "partitioned-summary-v1", "batch_id": manifest["batch_id"], "library_id": library["library_id"],
              "execution_id": execution["execution_id"] if execution else None, "analysis_source": source,
              "analysis_version": summary["analysis_version"] if entries else None,
-             "settings": summary["settings"] if entries else manifest["config"].get("analysis"), "coverage": manifest["coverage"],
+             "settings": summary["settings"] if entries else _scoring_settings(manifest, analysis_settings), "coverage": manifest["coverage"],
              "attempt_selection_rule": manifest["attempt_selection_rule"], "complete": complete,
              "completion_scope": "All configured tasks execution-valid and all required frozen references complete; scientific label counts reported separately.",
              "counts": totals, "table_rows": row_counts, "graphs": entries}
@@ -232,13 +247,15 @@ def save_partitioned_summary(output, batch, attempts_directory, references_direc
     return index
 
 
-def _warm_attempt_views(manifest, tasks, directory, references, requested, *, reference_pairs=None, by_depth=False):
+def _warm_attempt_views(manifest, tasks, directory, references, requested, *, reference_pairs=None, by_depth=False,
+                        graphs=None, metric=None):
     """Project validated graph-sized traces onto events needed by warm analysis.
 
     These in-memory views retain the first call, first threshold hit and maximum
     score event. They are not run records and are never written as attempts.
     Full calls/counts and provenance were validated before projection.
     """
+    metric = resolve_success_metric(metric if metric is not None else manifest["config"])
     selected, costs, reference_costs, audit, execution, completed_ids = {}, [], [], {}, None, set()
     verified_references = set()
     lookup = {t["task_id"]: t for t in requested}
@@ -264,8 +281,13 @@ def _warm_attempt_views(manifest, tasks, directory, references, requested, *, re
         rows = [row for row in rows if row["task_id"] in lookup]
         for identity, row in select_attempts(rows).items():
             ref = references[row["iso_class_id"], row["p"]]
-            hit = evaluate_trace(row, ref["C_ref"])["first_hit"]
-            calls = {1, hit, row.get("best_call_id")}
+            graph = (graphs or {}).get(row["iso_class_id"], {})
+            exact = graph.get("C_star") if graph.get("exact_status") == "computed" else None
+            metrics = [metric]
+            if exact is not None and exact > 0:
+                metrics += [{"kind": "normalized_gap", "tolerance": tolerance} for tolerance in (.005, .01, .02)]
+            calls = {1, row.get("best_call_id")}
+            calls.update(evaluate_trace(row, ref["C_ref"], C_star=exact, metric=rule)["first_hit"] for rule in metrics)
             view = {k: v for k, v in row.items() if k not in ("trace", "optimizer_messages", "invalid_result")}
             view["trace"] = [{k: point[k] for k in ("call_id", "C", "theta")}
                              for point in row["trace"] if point["call_id"] in calls]
@@ -287,9 +309,12 @@ def _warm_attempt_views(manifest, tasks, directory, references, requested, *, re
     return selected, execution, costs_audit
 
 
-def summarize_b2_batch(batch, attempts_directory, b1_batch, b1_attempts):
+def summarize_b2_batch(batch, attempts_directory, b1_batch, b1_attempts, *, analysis_settings=None):
     """Read a bound B2 experiment and separately verify B1 comparison eligibility."""
     manifest, library, tasks = read_batch(batch)
+    scoring = _scoring_settings(manifest, analysis_settings)
+    metric = resolve_success_metric(scoring) if any(k in scoring for k in ("epsilon", "success_metric")) else resolve_success_metric()
+    graphs = {g["iso_class_id"]: g for g in library["graphs"]}
     if manifest["config"].get("kind") != "b2":
         raise ValueError("summarize-b2 requires a B2 batch.")
     fit, binding = read_b2_inputs(batch, manifest)
@@ -300,11 +325,11 @@ def summarize_b2_batch(batch, attempts_directory, b1_batch, b1_attempts):
     targets = {(t["iso_class_id"], t["p"]) for t in tasks}
     b1_tasks = [t for t in baseline_tasks if t["experiment_role"] == "evaluation"
                 and (t["iso_class_id"], t["p"]) in targets]
-    selected, execution, warm_audit = _warm_attempt_views(manifest, tasks, attempts_directory, references, tasks)
-    b1_selected, b1_execution, b1_audit = _warm_attempt_views(baseline, baseline_tasks, b1_attempts, references, b1_tasks)
+    selected, execution, warm_audit = _warm_attempt_views(manifest, tasks, attempts_directory, references, tasks, graphs=graphs, metric=metric)
+    b1_selected, b1_execution, b1_audit = _warm_attempt_views(baseline, baseline_tasks, b1_attempts, references, b1_tasks, graphs=graphs, metric=metric)
     validate_b1_comparison(manifest, baseline, execution, b1_execution)
     summary = build_warm_summary(library, tasks, selected, references, b1_tasks=b1_tasks,
-                                 b1_selected=b1_selected, settings=manifest["config"].get("analysis"))
+                                 b1_selected=b1_selected, settings=scoring)
     evaluation_reference_costs = b1_audit.pop("reference_attempt_costs")
     summary.update(batch_id=manifest["batch_id"], b1_batch_id=baseline["batch_id"], fit_id=fit["fit_id"],
         reference_binding_digest=digest(binding), analysis_source=source_identity(),
@@ -365,9 +390,12 @@ def _b3_training_costs(manifest, tasks, directory, fits, depths):
         "scope": "Original training-reference attempts; union deduplicated across fits. Joint fit time is not apportioned by depth."}
 
 
-def summarize_b3_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_cases):
+def summarize_b3_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_cases, *, analysis_settings=None):
     """Compare B3 with the declared B1/B2 cases under matching frozen contracts."""
     manifest, library, tasks = read_batch(batch)
+    scoring = _scoring_settings(manifest, analysis_settings)
+    metric = resolve_success_metric(scoring) if any(k in scoring for k in ("epsilon", "success_metric")) else resolve_success_metric()
+    graphs = {g["iso_class_id"]: g for g in library["graphs"]}
     if manifest["config"].get("kind") != "b3":
         raise ValueError("summarize-b3 requires a B3 batch.")
     prepared, binding = read_b3_inputs(batch, manifest)
@@ -379,9 +407,9 @@ def summarize_b3_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_case
     b1_tasks = [task for task in baseline_tasks if task["experiment_role"] == "evaluation"
                 and (task["iso_class_id"], task["p"]) in targets]
     selected, execution, b3_audit = _warm_attempt_views(manifest, tasks, attempts_directory,
-        references, tasks, reference_pairs=set(), by_depth=True)
+        references, tasks, reference_pairs=set(), by_depth=True, graphs=graphs, metric=metric)
     b1_selected, b1_execution, b1_audit = _warm_attempt_views(baseline, baseline_tasks, b1_attempts,
-        references, b1_tasks, reference_pairs=targets, by_depth=True)
+        references, b1_tasks, reference_pairs=targets, by_depth=True, graphs=graphs, metric=metric)
     comparison_execution = execution or {"environment": prepared["environment"]}
     validate_b1_comparison(manifest, baseline, comparison_execution, b1_execution)
     b2_tasks, b2_selected, fits, cases, audits = [], {}, [], [], {}
@@ -405,7 +433,7 @@ def summarize_b3_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_case
                for task in requested):
             raise ValueError("B2/B3 evaluation graphs or scoring reference identities disagree.")
         chosen, other_execution, audit = _warm_attempt_views(other, planned, case_attempts,
-            other_refs, requested, reference_pairs=set(), by_depth=True)
+            other_refs, requested, reference_pairs=set(), by_depth=True, graphs=graphs, metric=metric)
         validate_b1_comparison(manifest, other, comparison_execution, other_execution)
         if set(b2_selected) & set(chosen):
             raise ValueError("B2 cases share an execution task identity.")
@@ -420,7 +448,7 @@ def summarize_b3_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_case
         raise ValueError("All declared B2 comparison cases are required; no silent fold/variant omission.")
     summary = build_b3_summary(library, tasks, selected, references, b1_tasks=b1_tasks,
         b1_selected=b1_selected, b2_tasks=b2_tasks, b2_selected=b2_selected,
-        settings=manifest["config"].get("analysis"))
+        settings=scoring)
     timings = prepared["preparation"]
     depths = manifest["config"]["depths"]
     summary.update(batch_id=manifest["batch_id"], initialization_set_id=prepared["initialization_set_id"],
@@ -446,32 +474,154 @@ def summarize_b3_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_case
     return summary
 
 
-def summarize_b4_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_cases, b3_batch, b3_attempts):
+def _success_prediction_overlay(path, batch, manifest, prepared, metric):
+    """Validate replacement success predictions without rebinding execution artifacts.
+
+    The returned in-memory view is for analysis only. Its original preparation
+    and prediction identities remain provenance pointers, not new plan inputs.
+    """
+    from qaoa_study.learning import validate_b4_model, validate_b5_model, load_b5_boosters
+    from qaoa_study.experiments import _b5_model_summary, _validate_b5_explanations
+
+    overlay = read_json(path)
+    tree = manifest["config"].get("kind") == "b5"
+    if (overlay.get("version") != "success-prediction-overlay-v1"
+            or overlay.get("overlay_id") != digest({k: v for k, v in overlay.items() if k != "overlay_id"})
+            or overlay.get("source_batch_id") != manifest["batch_id"]
+            or overlay.get("source_preparation_id") != prepared["preparation_id"]
+            or overlay.get("source_manifest_sha256") != hashlib.sha256((Path(batch) / "manifest.json").read_bytes()).hexdigest()
+            or resolve_success_metric(overlay.get("success_metric", LEGACY_SUCCESS_METRIC)) != metric):
+        raise ValueError("Success overlay checksum, source batch/preparation or metric differs.")
+    original = {m["fit_id"]: m for m in prepared["models"] if m["head"] == "success"}
+    replacements, models, native_files = {}, {}, {}
+    base = Path(path).resolve().parent
+    source = zipfile.ZipFile(base / overlay["source_archive_path"]) if tree else nullcontext()
+    with source as archive:
+        if tree:
+            snapshot = json.loads(archive.read("snapshot.json"))
+            prefix = overlay["source_fits_member_prefix"]
+            fit_bytes = archive.read(prefix + "manifest.json")
+            fit_manifest = json.loads(fit_bytes)
+            if (snapshot["snapshot_id"] != overlay["source_snapshot_id"]
+                    or snapshot["snapshot_id"] != digest({k: v for k, v in snapshot.items() if k != "snapshot_id"})
+                    or hashlib.sha256(fit_bytes).hexdigest() != overlay["source_fit_manifest_sha256"]
+                    or snapshot["files"].get(prefix + "manifest.json") != overlay["source_fit_manifest_sha256"]
+                    or fit_manifest != prepared["fit_set_manifest"]):
+                raise ValueError("B5 overlay original checkpoint or fitting manifest differs.")
+        for model in overlay["models"]:
+            old = original.get(model.get("source_fit_id"))
+            if old is None or model["source_fit_id"] in replacements or model["fit_id"] in models:
+                raise ValueError("Success overlay contains a foreign or duplicate model.")
+            if tree:
+                member = model["source_model_member"]
+                relative = member.removeprefix(prefix)
+                if not member.startswith(prefix) or relative not in fit_manifest["model_files"]:
+                    raise ValueError("B5 overlay source model is outside the original fit manifest.")
+                payload = archive.read(member)
+                full = json.loads(payload)
+                if (hashlib.sha256(payload).hexdigest() != model["source_model_sha256"]
+                        or model["source_model_sha256"] != fit_manifest["files"][relative]
+                        or snapshot["files"].get(member) != model["source_model_sha256"]
+                        or _b5_model_summary(full) != old
+                        or full["fit_id"] != digest({k: v for k, v in full.items() if k != "fit_id"})):
+                    raise ValueError("B5 overlay source model bytes or identity differ.")
+                old = full
+            if (model["head"] != "success" or resolve_success_metric(model.get("success_metric", LEGACY_SUCCESS_METRIC)) != metric
+                    or model["fit_id"] != digest({k: v for k, v in model.items() if k != "fit_id"})
+                    or any(model[k] != old[k] for k in ("p", "group", "regime", "fold", "shuffle_seed",
+                        "training_graph_ids", "reference_candidates", "feature_names", "feature_version", "settings", "rules"))):
+                raise ValueError("Success overlay model changed its original training scope, features or reference targets.")
+            if tree:
+                if any(model[k] != old[k] for k in ("library_id", "split_digest", "feature_artifact_id")):
+                    raise ValueError("B5 overlay library, split or frozen features differ.")
+                payloads = []
+                if set(model["booster_paths"]) != set(model["booster_files"]):
+                    raise ValueError("B5 overlay must bind every native booster.")
+                for name, checksum in model["booster_files"].items():
+                    relative = model["booster_paths"][name]
+                    native = (base / relative).resolve()
+                    if not native.is_relative_to(base) or relative in native_files:
+                        raise ValueError("B5 overlay native paths must be distinct and stay within its directory.")
+                    payload = native.read_bytes()
+                    if hashlib.sha256(payload).hexdigest() != checksum or overlay["native_files"].get(relative) != checksum:
+                        raise ValueError("B5 overlay native booster checksum mismatch.")
+                    native_files[relative] = checksum
+                    payloads.append(payload)
+                validate_b5_model(model, load_b5_boosters(payloads))
+            else:
+                validate_b4_model(model)
+            replacements[model["source_fit_id"]] = model
+            models[model["fit_id"]] = model
+    if tree and native_files != overlay["native_files"]:
+        raise ValueError("B5 overlay native inventory differs from its models.")
+    if set(replacements) != set(original):
+        raise ValueError("Success overlay must cover every original success model exactly once.")
+    predictions = {p["source_prediction_id"]: p for p in overlay["predictions"]}
+    if (len(predictions) != len(overlay["predictions"])
+            or set(predictions) != {p["prediction_id"] for p in prepared["predictions"]}):
+        raise ValueError("Success overlay must cover every original prediction exactly once.")
+    rows = []
+    for old in prepared["predictions"]:
+        new = predictions[old["prediction_id"]]
+        raw, probability = new["raw_success_prediction"], new["success_probability"]
+        if (new["source_success_fit_id"] != old["success_fit_id"]
+                or new["success_fit_id"] != replacements[old["success_fit_id"]]["fit_id"]
+                or not math.isfinite(raw) or probability != min(1., max(0., raw))):
+            raise ValueError("Success overlay prediction model or clipping is inconsistent.")
+        rows.append({**old, **{k: new[k] for k in ("success_fit_id", "raw_success_prediction", "success_probability")},
+                     "success_metric": metric})
+    view = {**prepared, "predictions": rows,
+            "models": [replacements[m["fit_id"]] if m["head"] == "success" else m for m in prepared["models"]],
+            "analysis_overlay": {"path": str(path), "overlay_id": overlay["overlay_id"],
+                "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                "scope": "Analysis-only success predictions; original angles, tasks and attempts remain frozen."}}
+    if tree:
+        explained = overlay["explanations"]
+        _validate_b5_explanations(explained, {**view, "explanation_id": explained["explanation_id"]})
+        if any(resolve_success_metric(row.get("success_metric", LEGACY_SUCCESS_METRIC)) != metric for row in explained["rows"]):
+            raise ValueError("B5 overlay SHAP metric differs from its models and predictions.")
+        view["analysis_explanations"] = explained
+        view["analysis_overlay"].update(explanation_id=explained["explanation_id"], native_files=native_files,
+            source_snapshot_id=overlay["source_snapshot_id"])
+    return view
+
+
+def summarize_b4_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_cases, b3_batch, b3_attempts, *,
+                       analysis_settings=None, success_overlay=None):
     return _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts,
-                                     b2_cases, b3_batch, b3_attempts)
+                                     b2_cases, b3_batch, b3_attempts,
+                                     analysis_settings=analysis_settings, success_overlay=success_overlay)
 
 
 def summarize_b5_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_cases,
-                       b3_batch, b3_attempts, b4_batch, b4_attempts):
+                       b3_batch, b3_attempts, b4_batch, b4_attempts, *, analysis_settings=None,
+                       success_overlay=None, b4_success_overlay=None):
     return _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts,
-        b2_cases, b3_batch, b3_attempts, b4_batch=b4_batch, b4_attempts=b4_attempts)
+        b2_cases, b3_batch, b3_attempts, b4_batch=b4_batch, b4_attempts=b4_attempts, analysis_settings=analysis_settings,
+        success_overlay=success_overlay, b4_success_overlay=b4_success_overlay)
 
 
 def _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts, b2_cases,
-                              b3_batch, b3_attempts, *, b4_batch=None, b4_attempts=None):
+                              b3_batch, b3_attempts, *, b4_batch=None, b4_attempts=None, analysis_settings=None,
+                              success_overlay=None, b4_success_overlay=None):
     """Read graph-sized validated traces; no prediction, training or quantum calls."""
     from qaoa_study.analysis import build_b4_summary, build_b5_summary
 
     kind = "b4" if b4_batch is None else "b5"
     method = kind.upper()
     manifest, library, tasks = read_batch(batch)
+    scoring = _scoring_settings(manifest, analysis_settings)
+    metric = resolve_success_metric(scoring) if any(k in scoring for k in ("epsilon", "success_metric")) else resolve_success_metric()
+    graphs = {g["iso_class_id"]: g for g in library["graphs"]}
     if manifest["config"].get("kind") != kind:
         raise ValueError(f"summarize-{kind} requires a {method} batch.")
     prepared, binding = (read_b4_inputs if kind == "b4" else read_b5_inputs)(batch, manifest)
+    if success_overlay:
+        prepared = _success_prediction_overlay(success_overlay, batch, manifest, prepared, metric)
     references = {(r["iso_class_id"], r["p"]): r for r in binding["references"]}
     targets = {(t["iso_class_id"], t["p"]) for t in tasks}
     selected, execution, audit = _warm_attempt_views(manifest, tasks, attempts_directory,
-        references, tasks, reference_pairs=set(), by_depth=True)
+        references, tasks, reference_pairs=set(), by_depth=True, graphs=graphs, metric=metric)
     compare_execution = execution or {"environment": prepared["compute_environment"]}
     baseline, _, baseline_tasks = read_batch(b1_batch)
     if baseline["batch_id"] != binding["source_batch_id"]:
@@ -479,7 +629,7 @@ def _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts, 
     requested = [t for t in baseline_tasks if t["experiment_role"] == "evaluation"
                  and (t["iso_class_id"], t["p"]) in targets]
     b1_selected, b1_execution, b1_audit = _warm_attempt_views(baseline, baseline_tasks, b1_attempts,
-        references, requested, reference_pairs=targets, by_depth=True)
+        references, requested, reference_pairs=targets, by_depth=True, graphs=graphs, metric=metric)
     validate_b1_comparison(manifest, baseline, compare_execution, b1_execution)
     b2_tasks, b2_selected, fits, cases, audits = [], {}, [], [], {}
     expected = {(c["regime"], c["fold"]) for c in manifest["config"]["comparison_cases"]}
@@ -497,7 +647,7 @@ def _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts, 
         if any(other_refs.get((t["iso_class_id"], t["p"])) != references.get((t["iso_class_id"], t["p"])) for t in planned):
             raise ValueError("B4/B2 scoring references differ.")
         chosen, other_execution, other_audit = _warm_attempt_views(other, planned, case_attempts,
-            other_refs, planned, reference_pairs=set(), by_depth=True)
+            other_refs, planned, reference_pairs=set(), by_depth=True, graphs=graphs, metric=metric)
         validate_b1_comparison(manifest, other, compare_execution, other_execution)
         b2_tasks.extend(planned)
         b2_selected.update(chosen)
@@ -517,7 +667,7 @@ def _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts, 
     if any(other_refs.get(key) != references[key] for key in targets):
         raise ValueError("B4/B3 scoring references differ.")
     b3_selected, b3_execution, b3_audit = _warm_attempt_views(other, b3_tasks, b3_attempts,
-        other_refs, b3_tasks, reference_pairs=set(), by_depth=True)
+        other_refs, b3_tasks, reference_pairs=set(), by_depth=True, graphs=graphs, metric=metric)
     validate_b1_comparison(manifest, other, compare_execution,
                            b3_execution or {"environment": b3_prepared["environment"]})
     extra = {}
@@ -526,23 +676,26 @@ def _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts, 
         if fourth["config"].get("kind") != "b4" or fourth["issues"]:
             raise ValueError("B5 requires its valid original B4 comparison batch.")
         b4_prepared, b4_binding = read_b4_inputs(b4_batch, fourth)
+        if b4_success_overlay:
+            b4_prepared = _success_prediction_overlay(b4_success_overlay, b4_batch, fourth, b4_prepared, metric)
         other_refs = {(r["iso_class_id"], r["p"]): r for r in b4_binding["references"]}
         if (b4_binding["source_batch_id"] != baseline["batch_id"]
                 or any(other_refs.get(key) != references[key] for key in targets)):
             raise ValueError("B5/B4 scoring references differ.")
         b4_selected, b4_execution, b4_audit = _warm_attempt_views(fourth, b4_tasks, b4_attempts,
-            other_refs, b4_tasks, reference_pairs=set(), by_depth=True)
+            other_refs, b4_tasks, reference_pairs=set(), by_depth=True, graphs=graphs, metric=metric)
         validate_b1_comparison(manifest, fourth, compare_execution,
                               b4_execution or {"environment": b4_prepared["compute_environment"]})
         extra = {"b4_tasks": b4_tasks, "b4_selected": b4_selected,
             "b4_predictions": b4_prepared["predictions"],
             "b4_success_models": [m for m in b4_prepared["models"] if m["head"] == "success"],
-            "explanations": read_b5_explanations(batch, prepared)["rows"]}
+            "explanations": (prepared["analysis_explanations"] if "analysis_explanations" in prepared
+                             else read_b5_explanations(batch, prepared))["rows"]}
     summary = (build_b4_summary if kind == "b4" else build_b5_summary)(
         library, tasks, selected, references, b1_tasks=requested, b1_selected=b1_selected,
         b2_tasks=b2_tasks, b2_selected=b2_selected, b3_tasks=b3_tasks, b3_selected=b3_selected,
         predictions=prepared["predictions"], success_models=[m for m in prepared["models"] if m["head"] == "success"],
-        settings=manifest["config"].get("analysis"), **extra)
+        settings=scoring, **extra)
     original_training = {(r["iso_class_id"], r["p"]): r for f in fits for r in f["reference_binding"]["references"]}
     if any(original_training.get((r["iso_class_id"], r["p"])) != r for r in prepared["training_binding"]["references"]):
         raise ValueError("B4 and B2 disagree on shared original training references.")
@@ -575,6 +728,10 @@ def _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts, 
         summary["cost_scope"] = summary["cost_scope"].replace("B2/B4", "B2/B4/B5")
     summary["complete"] = summary["complete"] and not manifest["issues"]
     summary["provisional"] = not summary["complete"]
+    summary["success_prediction_overlays"] = {
+        method: prepared["analysis_overlay"] for method, prepared in
+        [(method, prepared), *(([("B4", b4_prepared)]) if kind == "b5" else [])]
+        if "analysis_overlay" in prepared}
     return summary
 
 
@@ -601,6 +758,10 @@ def main(argv=None):
             options += ["b4-batch", "b4-attempts"]
         for option in options:
             summary.add_argument("--" + option, required=True)
+        summary.add_argument("--analysis-settings", help="JSON scoring settings for a new derived analysis")
+        summary.add_argument("--success-overlay", help="Verified analysis-only replacement success predictions and B5 SHAP")
+        if method == "b5":
+            summary.add_argument("--b4-success-overlay", help="Replacement B4 success predictions for this comparison")
         summary.add_argument("--b2-case", nargs=2, action="append", required=True, metavar=("BATCH", "ATTEMPTS"))
     for command in ("fit-b2", "plan-b2"):
         sub = commands.add_parser(command, help="Fit or freeze B2 using complete original training references")
@@ -615,6 +776,7 @@ def main(argv=None):
     warm_summary = commands.add_parser("summarize-b2", help="Read bound B2 and comparable original B1 traces")
     for option in ("batch", "attempts", "b1-batch", "b1-attempts", "output"):
         warm_summary.add_argument("--" + option, required=True)
+    warm_summary.add_argument("--analysis-settings", help="JSON scoring settings for a new derived analysis")
     prepare = commands.add_parser("prepare-b3", help="Explicitly compute and freeze graph-only B3 initial angles")
     for option in ("library", "config", "output"):
         prepare.add_argument("--" + option, required=True)
@@ -625,6 +787,7 @@ def main(argv=None):
     b3_summary = commands.add_parser("summarize-b3", help="Read B3 and all declared original B1/B2 comparison cases")
     for option in ("batch", "attempts", "b1-batch", "b1-attempts", "output"):
         b3_summary.add_argument("--" + option, required=True)
+    b3_summary.add_argument("--analysis-settings", help="JSON scoring settings for a new derived analysis")
     b3_summary.add_argument("--b2-case", nargs=2, action="append", required=True, metavar=("BATCH", "ATTEMPTS"))
     run = commands.add_parser("run", help="Check only unless --execute is explicit")
     run.add_argument("--batch", required=True)
@@ -643,10 +806,12 @@ def main(argv=None):
         sub.add_argument("--attempts", required=True)
         sub.add_argument("--output", required=True)
         if command == "summarize":
+            sub.add_argument("--analysis-settings", help="JSON scoring settings for a new derived analysis")
             sub.add_argument("--references", required=True)
             sub.add_argument("--partitioned-output", action="store_true", help="Write bounded-memory per-graph tables and a root index")
     args = parser.parse_args(argv)
     try:
+        scoring_override = read_json(args.analysis_settings) if getattr(args, "analysis_settings", None) else None
         if args.command not in ("run", "fit-b4", "fit-b5") and Path(args.output).exists():
             raise FileExistsError("Choose a new output path; frozen outputs are not overwritten.")
         if args.command in ("fit-b4", "fit-b5"):
@@ -664,9 +829,11 @@ def main(argv=None):
             return 2 if manifest["issues"] else 0
         if args.command in ("summarize-b4", "summarize-b5"):
             summarizer = summarize_b4_batch if args.command == "summarize-b4" else summarize_b5_batch
-            extra = {} if args.command == "summarize-b4" else {"b4_batch": args.b4_batch, "b4_attempts": args.b4_attempts}
+            extra = {} if args.command == "summarize-b4" else {"b4_batch": args.b4_batch, "b4_attempts": args.b4_attempts,
+                "b4_success_overlay": args.b4_success_overlay}
             summary = summarizer(args.batch, args.attempts, args.b1_batch, args.b1_attempts,
-                                 args.b2_case, args.b3_batch, args.b3_attempts, **extra)
+                                 args.b2_case, args.b3_batch, args.b3_attempts, analysis_settings=scoring_override,
+                                 success_overlay=getattr(args, "success_overlay", None), **extra)
             save_summary(args.output, summary)
             print(json.dumps({"complete": summary["complete"], "comparisons": len(summary["comparisons"])}))
             return 0 if summary["complete"] else 2
@@ -681,7 +848,7 @@ def main(argv=None):
             print(json.dumps({k: manifest[k] for k in ("batch_id", "task_count", "issues")}))
             return 2 if manifest["issues"] else 0
         if args.command == "summarize-b3":
-            summary = summarize_b3_batch(args.batch, args.attempts, args.b1_batch, args.b1_attempts, args.b2_case)
+            summary = summarize_b3_batch(args.batch, args.attempts, args.b1_batch, args.b1_attempts, args.b2_case, analysis_settings=scoring_override)
             save_summary(args.output, summary)
             print(json.dumps({"complete": summary["complete"], "comparisons": len(summary["comparisons"])}))
             return 0 if summary["complete"] else 2
@@ -694,7 +861,7 @@ def main(argv=None):
             print(json.dumps({k: manifest[k] for k in ("batch_id", "task_count", "issues")}))
             return 2 if manifest["issues"] else 0
         if args.command == "summarize-b2":
-            summary = summarize_b2_batch(args.batch, args.attempts, args.b1_batch, args.b1_attempts)
+            summary = summarize_b2_batch(args.batch, args.attempts, args.b1_batch, args.b1_attempts, analysis_settings=scoring_override)
             save_summary(args.output, summary)
             print(json.dumps({"complete": summary["complete"], "comparisons": len(summary["comparisons"])}))
             return 0 if summary["complete"] else 2
@@ -717,10 +884,10 @@ def main(argv=None):
             print(json.dumps({"references": len(references), "complete": sum(r["complete"] for r in references.values())}))
             return 0 if all(ref["complete"] for ref in references.values()) else 2
         if args.partitioned_output:
-            index = save_partitioned_summary(args.output, args.batch, args.attempts, args.references)
+            index = save_partitioned_summary(args.output, args.batch, args.attempts, args.references, analysis_settings=scoring_override)
             print(json.dumps({"complete": index["complete"], "counts": index["counts"], "output": args.output}))
             return 0 if index["complete"] else 2
-        summary = summarize_batch(args.batch, args.attempts, args.references)
+        summary = summarize_batch(args.batch, args.attempts, args.references, analysis_settings=scoring_override)
         save_summary(args.output, summary)
         print(json.dumps({"graph_depth_rows": len(summary["graph_qaoa"]),
                           "restart_rows": len(summary["restarts"]), "output": args.output}))

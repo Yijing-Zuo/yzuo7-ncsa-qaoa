@@ -1,5 +1,5 @@
 {
-  "protocol_version": "plan-a-stage45-pilot-candidate-v1",
+  "protocol_version": "plan-a-stage45-pilot-candidate-v2",
   "purpose": "pilot_candidate_not_executed",
   "production_frozen": false,
   "seed_namespace": "plan-a-independent-pools-v1",
@@ -8,7 +8,7 @@
     1,
     2
   ],
-  "epsilon": 0.5,
+  "success_metric": {"kind": "normalized_gap", "tolerance": 0.01},
   "tier1_restarts": 5,
   "reference": {
     "p2_candidate": "best_seen_valid_execution",
@@ -48,7 +48,7 @@
   },
   "require_full_design": false,
   "analysis": {
-    "epsilon": 0.5,
+    "success_metric": {"kind": "normalized_gap", "tolerance": 0.01},
     "evaluation_restarts": 50,
     "cluster_threshold": 0.05,
     "cluster_sensitivity": [

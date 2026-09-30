@@ -16,6 +16,45 @@ import gzip
 
 
 EXECUTION_FAILURES = frozenset(("numerical_error", "evaluation_error", "optimizer_failed", "program_error"))
+DEFAULT_SUCCESS_METRIC = {"kind": "normalized_gap", "tolerance": 0.01}
+LEGACY_SUCCESS_METRIC = {"kind": "absolute", "tolerance": 0.5}
+
+
+def resolve_success_metric(value=None) -> dict:
+    """Resolve an explicit scoring rule, retaining historical absolute epsilon.
+
+    Settings may contain success_metric or legacy epsilon, never both. Missing
+    settings select the adopted one-percentage-point reference-ratio deficit.
+    """
+    if value is None:
+        value = DEFAULT_SUCCESS_METRIC
+    elif isinstance(value, dict) and ("success_metric" in value or "epsilon" in value):
+        if "success_metric" in value and "epsilon" in value:
+            raise ValueError("Specify success_metric or legacy epsilon, not both.")
+        value = value["success_metric"] if "success_metric" in value else {
+            "kind": "absolute", "tolerance": value["epsilon"]}
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = {"kind": "absolute", "tolerance": value}
+    if (not isinstance(value, dict) or set(value) != {"kind", "tolerance"}
+            or value["kind"] not in ("absolute", "normalized_gap")
+            or isinstance(value["tolerance"], bool)
+            or not isinstance(value["tolerance"], (int, float))
+            or not math.isfinite(value["tolerance"]) or value["tolerance"] < 0):
+        raise ValueError("A success metric needs a valid kind and finite nonnegative tolerance.")
+    return dict(value)
+
+
+def success_threshold(C_ref: float, C_star: float | None, metric: dict) -> float:
+    """Return a cut-score target without changing the frozen reference."""
+    metric = resolve_success_metric(metric)
+    if not math.isfinite(C_ref):
+        raise ValueError("C_ref must be finite.")
+    scale = 1.0
+    if metric["kind"] == "normalized_gap":
+        if C_star is None or not math.isfinite(C_star) or C_star <= 0:
+            raise ValueError("Normalized success requires a positive, computed C_star.")
+        scale = C_star
+    return C_ref - metric["tolerance"] * scale
 
 
 def execution_failed(result: dict) -> bool:
@@ -23,21 +62,25 @@ def execution_failed(result: dict) -> bool:
     return result["stop_reason"] in EXECUTION_FAILURES
 
 
-def evaluate_trace(result: dict, C_ref: float, epsilon: float = 0.5) -> dict:
+def evaluate_trace(result: dict, C_ref: float, epsilon: float | None = None, *,
+                   C_star: float | None = None, metric: dict | None = None) -> dict:
     """Evaluate existing scores without computing a circuit or changing a run.
 
     first_hit includes finite unaccepted trials. Numerical/evaluation failures
     cannot be terminal successes; their last valid accepted point is retained
     as C_final for inspection. Nonconvergence alone does not imply threshold failure.
     """
-    if not math.isfinite(C_ref) or not math.isfinite(epsilon) or epsilon < 0:
-        raise ValueError("C_ref must be finite and epsilon finite and nonnegative.")
-    threshold = C_ref - epsilon
+    if epsilon is not None and metric is not None:
+        raise ValueError("Specify metric or legacy epsilon, not both.")
+    metric = resolve_success_metric(epsilon if epsilon is not None else metric)
+    threshold = success_threshold(C_ref, C_star, metric)
     first_hit = next((row["call_id"] for row in result["trace"]
                       if row["C"] is not None and math.isfinite(row["C"]) and row["C"] >= threshold), None)
     final = result["C_final"]
     invalid_run = execution_failed(result)
-    return {"C_ref": C_ref, "epsilon": epsilon, "first_hit": first_hit,
+    return {"C_ref": C_ref, "success_metric": metric, "C_star": C_star,
+            "threshold": threshold, "epsilon": metric["tolerance"] * (
+                C_star if metric["kind"] == "normalized_gap" else 1.0), "first_hit": first_hit,
             "hit": first_hit is not None,
             "terminal_success": bool(not invalid_run and final is not None and
                                      math.isfinite(final) and final >= threshold),

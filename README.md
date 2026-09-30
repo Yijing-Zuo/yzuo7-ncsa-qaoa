@@ -9,6 +9,41 @@ Supplied production and pilot configurations are candidates; use the frozen
 batch manifests for adopted settings. B4 Ridge and B5 CPU XGBoost are implemented;
 B6–B7 remain outside the current implementation.
 
+The success metric adopted on 2026-09-27 is
+`success_metric={"kind":"normalized_gap","tolerance":0.01}`: a valid
+endpoint succeeds when `(C_ref - C_final) / C_star <= 0.01`. This is a gap of
+at most one percentage point in approximation ratio from the same depth's
+frozen reference, not 99% of the exact optimum. Report sensitivity at 0.005
+and 0.02 separately. Endpoint quality remains `C_final / C_star`; retain both
+the signed raw reference gap and its normalization by `C_star`.
+Restart tables use `gap_ref` and `gap_ratio`; warm-start tables retain
+`gap_initial_ref`/`gap_final_ref` and add
+`gap_initial_ratio`/`gap_final_ratio`.
+
+Historical batches used an absolute tolerance of 0.5 expected cut edges.
+Their references, traces, accepted endpoints and measured costs remain
+unchanged. Recompute success labels and first-hit costs in a new analysis
+version; do not overwrite historical manifests or resume an old batch with
+new source/configuration. Comparisons still require matching objective and
+optimizer source, budgets and execution environments. Success models must
+use labels and model identities for the selected metric; angle models and
+their saved optimization runs remain reusable. This is a disclosed revision
+after inspecting historical results, not an original preregistered threshold.
+
+To rescore existing records, pass `--analysis-settings FILE` to `summarize`,
+`summarize-b2`, `summarize-b3`, `summarize-b4` or `summarize-b5`, where the JSON
+contains `{"success_metric":{"kind":"normalized_gap","tolerance":0.01}}`.
+Use a new output directory for each metric/tolerance. Without this override,
+the summary uses the original batch's analysis settings to reproduce its
+historical definition. New candidate configurations select the normalized
+metric. B4 and B5 summaries accept `--success-overlay FILE` for verified
+replacement success models and predictions. B5's overlay also binds the
+native tree files and matching raw-success SHAP explanations. Use
+`--b4-success-overlay FILE` for B5's B4 comparison at the same metric.
+These overlays are
+analysis inputs, not changes to frozen tasks, angle predictions or execution
+manifests.
+
 Use Python 3.12. From the repository root, install the pinned environment
 in Windows PowerShell:
 

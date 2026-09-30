@@ -10,6 +10,7 @@ import networkx as nx
 import numpy as np
 
 from qaoa_study.graphs import graph_from_record, validate_graph
+from qaoa_study.records import LEGACY_SUCCESS_METRIC, resolve_success_metric
 
 
 _ANGLE_TIE = 32 * np.finfo(np.float64).eps * np.pi
@@ -499,12 +500,14 @@ def _b5_trees(matrix, target, candidate, names):
 
 
 def fit_b4_model(graph_rows, feature_rows, reference_candidates, success_labels, *,
-                 p, group, regime, fold=None, head="angles", shuffle_seed=None, settings=None):
+                 p, group, regime, fold=None, head="angles", shuffle_seed=None, settings=None,
+                 success_metric=None):
     """Fit a JSON numerical model on an already selected complete training scope.
 
     Graph rows use the frozen library schema. Feature rows use b4_feature_row
     plus iso_class_id. References contain iso_class_id, theta and optionally
-    source provenance. Success labels contain iso_class_id, successes, trials=50.
+    source provenance. Success labels contain iso_class_id, successes, trials=50
+    and their success_metric. Missing metric fields mean the historical absolute 0.5 rule.
     The I/O caller audits reference completeness and binds source/library hashes;
     this function rejects partial coverage, evaluation rows and illegal scopes.
     No objective or optimization call is made here. Development may use fewer
@@ -512,11 +515,12 @@ def fit_b4_model(graph_rows, feature_rows, reference_candidates, success_labels,
     """
     return _fit_learning_model(graph_rows, feature_rows, reference_candidates, success_labels,
         p=p, group=group, regime=regime, fold=fold, head=head,
-        shuffle_seed=shuffle_seed, settings=settings, boosted=False)
+        shuffle_seed=shuffle_seed, settings=settings, boosted=False, success_metric=success_metric)
 
 
 def fit_b5_model(graph_rows, feature_rows, reference_candidates, success_labels, *,
-                 p, group, regime, fold=None, head="angles", shuffle_seed=None, settings=None):
+                 p, group, regime, fold=None, head="angles", shuffle_seed=None, settings=None,
+                 success_metric=None):
     """Return frozen numerical metadata and scalar Boosters, with training-only CV.
 
     Uses the B4 graph/label contract. Only explicit development settings may
@@ -525,11 +529,11 @@ def fit_b5_model(graph_rows, feature_rows, reference_candidates, success_labels,
     """
     return _fit_learning_model(graph_rows, feature_rows, reference_candidates, success_labels,
         p=p, group=group, regime=regime, fold=fold, head=head,
-        shuffle_seed=shuffle_seed, settings=settings, boosted=True)
+        shuffle_seed=shuffle_seed, settings=settings, boosted=True, success_metric=success_metric)
 
 
 def _fit_learning_model(graph_rows, feature_rows, reference_candidates, success_labels, *,
-                        p, group, regime, fold, head, shuffle_seed, settings, boosted):
+                         p, group, regime, fold, head, shuffle_seed, settings, boosted, success_metric):
     from .features import B4_FEATURE_VERSION, b4_feature_matrix, b4_feature_names
     import sklearn
 
@@ -568,6 +572,10 @@ def _fit_learning_model(graph_rows, feature_rows, reference_candidates, success_
     rates = None
     if head == "success":
         labels = _b4_index(success_labels, ids, "success labels")
+        metric = resolve_success_metric(success_metric if success_metric is not None else
+                                        labels[0].get("success_metric", LEGACY_SUCCESS_METRIC))
+        if any(resolve_success_metric(row.get("success_metric", LEGACY_SUCCESS_METRIC)) != metric for row in labels):
+            raise ValueError("Success labels and model require the same success metric.")
         if any(type(row["successes"]) is not int or type(row["trials"]) is not int or
                row["trials"] != 50 or not 0 <= row["successes"] <= 50 for row in labels):
             raise ValueError("Success labels require integer successes and exactly 50 trials.")
@@ -662,7 +670,7 @@ def _fit_learning_model(graph_rows, feature_rows, reference_candidates, success_
              "timings": {"cv_seconds": cv_seconds, "final_fit_seconds": final_fit_seconds},
              "fit_seconds": perf_counter() - start}
     if rates is not None:
-        model.update(training_mean=float(rates.mean()), success_labels=deepcopy(labels))
+        model.update(training_mean=float(rates.mean()), success_labels=deepcopy(labels), success_metric=metric)
     if boosted:
         import xgboost
 
@@ -846,6 +854,9 @@ def _validate_learning_model(model, *, boosted):
             raise ValueError("Invalid B4 lambda tie status.")
         if model["head"] == "success":
             labels = _b4_index(model["success_labels"], ids, "saved success labels")
+            metric = resolve_success_metric(model.get("success_metric", LEGACY_SUCCESS_METRIC))
+            if any(resolve_success_metric(row.get("success_metric", LEGACY_SUCCESS_METRIC)) != metric for row in labels):
+                raise ValueError("Saved success labels and model metrics differ.")
             if (any(type(row["successes"]) is not int or type(row["trials"]) is not int or
                     row["trials"] != 50 or not 0 <= row["successes"] <= 50 for row in labels) or
                     not finite_numeric(model["training_mean"], ()) or not 0 <= model["training_mean"] <= 1 or
