@@ -460,6 +460,119 @@ def _warm_settings(settings):
     return settings
 
 
+def build_transfer_summary(library, tasks, selected, references, *, settings=None):
+    """Compare frozen B1–B5 starts on every new evaluation graph.
+
+    The caller validates batch/source and selected-attempt provenance. Reference
+    tasks contribute costs only. All comparisons pair graph means, preserve
+    planned restart denominators and suppress intervals for incomplete pairs.
+    Strata use representative generation cells; they are descriptive, with no
+    adjustment for density and no success-head inference or model refitting.
+    """
+    settings = _warm_settings(settings)
+    repeats = settings.setdefault("evaluation_restarts", 50)
+    if type(repeats) is not int or repeats < 1:
+        raise ValueError("Transfer analysis requires a positive planned B1 restart count.")
+    graphs = {graph["iso_class_id"]: graph for graph in library["graphs"]}
+    identities = {task["task_id"] for task in tasks}
+    if (not graphs or len(graphs) != len(library["graphs"]) or len(identities) != len(tasks)
+            or set(selected) - identities or any(attempt["task_id"] != key for key, attempt in selected.items())
+            or any(graph["tier"] != 2 or graph["graph_split"] != "evaluation" for graph in graphs.values())):
+        raise ValueError("Transfer analysis needs distinct planned tasks and evaluation-only graphs.")
+    baseline, groups = defaultdict(list), defaultdict(list)
+    fields = ("method", "p", "variant", "feature_group", "shuffle_seed")
+    for task in tasks:
+        if task["experiment_role"] == "reference":
+            continue
+        method, p, identity = task["method"], task["p"], task["iso_class_id"]
+        if (identity not in graphs or task["library_id"] != library["library_id"]
+                or task["graph_split"] != "evaluation" or task["kind"] != "optimization" or p not in (1, 2)):
+            raise ValueError("Transfer task and graph/depth identities disagree.")
+        if method == "B1":
+            if task["experiment_role"] != "evaluation":
+                raise ValueError("Transfer B1 baselines must use the evaluation restart pool.")
+            baseline[identity, p].append(task)
+        elif (method in ("B2", "B3", "B4", "B5") and task["experiment_role"] == "warm_start"
+              and task.get("regime") == "random" and task.get("fold") is None and task["restart_id"] == 0
+              and task.get("target_scope") == "external_family_transfer" and task.get("start_id")
+              and task.get("source_id")):
+            groups[tuple(task.get(name) for name in fields)].append(task)
+        else:
+            raise ValueError("Unsupported transfer method, scope or warm-start identity.")
+    depths = {p for _, p in baseline}
+    if (not depths or set(baseline) != {(identity, p) for identity in graphs for p in depths}
+            or any(len(rows) != repeats or {row["restart_id"] for row in rows} != set(range(repeats))
+                   for rows in baseline.values())):
+        raise ValueError("Every transfer graph/depth needs its complete planned B1 restart pool.")
+    for p in depths:
+        cases = {key for key in groups if key[1] == p}
+        if ({key[0] for key in cases} != {"B2", "B3", "B4", "B5"}
+                or {key[2:] for key in cases if key[0] == "B2"}
+                != {("medoid", None, None), ("aligned_median", None, None)}
+                or len([key for key in cases if key[0] == "B3"]) != 1
+                or {key[2:] for key in cases if key[0] == "B4"}
+                != {key[2:] for key in cases if key[0] == "B5"}):
+            raise ValueError("Transfer needs B2 variants, one B3 rule and matching B4/B5 model cases.")
+    if any(key[1] not in depths for key in groups):
+        raise ValueError("Warm-start depth has no transfer B1 baseline.")
+    restarts, pools, graph_rows, comparisons = [], {}, [], []
+    for (identity, p), group in sorted(baseline.items()):
+        reference = references.get((identity, p))
+        if reference and any(reference.get(name) != value for name, value in
+                             (("library_id", library["library_id"]), ("iso_class_id", identity), ("p", p))):
+            raise ValueError("Transfer reference and graph/depth identities disagree.")
+        rows = [_warm_restart(task, selected.get(task["task_id"]), reference, graphs[identity],
+                              settings["success_metric"]) for task in group]
+        restarts.extend(rows)
+        pools[identity, p] = _b3_pool(rows, "B1")
+    for key, group in sorted(groups.items(), key=lambda item: repr(item[0])):
+        metadata = dict(zip(fields, key))
+        method, p = key[:2]
+        if (len(group) != len(graphs) or {task["iso_class_id"] for task in group} != set(graphs)
+                or len({task["source_id"] for task in group}) != 1):
+            raise ValueError("Each frozen transfer model case must cover every graph exactly once.")
+        metadata.update(source_id=group[0]["source_id"], regime="random", fold=None,
+                        target_scope="external_family_transfer")
+        strata = defaultdict(list)
+        for task in sorted(group, key=lambda row: row["iso_class_id"]):
+            identity = task["iso_class_id"]
+            graph, reference = graphs[identity], references.get((identity, p))
+            if any(row["budget"] != task["budget"] for row in baseline[identity, p]):
+                raise ValueError("Transfer warm starts and B1 must have identical optimizer budgets.")
+            warm = _warm_restart(task, selected.get(task["task_id"]), reference, graph, settings["success_metric"])
+            warm.update({name: task.get(name) for name in (*fields, "start_id", "source_id", "target_scope")})
+            restarts.append(warm)
+            b1, other = pools[identity, p], _b3_pool([warm], method)
+            source = next(row for row in graph["provenance"] if row["cell_id"] == graph["representative_cell"])
+            dimensions = {"family": source["family"], "n": graph["n"],
+                          "generation_group": source["generation_group"]}
+            row = {**metadata, **dimensions, "library_id": library["library_id"], "iso_class_id": identity,
+                   "reference_id": reference.get("reference_id") if reference else None,
+                   "B1": b1, method: other, "budget": task["budget"],
+                   "complete": b1["complete"] and other["complete"],
+                   "provisional": not (b1["complete"] and other["complete"])}
+            graph_rows.append(row)
+            strata["all", "all"].append(row)
+            for dimension, value in dimensions.items():
+                strata[dimension, value].append(row)
+            strata["cell", source["cell_id"]].append(row)
+        for (dimension, value), pairs in sorted(strata.items(), key=lambda item: repr(item[0])):
+            comparisons.append({**metadata, "dimension": dimension, "value": value,
+                "stratum_interpretation": "representative-owner strata; descriptive, no density adjustment",
+                **_warm_comparison(pairs, settings, warm_method=method,
+                                   metrics_names=(*_WARM_METRICS, "objective_calls"))})
+    return {"analysis_version": "plan-a-transfer-analysis-v1", "settings": settings,
+            "library_id": library["library_id"], "graph_qaoa": graph_rows,
+            "restarts": restarts, "diagnostics": [], "comparisons": comparisons,
+            "complete": bool(graph_rows) and all(row["complete"] for row in graph_rows),
+            "planned_tasks": len(tasks), "selected_tasks": len(selected), "missing_tasks": len(tasks) - len(selected),
+            "selected_costs_by_method": {method: _costs([selected[task["task_id"]] for task in tasks
+                if task["method"] == method and task["experiment_role"] != "reference" and task["task_id"] in selected])
+                for method in ("B1", "B2", "B3", "B4", "B5")},
+            "selected_reference_costs": _costs([selected[task["task_id"]] for task in tasks
+                if task["experiment_role"] == "reference" and task["task_id"] in selected])}
+
+
 def _warm_restart(task, attempt, reference, graph, metric):
     exact = graph.get("C_star") if graph.get("exact_status") == "computed" else None
     row = evaluate_restart(task, attempt, reference, C_star=exact, metric=resolve_success_metric(metric))

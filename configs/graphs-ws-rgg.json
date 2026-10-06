@@ -1,0 +1,30 @@
+{
+  "purpose": "ws_rgg_evaluation_extension",
+  "dataset_namespace": "ws-rgg-extension-20261001",
+  "seed": 2026100111,
+  "split_seed": 2026100112,
+  "require_excluded_library": true,
+  "max_attempts_per_cell": 2000,
+  "exact_sizes": [12, 16, 20, 24],
+  "exact_chunk_size": 65536,
+  "calibration_evidence": "validation/shot-graph-calibration-20261001.json",
+  "design_status": "Reusable generation settings; use --match-original-quotas for the original per-size cell counts, or explicitly set --graphs-per-cell. RGG radii were selected using graph statistics, never QAOA outcomes; sparse/dense labels do not assert matched degrees. Existing libraries and splits are read-only exclusion inputs. All new graphs are evaluation-only for frozen B2/B4/B5 transfer.",
+  "cells": [
+    {"n": 12, "family": "ws", "generation_group": "rewire-0.1", "parameters": {"k": 4, "rewiring_probability": 0.1}},
+    {"n": 12, "family": "ws", "generation_group": "rewire-0.5", "parameters": {"k": 4, "rewiring_probability": 0.5}},
+    {"n": 12, "family": "rgg", "generation_group": "sparse", "parameters": {"radius": 0.4}},
+    {"n": 12, "family": "rgg", "generation_group": "dense", "parameters": {"radius": 0.55}},
+    {"n": 16, "family": "ws", "generation_group": "rewire-0.1", "parameters": {"k": 4, "rewiring_probability": 0.1}},
+    {"n": 16, "family": "ws", "generation_group": "rewire-0.5", "parameters": {"k": 4, "rewiring_probability": 0.5}},
+    {"n": 16, "family": "rgg", "generation_group": "sparse", "parameters": {"radius": 0.3211}},
+    {"n": 16, "family": "rgg", "generation_group": "dense", "parameters": {"radius": 0.4282}},
+    {"n": 20, "family": "ws", "generation_group": "rewire-0.1", "parameters": {"k": 4, "rewiring_probability": 0.1}},
+    {"n": 20, "family": "ws", "generation_group": "rewire-0.5", "parameters": {"k": 4, "rewiring_probability": 0.5}},
+    {"n": 20, "family": "rgg", "generation_group": "sparse", "parameters": {"radius": 0.2853}},
+    {"n": 20, "family": "rgg", "generation_group": "dense", "parameters": {"radius": 0.3804}},
+    {"n": 24, "family": "ws", "generation_group": "rewire-0.1", "parameters": {"k": 4, "rewiring_probability": 0.1}},
+    {"n": 24, "family": "ws", "generation_group": "rewire-0.5", "parameters": {"k": 4, "rewiring_probability": 0.5}},
+    {"n": 24, "family": "rgg", "generation_group": "sparse", "parameters": {"radius": 0.2593}},
+    {"n": 24, "family": "rgg", "generation_group": "dense", "parameters": {"radius": 0.3458}}
+  ]
+}

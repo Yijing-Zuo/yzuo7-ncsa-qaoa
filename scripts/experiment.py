@@ -763,6 +763,10 @@ def main(argv=None):
         if method == "b5":
             summary.add_argument("--b4-success-overlay", help="Replacement B4 success predictions for this comparison")
         summary.add_argument("--b2-case", nargs=2, action="append", required=True, metavar=("BATCH", "ATTEMPTS"))
+    transfer = commands.add_parser("plan-transfer", help="Freeze noiseless B1--B5 comparisons on new WS/RGG graphs")
+    for option in ("output", "b1-batch", "library", "b4-fits", "b5-fits"):
+        transfer.add_argument("--" + option, required=True)
+    transfer.add_argument("--b2-fit", action="append", required=True)
     for command in ("fit-b2", "plan-b2"):
         sub = commands.add_parser(command, help="Fit or freeze B2 using complete original training references")
         for option in ("batch", "attempts", "references", "output"):
@@ -865,6 +869,12 @@ def main(argv=None):
             save_summary(args.output, summary)
             print(json.dumps({"complete": summary["complete"], "comparisons": len(summary["comparisons"])}))
             return 0 if summary["complete"] else 2
+        if args.command == "plan-transfer":
+            from qaoa_study.experiments import prepare_transfer_batch
+            manifest = prepare_transfer_batch(args.output, args.b1_batch, args.library,
+                                               args.b2_fit, args.b4_fits, args.b5_fits)
+            print(json.dumps({key: manifest[key] for key in ("batch_id", "task_count", "counts", "issues")}, indent=2))
+            return 2 if manifest["issues"] else 0
         if args.command == "plan":
             manifest = save_batch(args.output, args.library, read_json(args.config))
             print(json.dumps({key: manifest[key] for key in ("batch_id", "task_count", "counts", "issues", "coverage")}, indent=2))

@@ -14,6 +14,31 @@ from pennylane import numpy as pnp
 from qaoa_study.graphs import validate_graph
 
 
+def _circuit_graph(graph, p):
+    validate_graph(graph)
+    if p not in (1, 2):
+        raise ValueError("This study implements p=1 and p=2 only.")
+    nodes = tuple(graph.nodes)
+    if not nodes:
+        raise ValueError("A QAOA circuit requires at least one node.")
+    wire = {node: i for i, node in enumerate(nodes)}
+    return len(nodes), tuple((wire[u], wire[v]) for u, v in graph.edges)
+
+
+def _apply_qaoa(theta, p, n, edges):
+    """Apply the shared exact/sampled circuit in the study's gate convention."""
+    if qml.math.shape(theta) != (2 * p,):
+        raise ValueError(f"Expected {2 * p} angles in [gamma..., beta...] order.")
+    angles = qml.math.cast(theta, "float64")
+    for v in range(n):
+        qml.Hadamard(wires=v)
+    for layer in range(p):
+        for u, v in edges:
+            qml.IsingZZ(-angles[layer], wires=(u, v))
+        for v in range(n):
+            qml.RX(2 * angles[p + layer], wires=v)
+
+
 def make_qaoa(graph: nx.Graph, p: int, *, backend: str = "default.qubit") -> qml.QNode:
     """Build the study's p=1 or p=2 exact-expectation QNode once for a graph.
 
@@ -28,34 +53,18 @@ def make_qaoa(graph: nx.Graph, p: int, *, backend: str = "default.qubit") -> qml
     one weighted bra rather than one state per edge. No dense global observable
     or full measurement Jacobian is needed for this scalar first derivative.
     """
-    validate_graph(graph)
-    if p not in (1, 2):
-        raise ValueError("This study implements p=1 and p=2 only.")
+    n, edges = _circuit_graph(graph, p)
     if backend not in ("default.qubit", "lightning.gpu"):
         raise ValueError("backend must be default.qubit or lightning.gpu.")
-    nodes = tuple(graph.nodes)
-    if not nodes:
-        raise ValueError("A QAOA circuit requires at least one node.")
-    wire = {node: i for i, node in enumerate(nodes)}
-    edges = tuple((wire[u], wire[v]) for u, v in graph.edges)
     coefficients = [len(edges) / 2] + [-0.5] * len(edges)
     observables = [qml.Identity(0)] + [qml.Z(u) @ qml.Z(v) for u, v in edges]
     cut_operator = qml.Hamiltonian(coefficients, observables)
     options = {"c_dtype": np.complex128} if backend == "lightning.gpu" else {}
-    device = qml.device(backend, wires=len(nodes), shots=None, **options)
+    device = qml.device(backend, wires=n, shots=None, **options)
 
     @qml.qnode(device, interface="autograd", diff_method="adjoint", device_vjp=True)
     def circuit(theta):
-        if qml.math.shape(theta) != (2 * p,):
-            raise ValueError(f"Expected {2 * p} angles in [gamma..., beta...] order.")
-        angles = qml.math.cast(theta, "float64")
-        for v in range(len(nodes)):
-            qml.Hadamard(wires=v)
-        for layer in range(p):
-            for u, v in edges:
-                qml.IsingZZ(-angles[layer], wires=(u, v))
-            for v in range(len(nodes)):
-                qml.RX(2 * angles[p + layer], wires=v)
+        _apply_qaoa(theta, p, n, edges)
         return qml.expval(cut_operator)
 
     # The adjoint kernel otherwise densifies a global LinearCombination. The
@@ -63,6 +72,58 @@ def make_qaoa(graph: nx.Graph, p: int, *, backend: str = "default.qubit") -> qml
     # Keep the constant zero Identity for edgeless graphs: removing every term
     # leaves no measurement, which PennyLane 0.43's adjoint cannot differentiate.
     return qml.transforms.split_to_single_terms(circuit) if edges else circuit
+
+
+def make_qaoa_sampler(graph: nx.Graph, p: int, *, shots: int, seed: int,
+                      backend: str = "default.qubit") -> qml.QNode:
+    """Sample ideal QAOA bitstrings, with columns in graph node insertion order.
+
+    Each call consumes fresh draws from this device's seeded RNG. Reconstructing
+    with the same seed reproduces the call sequence; no derivative or gate noise
+    is used. Topology is captured at construction as in ``make_qaoa``. At least
+    two shots are required to estimate whole-cut variance. Backend errors
+    propagate; Lightning GPU sampling is not yet validated by this workflow.
+    """
+    n, edges = _circuit_graph(graph, p)
+    if isinstance(shots, (bool, np.bool_)) or not isinstance(shots, (int, np.integer)) or shots < 2:
+        raise ValueError("shots must be an integer of at least 2.")
+    if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)) or seed < 0:
+        raise ValueError("seed must be a nonnegative integer.")
+    if backend not in ("default.qubit", "lightning.qubit"):
+        raise ValueError("sampled backend must be default.qubit or lightning.qubit.")
+    options = {"c_dtype": np.complex128} if backend == "lightning.qubit" else {}
+    device = qml.device(backend, wires=n, seed=int(seed), **options)
+
+    @qml.set_shots(shots=int(shots))
+    @qml.qnode(device, interface=None, diff_method=None)
+    def circuit(theta):
+        _apply_qaoa(theta, p, n, edges)
+        return qml.sample(wires=range(n))
+
+    return circuit
+
+
+def cut_sample_statistics(graph: nx.Graph, samples) -> dict:
+    """Summarize complete cut values, preserving correlations between edges.
+
+    Rows are independent bitstrings and columns follow ``tuple(graph.nodes)``.
+    ``sample_variance`` uses ddof=1; the standard error is its square root
+    divided by sqrt(shots). An observed zero variance is not a guarantee that
+    the true variance is zero or a confidence certificate for success.
+    """
+    validate_graph(graph)
+    bits = np.asarray(samples)
+    if bits.ndim != 2 or bits.shape[1] != len(graph) or bits.shape[0] < 2:
+        raise ValueError("samples must have shape (shots >= 2, number of graph nodes).")
+    if not np.all((bits == 0) | (bits == 1)):
+        raise ValueError("samples must contain only binary 0/1 values.")
+    wire = {node: i for i, node in enumerate(graph)}
+    cuts = np.zeros(len(bits), dtype=np.int64)
+    for u, v in graph.edges:
+        cuts += bits[:, wire[u]] != bits[:, wire[v]]
+    variance = float(np.var(cuts, ddof=1))
+    return {"C_mean": float(np.mean(cuts)), "sample_variance": variance,
+            "standard_error": float(np.sqrt(variance / len(bits))), "shots": len(bits)}
 
 
 def qaoa_loss(theta, circuit: qml.QNode):

@@ -7,6 +7,7 @@ optimizer checkpoint is implemented here.
 
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 import csv
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, distributions, version
@@ -33,7 +34,7 @@ from .records import (execution_failed, read_json, read_library, read_run, save_
 
 TASK_VERSION = "plan-a-tasks-v1"
 ATTEMPT_RULE = "first nonfault attempt ordered by attempt_number,started_utc,attempt_id; else first fault"
-ENTRY_FILES = ("build_library.py", "experiment.py", "verify_backend.py", "snapshot.py")
+ENTRY_FILES = ("build_library.py", "experiment.py", "verify_backend.py", "snapshot.py", "shot_benchmark.py")
 PARTITIONED_LAYOUT = "graph-role-v1"
 
 
@@ -242,12 +243,16 @@ def library_issues(library, config):
 
 
 def save_batch(directory, library_path, config, *, b2_fit=None, reference_binding=None, b3_initializations=None,
-               b4_prepared=None, b5_prepared=None, b5_explanations=None):
+               b4_prepared=None, b5_prepared=None, b5_explanations=None, transfer_prepared=None):
     """Freeze task JSONL and metadata. This operation performs no scientific computation."""
     directory, library_path = Path(directory), Path(library_path).resolve()
     library = read_library(library_path)
     graph_inputs = {}
-    if b5_prepared is not None:
+    if transfer_prepared is not None:
+        config = {**config, "transfer_inputs": {"preparation_id": transfer_prepared["preparation_id"],
+                                               "prepared_digest": digest(transfer_prepared)}}
+        tasks = build_transfer_tasks(library, config, transfer_prepared)
+    elif b5_prepared is not None:
         config = {**config, "b5_inputs": {"preparation_id": b5_prepared["preparation_id"],
                   "prepared_digest": digest(b5_prepared), "reference_binding_digest": digest(reference_binding)}}
         tasks = build_b5_tasks(library, config, b5_prepared, reference_binding)
@@ -276,11 +281,13 @@ def save_batch(directory, library_path, config, *, b2_fit=None, reference_bindin
                   "fit_digest": digest(b2_fit), "reference_binding_digest": digest(reference_binding)}}
         tasks = build_b2_tasks(library, config, b2_fit, reference_binding)
     else:
-        if config.get("kind") in ("b2", "b3", "b4", "b5"):
+        if config.get("kind") in ("b2", "b3", "b4", "b5", "transfer"):
             raise ValueError("Warm planning requires frozen initialization inputs and audited reference binding.")
         tasks = build_tasks(library, config)
     content = "".join(json.dumps(task, sort_keys=True, allow_nan=False) + "\n" for task in tasks).encode()
     source = source_identity()
+    if transfer_prepared is not None and transfer_prepared["source"] != source:
+        raise ValueError("Transfer source changed since preparation; prepare with the final source.")
     if b3_initializations is not None and b3_initializations["source"] != source:
         raise ValueError("B3 source changed since preparation; prepare again with the final source.")
     if b4_prepared is not None and b4_prepared["source"] != source:
@@ -303,6 +310,8 @@ def save_batch(directory, library_path, config, *, b2_fit=None, reference_bindin
                 "coverage": graph_split_coverage(library["graphs"], library.get("cells")),
                 "attempt_selection_rule": ATTEMPT_RULE}
     directory.mkdir(parents=True, exist_ok=False)
+    if transfer_prepared is not None:
+        write_once_json(directory / "transfer.json", transfer_prepared)
     if b2_fit is not None:
         write_once_json(directory / "fit.json", b2_fit)
     if b3_initializations is not None:
@@ -353,7 +362,11 @@ def read_batch(directory):
                "attempt_selection_rule": ATTEMPT_RULE}
     if any(manifest.get(key) != value for key, value in derived.items()):
         raise ValueError("Batch completeness, coverage, counts or attempt rule changed.")
-    if manifest["config"].get("kind") == "b2":
+    if manifest["config"].get("kind") == "transfer":
+        prepared = read_transfer_inputs(directory, manifest)
+        if build_transfer_tasks(library, manifest["config"], prepared) != tasks:
+            raise ValueError("Transfer tasks disagree with frozen starts or original B1 settings.")
+    elif manifest["config"].get("kind") == "b2":
         fit, binding = read_b2_inputs(directory, manifest)
         if build_b2_tasks(library, manifest["config"], fit, binding) != tasks:
             raise ValueError("B2 tasks disagree with frozen fit/reference inputs.")
@@ -395,6 +408,9 @@ def validate_attempt(task, attempt, manifest, execution):
                                           "seed", "theta0", "protocol_version", "budget")}
     required.update({key: task[key] for key in ("fit_id", "reference_id", "regime", "fold", "variant",
         "rule_id", "initialization_id", "initialization_set_id") if key in task})
+    if manifest["config"].get("kind") == "transfer":
+        required.update({key: task[key] for key in ("source_id", "start_id", "initialization", "target_scope",
+            "target_library_id", "feature_group", "shuffle_seed") if key in task})
     required.update(batch_id=manifest["batch_id"], execution_id=execution["execution_id"], task_digest=digest(task))
     if any(attempt.get(key) != value for key, value in required.items()):
         raise ValueError("Attempt task, protocol, execution settings or initial angles disagree.")
@@ -2096,6 +2112,249 @@ def read_b5_fits(directory):
         models.append(model)
         boosters.append(native)
     return {"manifest": manifest, "features": features, "training": training, "models": models, "boosters": boosters}
+
+
+def prepare_transfer_batch(output, original_b1_batch, new_library_path, b2_fit_paths,
+                           b4_fits_directory, b5_fits_directory):
+    """Freeze new-family references, B1 restarts and existing B2--B5 starts together.
+
+    Only inference is performed here. Reference pools and all optimizations use
+    the ordinary worker later; every warm condition receives one L-BFGS-B run.
+    """
+    baseline, original, _ = read_batch(original_b1_batch)
+    library = read_library(new_library_path)
+    if baseline["config"].get("kind", "b1") != "b1" or baseline["issues"]:
+        raise ValueError("Transfer requires a valid original B1 batch.")
+    if (original["library_id"] == library["library_id"] or
+            original["library_id"] not in library.get("excluded_library_ids", []) or
+            not library["graphs"] or any(g["tier"] != 2 or g["graph_split"] != "evaluation"
+                or not set(g["families"]) or not set(g["families"]) <= {"ws", "rgg"}
+                for g in library["graphs"])):
+        raise ValueError("Transfer needs a separate WS/RGG library excluding the original, entirely held out.")
+    result = prepare_shot_starts([original, library], b2_fit_paths, b4_fits_directory, b5_fits_directory)
+    starts = [row for row in result["starts"] if row["target_library_id"] == library["library_id"]]
+    used = {row["source_id"] for row in starts}
+    prepared = {"version": "frozen-family-transfer-v1", "library_id": library["library_id"],
+        "original_b1": {key: baseline[key] for key in ("batch_id", "library_id", "source_id", "config")},
+        "source": source_identity(), "starts": starts,
+        "sources": [row for row in result["sources"] if row["source_id"] in used],
+        "timing": result["timing"], "timing_scope": "Reading frozen models and preparing original plus external starts"}
+    prepared["preparation_id"] = digest(prepared)
+    config = deepcopy(baseline["config"])
+    for key in ("epsilon", "design"):
+        config.pop(key, None)
+    config.update(kind="transfer", purpose="Frozen B1--B5 angle comparison on held-out WS/RGG",
+        success_metric=resolve_success_metric(), require_full_design=False, require_split_coverage=False,
+        expected_library={"graphs": len(library["graphs"]), "tier2": len(library["graphs"]),
+                          "training": 0, "evaluation": len(library["graphs"])})
+    if "analysis" in config:
+        config["analysis"].pop("epsilon", None)
+        config["analysis"]["success_metric"] = resolve_success_metric()
+    return save_batch(output, new_library_path, config, transfer_prepared=prepared)
+
+
+def read_transfer_inputs(directory, manifest):
+    """Read frozen external starts without models, predictions or new computation."""
+    prepared = read_json(Path(directory) / "transfer.json")
+    if (digest({k: v for k, v in prepared.items() if k != "preparation_id"}) != prepared.get("preparation_id")
+            or manifest["config"].get("transfer_inputs") != {
+                "preparation_id": prepared["preparation_id"], "prepared_digest": digest(prepared)}
+            or prepared["source"] != manifest["source"]):
+        raise ValueError("Frozen transfer preparation or source identity changed.")
+    return prepared
+
+
+def build_transfer_tasks(library, config, prepared):
+    """Derive the complete new-family task list from its original budgets and starts."""
+    if (prepared.get("version") != "frozen-family-transfer-v1" or config.get("kind") != "transfer"
+            or prepared["library_id"] != library["library_id"]
+            or digest({k: v for k, v in prepared.items() if k != "preparation_id"}) != prepared["preparation_id"]
+            or prepared["original_b1"]["library_id"] not in library.get("excluded_library_ids", [])
+            or _success_settings(config) != DEFAULT_SUCCESS_METRIC):
+        raise ValueError("Transfer library, preparation or scoring contract changed.")
+    inherited = ("depths", "optimizer", "reference", "evaluation_restarts", "max_attempts", "seed", "seed_namespace")
+    if any(config[key] != prepared["original_b1"]["config"][key] for key in inherited):
+        raise ValueError("Transfer must retain the original B1 optimizer, references and restart budget.")
+    graphs = {graph["iso_class_id"]: graph for graph in library["graphs"]}
+    if not graphs or any(g["tier"] != 2 or g["graph_split"] != "evaluation"
+                        or not g["families"] or not set(g["families"]) <= {"ws", "rgg"} for g in graphs.values()):
+        raise ValueError("Transfer graphs must be held-out WS/RGG targets.")
+    sources = {row["source_id"]: row for row in prepared["sources"]}
+    if len(sources) != len(prepared["sources"]):
+        raise ValueError("Duplicate transfer source identity.")
+    tasks = [task for task in build_tasks(library, config) if task["experiment_role"] in ("reference", "evaluation")]
+    coverage = defaultdict(set)
+    for start in prepared["starts"]:
+        key = start["iso_class_id"], start["p"]
+        method = start["initialization"]
+        spec = method, start["variant"], start["feature_group"], start["shuffle_seed"]
+        if (key[0] not in graphs or key[1] not in config["depths"] or method not in ("B2", "B3", "B4", "B5")
+                or start["target_library_id"] != library["library_id"] or start["target_scope"] != "external_family_transfer"
+                or start["regime"] != "random" or start["fold"] is not None
+                or start["source_id"] not in sources or spec in coverage[key]
+                or start["start_id"] != digest({k: v for k, v in start.items() if k != "start_id"})
+                or np.shape(start["theta0"]) != (2 * key[1],) or not np.isfinite(start["theta0"]).all()):
+            raise ValueError("Transfer start coverage, angles or source identity changed.")
+        source = sources[start["source_id"]]
+        if (source["initialization"] != method or set(source["training_graph_ids"]) & set(graphs)
+                or method != "B3" and (source["library_id"] != prepared["original_b1"]["library_id"]
+                    or source["regime"] != "random" or source["fold"] is not None)):
+            raise ValueError("Transfer starts must use original random-split training only.")
+        coverage[key].add(spec)
+        task = {**start, "task_version": TASK_VERSION, "library_id": library["library_id"],
+            "n": graphs[key[0]]["n"], "graph_split": "evaluation", "kind": "optimization",
+            "experiment_role": "warm_start", "pool": None, "method": method, "restart_id": 0,
+            "seed": int(digest([config["seed_namespace"], config["seed"], start["start_id"]])[:32], 16),
+            "budget": config["optimizer"][str(key[1])], "protocol_version": config["protocol_version"]}
+        task["task_id"] = digest(task)
+        tasks.append(task)
+    for p in config["depths"]:
+        scopes = [coverage[identity, p] for identity in graphs]
+        if (not scopes or any(scope != scopes[0] for scope in scopes)
+                or {row[0] for row in scopes[0]} != {"B2", "B3", "B4", "B5"}
+                or {row[1] for row in scopes[0] if row[0] == "B2"} != {"medoid", "aligned_median"}
+                or sum(row[0] == "B3" for row in scopes[0]) != 1):
+            raise ValueError("Transfer requires every warm condition on every target graph and depth.")
+    if len({task["task_id"] for task in tasks}) != len(tasks) or len({task["seed"] for task in tasks}) != len(tasks):
+        raise ValueError("Transfer task or random seed collision.")
+    return sorted(tasks, key=lambda task: task["task_id"])
+
+
+def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_directory, *, depths=(1, 2)):
+    """Reuse all frozen B2--B5 angle rules on held-out and new-family graphs.
+
+    The first library owns the original split and fitted models. Later WS/RGG
+    libraries must exclude the earlier libraries; they receive only original
+    random-split models, as external-family transfer. No reference set, success
+    head, fitting routine or quantum device is used to choose these starts.
+    """
+    from .features import b4_feature_row
+    from .learning import b3_initialization, predict_b4_model, predict_b5_model, select_b2_graphs
+
+    started = perf_counter()
+    if not libraries or not depths or len(set(depths)) != len(depths) or any(type(p) is not int or p not in (1, 2) for p in depths):
+        raise ValueError("Shot starts require a source library and distinct depths 1/2.")
+    original = libraries[0]
+    prior, graphs, graph_libraries, external = set(), {}, {}, []
+    for index, library in enumerate(libraries):
+        identity = library["library_id"]
+        if identity in prior or (index and not prior <= set(library.get("excluded_library_ids", []))):
+            raise ValueError("New shot libraries must explicitly exclude every earlier library.")
+        prior.add(identity)
+        for graph in library["graphs"]:
+            key = graph["iso_class_id"]
+            if key in graphs:
+                raise ValueError("Shot libraries contain duplicate graph identities.")
+            graphs[key], graph_libraries[key] = graph, identity
+            if index and graph["tier"] == 2 and graph["graph_split"] == "evaluation":
+                if not graph["families"] or not set(graph["families"]) <= {"ws", "rgg"}:
+                    raise ValueError("External shot targets must belong to WS/RGG.")
+                external.append(graph)
+    external.sort(key=lambda graph: graph["iso_class_id"])
+    original_targets = select_b2_graphs(original, "random", None, "evaluation")
+    if not original_targets:
+        raise ValueError("Shot starts require the original held-out evaluation graphs.")
+    split_digest = digest(original["split_summary"])
+    b2 = [read_b2_fit(path) for path in b2_fit_paths]
+    loaded = {"B4": read_b4_fits(b4_fits_directory), "B5": read_b5_fits(b5_fits_directory)}
+    cases = {(fit["regime"], fit["fold"]) for fit in b2}
+    if len(cases) != len(b2) or ("random", None) not in cases:
+        raise ValueError("Shot starts require unique B2 fitting scopes including random.")
+    for fit in [*b2, *(item["manifest"] for item in loaded.values())]:
+        if fit["library_id"] != original["library_id"] or fit["split_digest"] != split_digest:
+            raise ValueError("Shot angle models must use the original library and frozen split.")
+    for item in loaded.values():
+        declared = {(case["regime"], case["fold"]) for case in item["manifest"]["settings"]["comparison_cases"]}
+        if declared != cases:
+            raise ValueError("B2, B4 and B5 must cover the same complete fitting scopes.")
+    timing = {"model_read_seconds": perf_counter() - started, "feature_seconds": 0.,
+              "b3_seconds": 0., "prediction_seconds": 0.}
+    sources, starts, seen = {}, [], set()
+
+    def source_row(fit, method, fit_set=None):
+        training = [g["iso_class_id"] for g in select_b2_graphs(original, fit["regime"], fit["fold"], "training")]
+        if fit["training_graph_ids"] != training:
+            raise ValueError("Shot angle model training membership differs from the original split.")
+        identity = fit["fit_id"]
+        sources[identity] = {"source_id": identity, "initialization": method,
+            "fit_id": identity, "fit_set_id": fit_set, "library_id": fit["library_id"],
+            "split_digest": fit["split_digest"], "training_graph_ids": training,
+            "training_source_id": fit["source"]["source_id"],
+            "regime": fit["regime"], "fold": fit["fold"]}
+        return identity
+
+    def targets(regime, fold):
+        return select_b2_graphs(original, regime, fold, "evaluation") + (external if regime == "random" else [])
+
+    def append(graph, p, method, theta, identity, *, regime="random", fold=None,
+               variant=None, group=None, shuffle_seed=None, diagnostics=None):
+        row = {"iso_class_id": graph["iso_class_id"], "p": p, "initialization": method,
+            "variant": variant, "regime": regime, "fold": fold, "feature_group": group,
+            "shuffle_seed": shuffle_seed, "theta0": list(theta), "source_id": identity,
+            "target_library_id": graph_libraries[graph["iso_class_id"]],
+            "target_scope": "original_evaluation" if graph_libraries[graph["iso_class_id"]] == original["library_id"] else "external_family_transfer"}
+        if np.shape(theta) != (2 * p,) or not np.isfinite(theta).all():
+            raise ValueError("Shot angle initialization must contain 2p finite coordinates.")
+        key = tuple(row[name] for name in ("iso_class_id", "p", "initialization", "variant", "regime", "fold", "feature_group", "shuffle_seed"))
+        if key in seen:
+            raise ValueError("Duplicate shot angle initialization.")
+        seen.add(key)
+        if diagnostics is not None:
+            row["prediction_diagnostics"] = diagnostics
+        row["start_id"] = digest(row)
+        starts.append(row)
+
+    for fit in b2:
+        identity = source_row(fit, "B2")
+        for graph in targets(fit["regime"], fit["fold"]):
+            for p in depths:
+                for variant, field in (("medoid", "medoid"), ("aligned_median", "median")):
+                    append(graph, p, "B2", fit["fits"][str(p)][field]["theta"], identity,
+                           regime=fit["regime"], fold=fit["fold"], variant=variant)
+    begin = perf_counter()
+    for graph in original_targets + external:
+        for p in depths:
+            point = b3_initialization(graph_from_record(graph), p)
+            identity = digest({"p": p, "rule": point["provenance"]})
+            sources[identity] = {"source_id": identity, "initialization": "B3", "p": p,
+                "rule_id": point["rule_id"], "rule": point["provenance"], "training_graph_ids": []}
+            append(graph, p, "B3", point["theta"], identity, variant=point["rule_id"])
+    timing["b3_seconds"] = perf_counter() - begin
+    begin = perf_counter()
+    features = {}
+    for item in loaded.values():
+        rows = {row["iso_class_id"]: row for row in item["features"]["rows"]}
+        for graph in original_targets:
+            identity = graph["iso_class_id"]
+            row = rows.get(identity)
+            if row is None or row["topology_hash"] != digest({"n": graph["n"], "edges": graph["edges"]}):
+                raise ValueError("Frozen shot model features disagree with original evaluation topology.")
+            if identity in features and features[identity] != row:
+                raise ValueError("B4/B5 frozen topology feature rows disagree.")
+            features[identity] = row
+    for graph in external:
+        features[graph["iso_class_id"]] = {**b4_feature_row(graph_from_record(graph)),
+            "iso_class_id": graph["iso_class_id"], "topology_hash": digest({"n": graph["n"], "edges": graph["edges"]})}
+    timing["feature_seconds"] = perf_counter() - begin
+    begin = perf_counter()
+    for method, item in loaded.items():
+        for index, model in enumerate(item["models"]):
+            if model["head"] != "angles" or model["p"] not in depths:
+                continue
+            identity = source_row(model, method, item["manifest"]["fit_set_id"])
+            selected = targets(model["regime"], model["fold"])
+            inputs = [features[graph["iso_class_id"]] for graph in selected]
+            predictions = (predict_b4_model(model, inputs) if method == "B4" else
+                           predict_b5_model(model, item["boosters"][index], inputs))
+            for graph, prediction in zip(selected, predictions, strict=True):
+                append(graph, model["p"], method, prediction["theta0"], identity,
+                    regime=model["regime"], fold=model["fold"], group=model["group"],
+                    shuffle_seed=model["shuffle_seed"], diagnostics={key: value for key, value in prediction.items()
+                        if key not in ("theta0", "iso_class_id")})
+    timing["prediction_seconds"] = perf_counter() - begin
+    timing["total_seconds"] = perf_counter() - started
+    return {"starts": sorted(starts, key=lambda row: row["start_id"]),
+            "sources": sorted(sources.values(), key=lambda row: row["source_id"]), "timing": timing}
 
 
 def save_b5_predictions(output, fits_directory, library_path):

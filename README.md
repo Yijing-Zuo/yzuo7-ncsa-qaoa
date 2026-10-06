@@ -7,7 +7,8 @@ task/reference/evaluation pools, read-only labels and diagnostics, and
 training-derived B2 fixed starts and graph-only B3 theoretical starts with single-start comparisons.
 Supplied production and pilot configurations are candidates; use the frozen
 batch manifests for adopted settings. B4 Ridge and B5 CPU XGBoost are implemented;
-B6–B7 remain outside the current implementation.
+B6–B7 remain outside the current implementation. The finite-shot COBYLA/SPSA
+comparison below reuses the frozen B1–B5 initialization methods.
 
 The success metric adopted on 2026-09-27 is
 `success_metric={"kind":"normalized_gap","tolerance":0.01}`: a valid
@@ -54,7 +55,7 @@ python -m venv .venv
 ```
 
 On Linux/macOS, substitute `.venv/bin/python`; those platforms have not been
-verified by the local B2 checks. The numerical backend is PennyLane 0.43.0 `default.qubit`,
+verified by the local B2 checks. The analytic pipeline uses PennyLane 0.43.0 `default.qubit`,
 `shots=None`, Autograd, adjoint first derivatives and double precision.
 `default.qubit` is the CPU reference. Explicit `lightning.gpu` selection uses
 the same circuit and optimizer, requires a separately prepared Linux GPU
@@ -283,6 +284,117 @@ remain separate. Missing/faulted runs keep their planned denominators and
 suppress formal paired intervals. JSON includes comparisons and first-hit
 curves; Parquet retains graph/restart tables. Unreached median/p90 are null.
 The two variants are never selected by their scores on individual test graphs.
+
+## Frozen-model B1–B5 transfer to WS/RGG
+
+`plan-transfer` extends the original noiseless L-BFGS-B comparison to a separate
+WS/RGG library. Match the original per-cell graph counts with
+`build_library.py --extend-ws-rgg ORIGINAL_LIBRARY --match-original-quotas`.
+The standard 45/46/48/49 counts at 12/16/20/24 vertices give 752 new graphs,
+376 per family. Both new families have two generation settings; their actual
+degree distributions remain different from those of the original families.
+All added graphs are held out from the original training set.
+
+```bash
+python scripts/experiment.py plan-transfer --output TRANSFER_BATCH \
+  --b1-batch ORIGINAL_B1_BATCH --library NEW_GRAPH_LIBRARY \
+  --b2-fit B2_RUN/cases/random/fit.json \
+  --b2-fit B2_RUN/cases/lofo-regular/fit.json \
+  --b2-fit B2_RUN/cases/lofo-er/fit.json \
+  --b2-fit B2_RUN/cases/lofo-ba/fit.json \
+  --b2-fit B2_RUN/cases/lofo-sbm/fit.json \
+  --b4-fits ORIGINAL_B4_FITS --b5-fits ORIGINAL_B5_FITS
+python scripts/experiment.py run --batch TRANSFER_BATCH \
+  --output TRANSFER_ATTEMPTS --backend lightning.gpu --partitioned --execute
+```
+
+Use the same run command to continue complete-attempt recovery. The batch
+inherits the original B1 reference recipe, 50 evaluation restarts per depth,
+and optimization budgets. Each B2/B3/B4/B5 angle condition gets one local
+optimization. Existing models supply external-family predictions without
+refitting; all original random-split feature and shuffled controls are retained.
+With the standard full models this is 239 tasks per graph, including references.
+`analysis.build_transfer_summary` reports graph-weighted comparisons and paired
+bootstrap intervals, including family, size and generation-setting strata.
+Original libraries, fits and reports remain read-only inputs. Use the provided
+study driver for background start/status/stop and automatic result packaging.
+
+## Finite-shot B1–B5 comparison
+
+`scripts/shot_benchmark.py` applies COBYLA/SPSA to the frozen B1–B5 starting
+rules on every original Tier2 evaluation graph and every supplied new
+evaluation graph. B2 includes medoid and median; B3 uses its graph-only rule;
+B4/B5 reuse the saved angle models, including the existing feature groups,
+LOFO cases and shuffled controls on the original graphs. New WS/RGG graphs
+use the original random-split models for external-family transfer. The
+success-prediction heads are not refitted or relabeled as noisy success models.
+Each warm start also receives a fixed-angle measurement control.
+
+There is no required pilot subset or separate comparison configuration.
+Specify the added graph quantity and stochastic repetitions explicitly.
+The following are manual execution templates; replace uppercase input paths,
+`N` and `REPEATS`. This implementation has only been checked with small CPU
+tests; the research runs below have not been executed locally.
+
+```bash
+python scripts/build_library.py --extend-ws-rgg ORIGINAL_LIBRARY \
+  --graphs-per-cell N --output NEW_GRAPH_LIBRARY \
+  --evidence NEW_GRAPH_EVIDENCE.json --allow-study-build
+python scripts/shot_benchmark.py reference-plan --b1-batch ORIGINAL_B1_BATCH \
+  --library NEW_GRAPH_LIBRARY --output NEW_REFERENCE_BATCH
+python scripts/experiment.py run --batch NEW_REFERENCE_BATCH \
+  --output NEW_REFERENCE_ATTEMPTS --roles reference --execute
+python scripts/experiment.py freeze --batch NEW_REFERENCE_BATCH \
+  --attempts NEW_REFERENCE_ATTEMPTS --output NEW_REFERENCES
+```
+
+The graph command uses `configs/graphs-ws-rgg.json`: 16 cells and `16*N`
+requested new graphs, all evaluation-only. It excludes the entire original
+library; repeat `--exclude-library` for other earlier additions. Existing
+graph splits remain frozen. New references use the original B1 reference
+recipe; `--roles reference` restricts execution to that work. Existing
+references are reused. Planning the comparison requires complete references
+and exact MaxCut annotations for every target graph/depth.
+
+```bash
+python scripts/shot_benchmark.py plan --b1-batch ORIGINAL_B1_BATCH \
+  --library NEW_GRAPH_LIBRARY \
+  --b2-fit B2_RUN/cases/random/fit.json \
+  --b2-fit B2_RUN/cases/lofo-regular/fit.json \
+  --b2-fit B2_RUN/cases/lofo-er/fit.json \
+  --b2-fit B2_RUN/cases/lofo-ba/fit.json \
+  --b2-fit B2_RUN/cases/lofo-sbm/fit.json \
+  --b4-fits ORIGINAL_B4_FITS --b5-fits ORIGINAL_B5_FITS \
+  --references ORIGINAL_REFERENCES --references NEW_REFERENCES \
+  --repetitions REPEATS --output SHOT_PLAN.json
+python scripts/shot_benchmark.py run --plan SHOT_PLAN.json --output SHOT_ATTEMPTS
+python scripts/shot_benchmark.py run --plan SHOT_PLAN.json --output SHOT_ATTEMPTS --execute
+python scripts/shot_benchmark.py summarize --plan SHOT_PLAN.json \
+  --output SHOT_ATTEMPTS --save NEW_SHOT_SUMMARY.json
+```
+
+Omit the new-library/new-reference arguments when filling only the original
+evaluation graphs. The default plan includes both optimizers and both
+`finite_shots` and matched `exact_control` modes. Defaults are 1,024 shots per
+score, at most 32,768 optimization shots and 4,096 independent validation
+shots; CLI flags set these explicitly when needed. These are recorded
+settings, not an established optimal budget. Original B1 random starts are
+reused where available; additional repetitions receive frozen new seeds.
+Independent terminal samples and offline exact audits are recorded separately;
+exact audit values never guide optimization. Summaries average repetitions
+within graphs, then weight graphs equally, keeping the original evaluation
+and external-family results separate. LOFO comparisons reuse the B1/B3 results
+for their actual target graph IDs without executing those controls again.
+
+The first `run` command only checks/counts. Repeating `run --execute` resumes
+missing tasks; `--max-tasks` or `--graph-ids` can limit an invocation. Complete
+records are skipped, and interrupted or failed records are retained without
+automatic retry. Explicit `--retry-interrupted` permits a new attempt only
+when a started task has no complete result, preserving its earlier marker and
+the original B1 `max_attempts` cap. It does not retry recorded failures,
+nonconvergence or threshold misses. Keep the planned working source, settings
+and numerical environment for continuation. Supported sampling backends are CPU
+`default.qubit` and `lightning.qubit`; GPU sampling has not been validated.
 
 ## B3 graph-only starts
 

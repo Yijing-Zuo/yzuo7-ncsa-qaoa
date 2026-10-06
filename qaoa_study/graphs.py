@@ -123,6 +123,16 @@ def _draw_graph(n, family, target_degree, seed):
             sizes, [[p_in, p_out], [p_out, p_in]], seed=seed,
             directed=False, selfloops=False,
         )
+    elif family == "ws":
+        parameters = dict(target_degree)
+        graph = nx.watts_strogatz_graph(
+            n, parameters["k"], parameters["rewiring_probability"], seed=seed,
+        )
+    elif family == "rgg":
+        parameters = dict(target_degree)
+        graph = nx.random_geometric_graph(n, parameters["radius"], dim=2, seed=seed)
+        parameters.update(dimension=2, domain="unit_square", metric="euclidean",
+                          positions=[list(graph.nodes[i]["pos"]) for i in range(n)])
     else:
         raise ValueError(f"Unknown graph family: {family}")
     return graph, parameters
@@ -172,17 +182,26 @@ def graph_split_coverage(records, cells=None):
     balanced random generalization study. Coverage alone is not a power claim.
     """
     metadata = {cell["cell_id"]: {"n": cell["n"], "family": cell["family"],
-                                  "degree_band": cell["target_degree"]} for cell in cells or []}
+                                  "degree_band": cell.get("target_degree", "not_applicable")}
+                for cell in cells or []}
     for record in records:
         source = record.get("provenance", [{}])[0]
         metadata.setdefault(record["representative_cell"], {
             "n": record.get("n", source.get("n", "unknown")),
             "family": source.get("family", "unknown"),
-            "degree_band": source.get("target_degree", "unknown"),
+            "degree_band": source.get("target_degree", "not_applicable" if "generation_group" in source else "unknown"),
         })
+    for source in [*(cells or []), *(row["provenance"][0] for row in records)]:
+        if "generation_group" in source:
+            metadata[source["cell_id"]]["generation_group"] = source["generation_group"]
+    dimensions = [("by_n", "n"), ("by_family", "family"),
+                  ("by_degree_band", "degree_band"), ("by_cell", "cell_id")]
+    if any("generation_group" in row for row in metadata.values()):
+        for row in metadata.values():
+            row.setdefault("generation_group", "not_applicable")
+        dimensions.append(("by_generation_group", "generation_group"))
     tables = {}
-    for name, dimension in (("by_n", "n"), ("by_family", "family"),
-                            ("by_degree_band", "degree_band"), ("by_cell", "cell_id")):
+    for name, dimension in dimensions:
         counts = {}
         for cell_id, dimensions in metadata.items():
             key = cell_id if dimension == "cell_id" else dimensions[dimension]
@@ -270,15 +289,33 @@ def resplit_library(library, *, split_seed, tier2_count=None, training_count=Non
     return revised
 
 
-def generate_library(config: dict) -> dict:
-    """Generate the configured cells, preserving every draw and collision.
-
-    Order is increasing n, configured family order, increasing degree band.
-    Only a new class owned by the current cell fills its quota. Connectivity
-    uses rejection only; collisions and rejections consume attempts. Reaching
-    the cap establishes a sampling shortfall, never exhaustion of a graph class.
-    """
-    config = deepcopy(config)
+def _generation_cells(config):
+    """Keep legacy draw order; new families have explicit generator groups."""
+    if "cells" in config:
+        cells = deepcopy(config["cells"])
+        if not cells:
+            raise ValueError("Explicit generation cells cannot be empty.")
+        for cell in cells:
+            if set(cell) != {"n", "family", "generation_group", "parameters"}:
+                raise ValueError("Explicit cells require n, family, generation_group and parameters only.")
+            n, family, parameters = cell["n"], cell["family"], cell["parameters"]
+            if n not in (12, 16, 20, 24) or not cell["generation_group"]:
+                raise ValueError("New cells require a supported size and a generation group.")
+            if family == "ws":
+                if (set(parameters) != {"k", "rewiring_probability"}
+                        or not isinstance(parameters["k"], int)
+                        or not 0 < parameters["k"] < n or parameters["k"] % 2
+                        or not 0 <= parameters["rewiring_probability"] <= 1):
+                    raise ValueError("WS requires an even k < n and rewiring probability in [0, 1].")
+            elif family == "rgg":
+                if set(parameters) != {"radius"} or not 0 < parameters["radius"] <= np.sqrt(2):
+                    raise ValueError("Unit-square RGG requires a finite radius in (0, sqrt(2)].")
+            else:
+                raise ValueError("Explicit generation cells support WS and RGG only.")
+            cell["cell_id"] = f"n{n}:{family}:{cell['generation_group']}"
+        if len({cell["cell_id"] for cell in cells}) != len(cells):
+            raise ValueError("Duplicate explicit generation cells.")
+        return cells
     sizes, families, bands = config["sizes"], config["families"], config["degree_bands"]
     if not sizes or not set(sizes) <= {12, 16, 20, 24}:
         raise ValueError("Generation sizes must be selected from 12, 16, 20, 24.")
@@ -288,59 +325,85 @@ def generate_library(config: dict) -> dict:
         raise ValueError("Target degree bands must be selected from 3 and 5.")
     if any(len(items) != len(set(items)) for items in (sizes, families, bands)):
         raise ValueError("Duplicate sizes, families or bands would repeat cells.")
+    return [{"n": n, "family": family, "target_degree": band,
+             "cell_id": f"n{n}:{family}:k{band}"}
+            for n in sorted(sizes) for family in families for band in sorted(bands)]
+
+
+def generate_library(config: dict, *, excluded_libraries=()) -> dict:
+    """Generate new graphs; optional parent libraries are excluded, never changed.
+
+    Legacy order is increasing n, configured family order, increasing degree
+    band. Explicit new cells use their listed order. Connected whole draws are
+    deduplicated before filling quotas; a cap means shortfall, not exhaustion.
+    Only the newly generated records receive splits. Cross-library duplicates
+    remain in draw logs, with links to the unchanged prior representative.
+    """
+    config = deepcopy(config)
+    definitions = _generation_cells(config)
+    excluded_libraries = tuple(excluded_libraries)
+    if config.get("require_excluded_library") and not excluded_libraries:
+        raise ValueError("This extension requires prior libraries for cross-library exclusion.")
     max_attempts = config["max_attempts_per_cell"]
     if max_attempts < 1 or int(max_attempts) != max_attempts:
         raise ValueError("max_attempts_per_cell must be a positive integer.")
     records, attempts, cells, buckets = [], [], [], defaultdict(list)
+    excluded_ids = []
+    for library in excluded_libraries:
+        excluded_ids.append(library["library_id"])
+        for record in library["graphs"]:
+            graph = graph_from_record(record)
+            wl_hash = nx.weisfeiler_lehman_graph_hash(
+                graph, iterations=WL_SETTINGS["iterations"], digest_size=WL_SETTINGS["digest_size"],
+            )
+            buckets[len(graph), wl_hash].append((deepcopy(record), graph))
     rng = np.random.default_rng(config["seed"])
-    for n in sorted(sizes):
-        for family in families:
-            for band in sorted(bands):
-                quota = config["quota_per_cell"]
-                if isinstance(quota, dict):
-                    quota = quota[str(n)]
-                if quota < 0 or int(quota) != quota:
-                    raise ValueError("Cell quotas must be nonnegative integers.")
-                cell_id = f"n{n}:{family}:k{band}"
-                stats = {"cell_id": cell_id, "n": n, "family": family, "target_degree": band,
-                         "quota": quota, "attempts": 0, "accepted": 0, "duplicates": 0,
-                         "rejected_disconnected": 0, "generator_errors": 0}
-                while stats["accepted"] < quota and stats["attempts"] < max_attempts:
-                    seed = int(rng.integers(0, 2**32, dtype=np.uint64))
-                    stats["attempts"] += 1
-                    source = {"family": family, "target_degree": band, "n": n,
-                              "cell_id": cell_id, "seed": seed, "attempt": stats["attempts"],
-                              "parameters": None}
-                    try:
-                        graph, parameters = _draw_graph(n, family, band, seed)
-                    except nx.NetworkXException as error:
-                        stats["generator_errors"] += 1
-                        attempts.append({**source, "num_edges": None, "iso_class_id": None,
-                                         "status": "generator_error",
-                                         "error": f"{type(error).__name__}: {error}"})
-                        continue
-                    source["parameters"] = parameters
-                    log = {**source, "num_edges": graph.number_of_edges(), "iso_class_id": None}
-                    if not nx.is_connected(graph):
-                        stats["rejected_disconnected"] += 1
-                        log.update(status="rejected_disconnected", components=nx.number_connected_components(graph))
-                    else:
-                        record, is_new, candidate_hash = _add_candidate(
-                            {"graph": graph, "provenance": source}, records, buckets, config["dataset_namespace"],
-                        )
-                        stats["accepted" if is_new else "duplicates"] += 1
-                        log.update(status="accepted" if is_new else "duplicate",
-                                   iso_class_id=record["iso_class_id"], candidate_hash=candidate_hash,
-                                   representative_cell=record["representative_cell"])
-                    attempts.append(log)
-                stats.update(shortfall=quota - stats["accepted"], exhaustive=False,
-                             status="satisfied" if stats["accepted"] == quota else "shortfall_unknown_population")
-                cells.append(stats)
+    for definition in definitions:
+        n, family = definition["n"], definition["family"]
+        settings = definition.get("target_degree", definition.get("parameters"))
+        dimensions = {key: value for key, value in definition.items() if key != "parameters"}
+        quota = config["quota_per_cell"]
+        if isinstance(quota, dict):
+            quota = quota[str(n)]
+        if quota < 0 or int(quota) != quota:
+            raise ValueError("Cell quotas must be nonnegative integers.")
+        stats = {**dimensions, "quota": quota, "attempts": 0, "accepted": 0, "duplicates": 0,
+                 "rejected_disconnected": 0, "generator_errors": 0}
+        while stats["accepted"] < quota and stats["attempts"] < max_attempts:
+            seed = int(rng.integers(0, 2**32, dtype=np.uint64))
+            stats["attempts"] += 1
+            source = {**dimensions, "seed": seed, "attempt": stats["attempts"], "parameters": None}
+            try:
+                graph, parameters = _draw_graph(n, family, settings, seed)
+            except nx.NetworkXException as error:
+                stats["generator_errors"] += 1
+                attempts.append({**source, "num_edges": None, "iso_class_id": None,
+                                 "status": "generator_error", "error": f"{type(error).__name__}: {error}"})
+                continue
+            source["parameters"] = parameters
+            log = {**source, "num_edges": graph.number_of_edges(), "iso_class_id": None}
+            if not nx.is_connected(graph):
+                stats["rejected_disconnected"] += 1
+                log.update(status="rejected_disconnected", components=nx.number_connected_components(graph))
+            else:
+                record, is_new, candidate_hash = _add_candidate(
+                    {"graph": graph, "provenance": source}, records, buckets, config["dataset_namespace"],
+                )
+                stats["accepted" if is_new else "duplicates"] += 1
+                log.update(status="accepted" if is_new else "duplicate",
+                           iso_class_id=record["iso_class_id"], candidate_hash=candidate_hash,
+                           representative_cell=record["representative_cell"])
+            attempts.append(log)
+        stats.update(shortfall=quota - stats["accepted"], exhaustive=False,
+                     status="satisfied" if stats["accepted"] == quota else "shortfall_unknown_population")
+        cells.append(stats)
     split_summary = assign_splits(records, tier2_count=config["tier2_count"],
                                   training_count=config["training_count"], split_seed=config["split_seed"],
                                   cells=cells)
     identity = {"config": config, "graphs": records, "attempts": attempts,
                 "wl_settings": WL_SETTINGS, "split_summary": split_summary}
+    exclusions = {"excluded_library_ids": sorted(set(excluded_ids))} if excluded_ids else {}
+    identity.update(exclusions)
     return {"graphs": records, "attempts": attempts, "cells": cells, "config": config,
             "library_id": f"{config['dataset_namespace']}:{_hash(identity)}",
-            "wl_settings": deepcopy(WL_SETTINGS), "split_summary": split_summary}
+            "wl_settings": deepcopy(WL_SETTINGS), "split_summary": split_summary, **exclusions}
