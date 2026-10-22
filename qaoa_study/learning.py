@@ -58,24 +58,43 @@ B3_RULES = {
 }
 
 
-def b3_initialization(graph, p):
+def b3_rule(p, rules=None):
+    """Resolve a frozen rule; higher depths require explicit sourced coefficients."""
+    if type(p) is not int or p < 1:
+        raise ValueError("Depth must be a positive integer.")
+    supplied = (rules or {}).get(str(p))
+    if str(p) in B3_RULES:
+        if supplied is not None and supplied != B3_RULES[str(p)]:
+            raise ValueError("The adopted p1/p2 B3 rules cannot be overridden.")
+        return deepcopy(B3_RULES[str(p)])
+    if supplied is None:
+        raise ValueError(f"B3 p={p} needs an explicit b3_rules entry with sourced coefficients; otherwise omit B3.")
+    rule = deepcopy(supplied)
+    if (not isinstance(rule.get("rule_id"), str) or not rule["rule_id"] or not rule.get("sources")
+            or np.shape(rule.get("raw_gamma")) != (p,) or np.shape(rule.get("beta")) != (p,)
+            or not np.isfinite(rule["raw_gamma"]).all() or not np.isfinite(rule["beta"]).all()
+            or not math.isfinite(rule.get("gamma_multiplier", float("nan")))):
+        raise ValueError("A B3 rule needs a rule_id, sources, p finite raw_gamma/beta coefficients and gamma_multiplier.")
+    return rule
+
+
+def b3_initialization(graph, p, *, rules=None):
     """Return a deterministic JSON-compatible initial point using only topology.
 
     p1 fixes gamma by maximum degree and analytically maximizes beta, without
     searching gamma. p2 rescales external infinite-degree constants by actual
-    mean degree. Both are finite-graph heuristics; neither promises a better
+    mean degree; explicit higher-depth rules use the same scaling. These are
+    finite-graph heuristics; none promises a better
     optimized endpoint. Preparation timing belongs to the artifact writer.
     """
-    if type(p) is not int or p not in (1, 2):
-        raise ValueError("B3 supports integer p=1 or p=2 only.")
+    rule = b3_rule(p, rules)
     validate_graph(graph)
     n, m = graph.number_of_nodes(), graph.number_of_edges()
     if not m or not nx.is_connected(graph):
         raise ValueError("B3 requires a connected graph with at least one edge.")
-    rule = deepcopy(B3_RULES[str(p)])
     diagnostics = {"n": n, "m": m}
     counters = {"analytic_coefficient_passes": int(p == 1), "gamma_search_points": 0,
-                "qnode_calls": 0, "degree_scaling_evaluations": int(p == 2)}
+                "qnode_calls": 0, "degree_scaling_evaluations": int(p >= 2)}
     if p == 1:
         degree = dict(graph.degree())
         maximum = max(degree.values())
@@ -111,15 +130,15 @@ def b3_initialization(graph, p):
 
 
 def _periods(p):
-    if p not in (1, 2):
-        raise ValueError("B2 supports p=1 or p=2 only.")
+    if type(p) is not int or p < 1:
+        raise ValueError("Depth must be a positive integer.")
     return np.array([2 * np.pi] * p + [np.pi / 2] * p)
 
 
 def _angles(theta):
     value = np.asarray(theta, dtype=np.float64)
-    if value.ndim != 1 or value.size not in (2, 4) or not np.isfinite(value).all():
-        raise ValueError("Expected 2 or 4 finite angles in [gamma..., beta...] order.")
+    if value.ndim != 1 or (value.size < 2 or value.size % 2) or not np.isfinite(value).all():
+        raise ValueError("Expected 2p finite angles in [gamma..., beta...] order for positive integer p.")
     return value
 
 
@@ -539,8 +558,8 @@ def _fit_learning_model(graph_rows, feature_rows, reference_candidates, success_
 
     start = perf_counter()
     settings = _b5_settings(settings) if boosted else _b4_settings(settings)
-    if type(p) is not int or p not in (1, 2) or head not in ("angles", "success"):
-        raise ValueError("B4 supports p=1/2 and angles/success heads.")
+    if type(p) is not int or p < 1 or head not in ("angles", "success"):
+        raise ValueError("B4 supports positive integer depths and angles/success heads.")
     rows = sorted(graph_rows, key=lambda row: row["iso_class_id"])
     ids = [row["iso_class_id"] for row in rows]
     if not ids or len(set(ids)) != len(ids):
@@ -712,7 +731,7 @@ def _validate_learning_model(model, *, boosted):
         settings = _b5_settings(model["settings"]) if boosted else _b4_settings(model["settings"])
         choices = settings["candidate_grid"] if boosted else B4_LAMBDAS
         score_key, choice_key = ("candidate_scores", "candidate") if boosted else ("lambda_scores", "lambda")
-        if (type(model["p"]) is not int or model["p"] not in (1, 2) or
+        if (type(model["p"]) is not int or model["p"] < 1 or
                 model["head"] not in ("angles", "success") or
                 model["selected_" + choice_key] not in choices or settings != model["settings"]):
             raise ValueError("Invalid B4 model scope or hyperparameters.")

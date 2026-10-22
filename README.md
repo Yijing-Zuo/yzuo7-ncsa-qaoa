@@ -1,13 +1,13 @@
 # Shallow MaxCut QAOA
 
-Research code for unweighted MaxCut at QAOA depths `p=1,2`: exact cut
+Research code for unweighted MaxCut at any positive integer QAOA depth: exact cut
 enumeration, analytic p1 scores, statevector expectations and gradients,
 single-run L-BFGS-B optimization, frozen graph libraries, reproducible B1
 task/reference/evaluation pools, read-only labels and diagnostics, and
 training-derived B2 fixed starts and graph-only B3 theoretical starts with single-start comparisons.
 Supplied production and pilot configurations are candidates; use the frozen
 batch manifests for adopted settings. B4 Ridge and B5 CPU XGBoost are implemented;
-B6–B7 remain outside the current implementation. The finite-shot COBYLA/SPSA
+B6–B7 remain outside the current implementation. The finite-shot COBYLA/COBYQA/SPSA
 comparison below reuses the frozen B1–B5 initialization methods.
 
 The success metric adopted on 2026-09-27 is
@@ -71,8 +71,9 @@ Keep its original runtime snapshot and environment for continued execution;
 a new B2 batch does not make an edited checkout compatible with old B1 resume.
 
 On an allocated Linux GPU session, use a separate Python 3.12 environment.
-The following pinned GPU additions are installation candidates until verified
-on the actual device; they do not install a system NVIDIA driver:
+The following pinned GPU additions passed small p1/p2/p3 checks on an RTX 5080
+Laptop GPU under WSL. Run the backend check on the allocated device as well.
+These packages do not install a system NVIDIA driver:
 
 ```bash
 python3.12 -m venv .venv-gpu
@@ -90,7 +91,7 @@ python scripts/verify_backend.py --execute --backend lightning.gpu \
 ```
 
 The first verification command only prints a plan. Check the executed report
-before progressing to one size at a time (12, 16, 20, 24), using
+before progressing through the sizes in your experiment configuration, using
 `--config configs/experiments-candidate.json` and a fresh output filename.
 These fixed 3-regular cases do not establish all-family or full-pool readiness.
 A Git clone has no `snapshot.json`; `snapshot.py --verify` only applies to
@@ -321,7 +322,7 @@ study driver for background start/status/stop and automatic result packaging.
 
 ## Finite-shot B1–B5 comparison
 
-`scripts/shot_benchmark.py` applies COBYLA/SPSA to the frozen B1–B5 starting
+`scripts/shot_benchmark.py` applies COBYLA, COBYQA and SPSA to the frozen B1–B5 starting
 rules on every original Tier2 evaluation graph and every supplied new
 evaluation graph. B2 includes medoid and median; B3 uses its graph-only rule;
 B4/B5 reuse the saved angle models, including the existing feature groups,
@@ -388,13 +389,140 @@ for their actual target graph IDs without executing those controls again.
 
 The first `run` command only checks/counts. Repeating `run --execute` resumes
 missing tasks; `--max-tasks` or `--graph-ids` can limit an invocation. Complete
-records are skipped, and interrupted or failed records are retained without
-automatic retry. Explicit `--retry-interrupted` permits a new attempt only
-when a started task has no complete result, preserving its earlier marker and
-the original B1 `max_attempts` cap. It does not retry recorded failures,
-nonconvergence or threshold misses. Keep the planned working source, settings
-and numerical environment for continuation. Supported sampling backends are CPU
-`default.qubit` and `lightning.qubit`; GPU sampling has not been validated.
+records are skipped. `--retry-interrupted` resumes an unfinished task with a
+new attempt, retaining its earlier start receipt and the frozen `max_attempts`
+cap. GPU memory failures use that same cap, retain the failed attempt and
+reduce concurrency before retry. Ordinary nonconvergence and threshold misses
+remain completed scientific results. Keep the planned source, settings and
+numerical environment for continuation. Backends are `default.qubit`,
+`lightning.qubit` and `lightning.gpu`; the background launcher checks the
+selected backend at the requested depths before computing the batch.
+
+### Git-based execution and GPU concurrency
+
+Use the Git checkout for new experiments. Update it while idle with
+`git pull --ff-only`, then create a new plan and run directory. Existing runs
+continue with the source and environment that created them. Git updates replace
+the upload-and-extract runtime workflow for new runs.
+
+For the current B1–B3 comparison, select only those starts. This example keeps
+the previous 1,024 shots/query, 131,072 optimization-shot cap, 8,192 terminal
+shots and five repeats, and adds COBYQA:
+
+```bash
+python scripts/shot_benchmark.py plan --b1-batch ORIGINAL_B1_BATCH \
+  --b2-fit B2_RUN/cases/random/fit.json \
+  --references ORIGINAL_REFERENCES --initializations B1 B2 B3 \
+  --depths 1 2 --methods COBYLA COBYQA SPSA --repetitions 5 \
+  --shots-per-evaluation 1024 --total-shots 131072 \
+  --validation-shots 8192 --backend lightning.gpu --output SHOT_PLAN.json
+python scripts/shot_benchmark.py start --plan SHOT_PLAN.json \
+  --root data/manual/shot-comparison-v2 --workers 4 \
+  --memory-fraction 0.85 --reserve-mib 2048 --gpu-utilization-limit 85
+```
+
+Add `--library` and its `--references` to include WS/RGG or other frozen
+evaluation libraries. The commands above do not regenerate graphs. The Linux
+launcher runs in the background and logs to `ROOT/console.log`. In another
+terminal, use:
+
+```bash
+python scripts/shot_benchmark.py status --root data/manual/shot-comparison-v2 --watch 10
+python scripts/shot_benchmark.py stop --root data/manual/shot-comparison-v2
+python scripts/shot_benchmark.py start --root data/manual/shot-comparison-v2
+```
+
+The last command resumes; it also reports an already-active run without
+starting a duplicate. Stop waits for active tasks to save their endpoints.
+`status --json` includes resource readings and active task IDs. Completed
+results are in `ROOT/attempts`, and a completed batch produces
+`ROOT/summary.json`. Ctrl+C in the status terminal ends monitoring.
+
+`--workers` caps simultaneous independent graph/initialization tasks. Admission
+uses the allocated GPU or MIG instance's memory and reserves the larger of
+15% of its capacity and 2 GiB with the defaults above. A task's initial estimate
+is four complex128 statevectors plus 512 MiB of context/workspace; adjust with
+`--state-copies` and `--worker-overhead-mib`. Depth increases circuit work;
+the state dimension remains `2**n`. Busy memory pauses new admissions while
+active tasks continue. A reported GPU utilization above 85% also pauses
+admission. A100 MIG often has no utilization reading, so its instance memory
+governs admission. These thresholds control new work, rather than reserving
+a fixed share of GPU execution time.
+
+When idle worker contexts block admission, the pool releases them before
+waiting for external memory pressure to clear. After an allocation failure,
+the pool reduces concurrency and raises its memory estimate before a bounded
+retry in fresh processes. Every saved attempt remains
+available. Persistent faults are reported with the affected task, while other
+tasks can proceed. Whole-task seeds, shots and optimizer budgets are unchanged
+by parallel execution. Compare measurement counts across methods; measure
+isolated wall-clock performance separately from concurrent throughput.
+
+COBYQA builds a local quadratic approximation from sampled scores; COBYLA uses
+a local linear approximation, and SPSA estimates a direction from two random
+perturbations. All three use the same score/shot accounting and independent
+endpoint validation. COBYQA uses SciPy's existing implementation. For a
+`2*p`-angle problem, allow at least `4*p+1` score queries for its initial model.
+The existing `--cobyla-rhobeg` and `--cobyla-tol` options set initial/final
+trust-region radii for both COBYLA and COBYQA.
+
+### Depths beyond two
+
+The circuit, gradients, B1 references, B2 fitting, angle models and shot
+planner accept positive integer depths. Each depth needs `2*p` angles ordered
+`[gamma..., beta...]`, its own reference and matching fitted initialization.
+For a new B1 configuration, set increasing `depths` (for example `[3]`) and an explicit
+`optimizer["3"]` budget. At `p>=2`, references use independent optimization
+restarts; `reference.restarts_by_depth` optionally sets their counts per depth,
+otherwise the existing `reference.p2_restarts` value is used. The p1 analytic
+grid remains specific to one layer. Candidate budgets are selected before
+freezing a new batch.
+
+`fit-b2 --depths 3` builds six-angle starts from that depth's training pool;
+omitting `--depths` fits all depths in its source batch. For shot experiments,
+use `--depths 3 --initializations B1 B2` and the matching references and fit.
+B1/B2 can run once these inputs exist. B4/B5 likewise require matching models
+fitted at the requested depth. B3's published p1/p2 constants remain unchanged.
+For higher-depth B3, provide `--b3-rules FILE`: a JSON mapping from depth to
+`rule_id`, `sources`, p-length `raw_gamma` and `beta`, and `gamma_multiplier`.
+It applies the declared mean-degree scaling to gamma. The same mapping belongs
+under `b3_rules` in a B3 preparation configuration. This makes the actual
+deeper rule explicit; a p2 vector is never padded into a p3 result.
+
+`configs/b3-depth-rules.json` supplies sourced p3, p4 and p5 coefficients.
+Select it with `--b3-rules configs/b3-depth-rules.json` and include B3 in
+`--initializations B1 B2 B3`. It uses the paper's printed coefficients;
+the p4 first gamma discrepancy with the linked CSV is recorded in the file.
+The p4/p5 degree scaling extends the same initialization recipe and can now
+be evaluated alongside the other methods.
+
+For a small backend acceptance check at a new depth:
+
+```bash
+python scripts/verify_backend.py --shot-check --depths 3 \
+  --backend lightning.gpu --execute --output data/manual/backend/p3-shots.json
+```
+
+Local checks cover a p3 workflow and p3/p5 circuit/model correctness on CPU,
+plus independent p1/p2/p3 GPU scores and sampled moments on an RTX 5080 Laptop
+GPU. Concurrency uses the same task seeds and budgets as serial execution.
+Measure throughput on the allocated device before selecting its worker cap.
+
+A small local p3 check used 12 seeded tasks: n=12/16/20/22 with COBYLA,
+COBYQA and SPSA, 128 shots/query and up to 32 queries per task. On the RTX
+5080 Laptop GPU, elapsed times including process startup were:
+
+| Maximum workers | Elapsed seconds |
+| --- | ---: |
+| 1 | 43.6 |
+| 2 | 32.1 |
+| 4 | 27.8 |
+
+All three runs produced identical endpoint angles, exact endpoint scores and
+query counts. With the memory fraction deliberately reduced to 12%, all tasks
+also completed: admission waited for memory and reclaimed idle contexts twice.
+These development measurements guide the worker cap; ICRN/MIG throughput
+depends on its allocation and workload.
 
 ## B3 graph-only starts
 

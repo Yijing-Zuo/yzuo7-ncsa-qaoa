@@ -142,34 +142,50 @@ def _success_settings(settings):
     return metric
 
 
+def _validate_depths(depths):
+    if (not depths or any(type(p) is not int or p < 1 for p in depths)
+            or list(depths) != sorted(set(depths))):
+        raise ValueError("Depths must be distinct positive integers in increasing order.")
+
+
+def _reference_restarts(config, p):
+    reference = config["reference"]
+    per_depth = reference.get("restarts_by_depth", {})
+    return per_depth[str(p)] if str(p) in per_depth else reference["p2_restarts"]
+
+
 def validate_config(config):
     """Validate the small study configuration once at the planning boundary."""
-    if config["depths"] != [1, 2]:
-        raise ValueError("Plan A requires p=1 and p=2.")
+    _validate_depths(config["depths"])
     _success_settings(config)
-    if config["reference"]["p2_candidate"] != "best_seen_valid_execution":
+    if any(p >= 2 for p in config["depths"]) and config["reference"]["p2_candidate"] != "best_seen_valid_execution":
         raise ValueError("Reference and success definitions must follow this protocol version.")
-    for count in (config["tier1_restarts"], config["reference"]["p2_restarts"],
-                  config["evaluation_restarts"], config["gradient_samples"], config["max_attempts"]):
-        if type(count) is not int or count < 1:
-            raise ValueError("Pool/sample/attempt counts must be positive integers.")
+    counts = [config["tier1_restarts"], config["evaluation_restarts"],
+              config["gradient_samples"], config["max_attempts"]]
+    counts += [_reference_restarts(config, p) for p in config["depths"] if p >= 2]
+    if any(type(count) is not int or count < 1 for count in counts):
+        raise ValueError("Pool/sample/attempt counts must be positive integers.")
     for p in config["depths"]:
+        if str(p) not in config["optimizer"]:
+            raise ValueError(f"An explicit optimizer budget is required for p={p}.")
         OptimizerSettings(**config["optimizer"][str(p)])
-    grid = config["reference"]["p1_grid"]
-    if any(type(grid[key]) is not int or grid[key] < 2 for key in
-           ("gamma_points", "beta_points", "refinement_factor")) or grid["chunk_size"] < 1:
-        raise ValueError("Use positive grid dimensions and integer refinement >=2.")
-    if not math.isfinite(grid["refinement_tolerance"]) or grid["refinement_tolerance"] < 0:
-        raise ValueError("Grid refinement tolerance must be finite and nonnegative.")
+    if 1 in config["depths"]:
+        grid = config["reference"]["p1_grid"]
+        if any(type(grid[key]) is not int or grid[key] < 2 for key in
+               ("gamma_points", "beta_points", "refinement_factor")) or grid["chunk_size"] < 1:
+            raise ValueError("Use positive grid dimensions and integer refinement >=2.")
+        if not math.isfinite(grid["refinement_tolerance"]) or grid["refinement_tolerance"] < 0:
+            raise ValueError("Grid refinement tolerance must be finite and nonnegative.")
 
 
 def design_counts(graph_count, tier2_count, config):
     """Count the requested design without constructing graphs/tasks or circuits."""
-    return {"tier1": graph_count * 2 * config["tier1_restarts"],
-            "reference_grid": tier2_count,
-            "reference_optimization": tier2_count * config["reference"]["p2_restarts"],
-            "evaluation": tier2_count * 2 * config["evaluation_restarts"],
-            "gradient_diagnostic": tier2_count * 2 * config["gradient_samples"]}
+    depths = config["depths"]
+    return {"tier1": graph_count * len(depths) * config["tier1_restarts"],
+            "reference_grid": tier2_count * int(1 in depths),
+            "reference_optimization": tier2_count * sum(_reference_restarts(config, p) for p in depths if p >= 2),
+            "evaluation": tier2_count * len(depths) * config["evaluation_restarts"],
+            "gradient_diagnostic": tier2_count * len(depths) * config["gradient_samples"]}
 
 
 def build_tasks(library, config):
@@ -181,7 +197,7 @@ def build_tasks(library, config):
             specifications = [("tier1", "optimization", config["tier1_restarts"])]
             if record["tier"] == 2:
                 specifications += [("reference", "p1_grid" if p == 1 else "optimization",
-                                    1 if p == 1 else config["reference"]["p2_restarts"]),
+                                    1 if p == 1 else _reference_restarts(config, p)),
                                    ("evaluation", "optimization", config["evaluation_restarts"]),
                                    ("gradient_diagnostic", "gradient", config["gradient_samples"])]
             for role, kind, count in specifications:
@@ -1136,7 +1152,7 @@ def attempt_cost_totals(attempts, *, save_seconds=None):
             "population": "all_retained_attempts_including_execution_faults"}
 
 
-def audit_b2_references(batch, references_directory, attempts_directory, graph_ids, *, depths=(1, 2)):
+def audit_b2_references(batch, references_directory, attempts_directory, graph_ids, *, depths=None):
     """Re-derive required frozen references from validated original attempts.
 
     This is a read contract, never permission to resume the source batch.
@@ -1146,8 +1162,10 @@ def audit_b2_references(batch, references_directory, attempts_directory, graph_i
     manifest, library, tasks = read_batch(batch)
     if manifest["config"].get("kind") not in (None, "b1"):
         raise ValueError("Warm initialization requires an original B1 reference batch.")
-    if not depths or len(set(depths)) != len(depths) or not set(depths) <= {1, 2}:
-        raise ValueError("Reference audit needs a nonempty subset of p=1/2.")
+    depths = manifest["config"]["depths"] if depths is None else depths
+    _validate_depths(depths)
+    if not set(depths) <= set(manifest["config"]["depths"]):
+        raise ValueError("Reference audit depths must belong to the source B1 batch.")
     current_source = source_identity()
     for name in ("qaoa_study/qaoa.py", "qaoa_study/exact.py"):
         if manifest["source"]["files"].get(name) != current_source["files"].get(name):
@@ -1191,19 +1209,20 @@ def audit_b2_references(batch, references_directory, attempts_directory, graph_i
     return manifest, library, binding, costs
 
 
-def save_b2_fit(output, batch, references_directory, attempts_directory, *, regime="random", fold=None):
-    """Fit both depths from every predeclared training reference, with no QAOA calls."""
+def save_b2_fit(output, batch, references_directory, attempts_directory, *, regime="random", fold=None, depths=None):
+    """Fit requested depths from every predeclared training reference, with no QAOA calls."""
     from .learning import B2_RULES, fixed_angles, select_b2_graphs
 
-    _, library, _ = read_batch(batch)
+    manifest, library, _ = read_batch(batch)
+    depths = manifest["config"]["depths"] if depths is None else depths
     training = select_b2_graphs(library, regime, fold, "training")
     ids = [r["iso_class_id"] for r in training]
     if not ids:
         raise ValueError("The declared B2 training set is empty.")
-    _, _, binding, costs = audit_b2_references(batch, references_directory, attempts_directory, ids)
+    _, _, binding, costs = audit_b2_references(batch, references_directory, attempts_directory, ids, depths=depths)
     start = perf_counter()
     fits = {str(p): fixed_angles([{"iso_class_id": ref["iso_class_id"], "theta": ref["source"]["theta"]}
-                                  for ref in binding["references"] if ref["p"] == p]) for p in (1, 2)}
+                                  for ref in binding["references"] if ref["p"] == p]) for p in depths}
     fit = {"version": "b2-fit-v1", "rules": B2_RULES, "library_id": library["library_id"],
            "split_digest": digest(library["split_summary"]), "regime": regime, "fold": fold,
            "training_graph_ids": ids, "fits": fits, "reference_binding": binding,
@@ -1239,10 +1258,11 @@ def build_b2_tasks(library, config, fit, binding):
     if digest({k: v for k, v in fit.items() if k != "fit_id"}) != fit.get("fit_id"):
         raise ValueError("B2 fit identity changed.")
     _success_settings(config)
-    if (config.get("kind") != "b2" or config["depths"] != [1, 2] or
+    _validate_depths(config["depths"])
+    if (config.get("kind") != "b2" or
             config["variants"] != ["medoid", "aligned_median"] or
             type(config["max_attempts"]) is not int or config["max_attempts"] < 1):
-        raise ValueError("B2 requires both depths, both frozen variants and the adopted single-start budget.")
+        raise ValueError("B2 requires both frozen variants and the adopted single-start budget.")
     training = select_b2_graphs(library, fit["regime"], fit["fold"], "training")
     evaluation = select_b2_graphs(library, fit["regime"], fit["fold"], "evaluation")
     ids = [r["iso_class_id"] for r in training]
@@ -1255,15 +1275,17 @@ def build_b2_tasks(library, config, fit, binding):
     if len(refs) != len(binding["references"]):
         raise ValueError("Duplicate bound reference.")
     for ref in fit["reference_binding"]["references"]:
-        if refs.get((ref["iso_class_id"], ref["p"])) != ref:
+        if ref["p"] in config["depths"] and refs.get((ref["iso_class_id"], ref["p"])) != ref:
             raise ValueError("Training reference changed after B2 fitting.")
     for ref in refs.values():
         if (not ref["complete"] or ref["library_id"] != library["library_id"] or
                 ref["batch_id"] != binding["source_batch_id"] or
                 digest({k: v for k, v in ref.items() if k != "reference_id"}) != ref["reference_id"]):
             raise ValueError("Invalid external reference identity.")
+    if not set(map(str, config["depths"])) <= set(fit["fits"]):
+        raise ValueError("B2 requires a fitted angle model at every requested depth.")
     tasks = []
-    for p in (1, 2):
+    for p in config["depths"]:
         budget = config["optimizer"][str(p)]
         OptimizerSettings(**budget)
         if budget != binding["source_config"]["optimizer"][str(p)]:
@@ -1296,7 +1318,7 @@ def save_b2_batch(output, fit_path, batch, references_directory, attempts_direct
     source, library, _ = read_batch(batch)
     evaluation = select_b2_graphs(library, fit["regime"], fit["fold"], "evaluation")
     ids = sorted(set(fit["training_graph_ids"]) | {r["iso_class_id"] for r in evaluation})
-    _, _, binding, _ = audit_b2_references(batch, references_directory, attempts_directory, ids)
+    _, _, binding, _ = audit_b2_references(batch, references_directory, attempts_directory, ids, depths=settings["depths"])
     inherited = {k: source["config"][k] for k in ("optimizer", "max_attempts", "expected_library",
                  "require_full_design", "design", "require_split_coverage") if k in source["config"]}
     if set(settings) & set(inherited):
@@ -1323,9 +1345,9 @@ def validate_b1_comparison(warm, baseline, warm_execution, baseline_execution):
 def _validate_b3_settings(settings):
     _success_settings(settings)
     depths = settings["depths"]
-    if (settings.get("kind") != "b3" or not depths or depths != sorted(set(depths))
-            or any(type(p) is not int or p not in (1, 2) for p in depths)):
-        raise ValueError("B3 requires a nonempty ordered subset of p=1/2.")
+    _validate_depths(depths)
+    if settings.get("kind") != "b3":
+        raise ValueError("B3 requires its own study kind.")
     cases = settings["comparison_cases"]
     keys = [(row["regime"], row["fold"]) for row in cases]
     if (len(set(keys)) != len(keys) or ("random", None) not in keys or
@@ -1362,7 +1384,7 @@ def save_b3_initializations(output, library_path, settings, *, backend="default.
         graph_timings.append({"iso_class_id": record["iso_class_id"], "seconds": perf_counter() - before})
         for p in settings["depths"]:
             before = perf_counter()
-            result = b3_initialization(graph, p)
+            result = b3_initialization(graph, p, rules=settings.get("b3_rules"))
             elapsed = perf_counter() - before
             entry = {"library_id": library["library_id"], "source_id": source["source_id"],
                      "iso_class_id": record["iso_class_id"], "p": p,
@@ -1401,7 +1423,7 @@ def read_b3_inputs(directory, manifest):
 
 def build_b3_tasks(library, config, prepared, binding):
     """Rebuild one task per graph/depth using only frozen initial angles."""
-    from .learning import B3_RULES, select_b2_graphs
+    from .learning import b3_rule, select_b2_graphs
 
     _validate_b3_settings(config)
     if (prepared.get("version") != "b3-initializations-v1" or
@@ -1425,7 +1447,8 @@ def build_b3_tasks(library, config, prepared, binding):
     for graph in evaluation:
         for p in config["depths"]:
             row, ref = entries[graph["iso_class_id"], p], refs[graph["iso_class_id"], p]
-            if (row["rule_id"] != B3_RULES[str(p)]["rule_id"] or row["library_id"] != library["library_id"] or
+            if (row["provenance"] != b3_rule(p, config.get("b3_rules"))
+                    or row["rule_id"] != row["provenance"]["rule_id"] or row["library_id"] != library["library_id"] or
                     row["source_id"] != prepared["source"]["source_id"] or
                     row["topology_hash"] != digest({"n": graph["n"], "edges": graph["edges"]}) or
                     row["initialization_id"] != digest({k: v for k, v in row.items() if k != "initialization_id"}) or
@@ -1483,8 +1506,8 @@ def b4_specifications(settings):
     from .features import B4_GROUPS
 
     _validate_b3_settings({**settings, "kind": "b3"})
-    if settings.get("kind") != "b4" or settings["depths"] != [1, 2]:
-        raise ValueError("B4 requires both depths and its own study kind.")
+    if settings.get("kind") != "b4":
+        raise ValueError("B4 requires its own study kind.")
     groups, seeds = settings["feature_groups"], settings["shuffle_seeds"]
     if (not groups or len(set(groups)) != len(groups) or not set(groups) <= set(B4_GROUPS)
             or len(set(seeds)) != len(seeds) or any(type(s) is not int for s in seeds)):
@@ -1499,11 +1522,11 @@ def b4_specifications(settings):
                 or settings["comparison_cases"] != cases or learning.get("random_n_splits", 5) != 5):
             raise ValueError("Production B4 requires the complete approved five-group/five-scope design.")
     specs = [{**case, "group": group, "shuffle_seed": None, "p": p}
-             for case in settings["comparison_cases"] for group in groups for p in (1, 2)]
+             for case in settings["comparison_cases"] for group in groups for p in settings["depths"]]
     if seeds and "F" not in groups:
         raise ValueError("The shuffled control belongs to the F feature group.")
     specs += [{"regime": "random", "fold": None, "group": "F", "shuffle_seed": seed, "p": p}
-              for seed in seeds for p in (1, 2)]
+              for seed in seeds for p in settings["depths"]]
     return specs
 
 
@@ -1532,7 +1555,7 @@ def _b4_training_labels(manifest, tasks, attempts_directory, binding, ids, graph
     selected = select_attempts(attempts)
     labels = []
     for identity in ids:
-        for p in (1, 2):
+        for p in sorted(p for graph_id, p in refs if graph_id == identity):
             planned = [t for t in tasks if t["iso_class_id"] == identity and t["p"] == p
                        and t["experiment_role"] == "evaluation"]
             rows = [selected.get(t["task_id"]) for t in planned]
@@ -1548,7 +1571,7 @@ def _b4_training_labels(manifest, tasks, attempts_directory, binding, ids, graph
                            "success_metric": dict(metric), "C_star": C_star, "threshold": threshold,
                            "reference_id": reference["reference_id"],
                            "attempt_ids": [r["attempt_id"] for r in rows]})
-    used = [r for r in attempts if r["experiment_role"] == "evaluation" and r["iso_class_id"] in ids]
+    used = [r for r in attempts if r["experiment_role"] == "evaluation" and (r["iso_class_id"], r["p"]) in refs]
     costs = {**attempt_cost_totals(used, save_seconds=audit.get("save_seconds")),
              "attempt_ids": sorted(r["attempt_id"] for r in used),
              "scope": "Original training-graph evaluation pools, shared once across both heads/models; no additional QAOA."}
@@ -1635,7 +1658,7 @@ def _save_learning_fits(output, batch, references_directory, attempts_directory,
                         "historical_feature_seconds": None, "source": source}
             features["feature_artifact_id"] = digest(features)
             save_artifact(feature_path, features)
-        _, _, binding, costs = audit_b2_references(batch, references_directory, attempts_directory, ids)
+        _, _, binding, costs = audit_b2_references(batch, references_directory, attempts_directory, ids, depths=settings["depths"])
         metric = _success_settings(settings)
         labels, execution, label_costs = _b4_training_labels(manifest, tasks, attempts_directory, binding, ids,
             {g["iso_class_id"]: g for g in library["graphs"]}, metric)
@@ -1971,7 +1994,7 @@ def _save_learning_batch(output, predictions_path, batch, references_directory, 
         raise ValueError("B4 predictions used a different frozen library.")
     ids = sorted({r["iso_class_id"] for r in prepared["training_binding"]["references"]}
                  | {r["iso_class_id"] for r in prepared["predictions"]})
-    _, _, binding, _ = audit_b2_references(batch, references_directory, attempts_directory, ids)
+    _, _, binding, _ = audit_b2_references(batch, references_directory, attempts_directory, ids, depths=settings["depths"])
     inherited = {k: source["config"][k] for k in ("optimizer", "max_attempts", "expected_library",
                  "require_full_design", "design", "require_split_coverage") if k in source["config"]}
     if set(settings) & set(inherited):
@@ -2114,9 +2137,21 @@ def read_b5_fits(directory):
     return {"manifest": manifest, "features": features, "training": training, "models": models, "boosters": boosters}
 
 
+def _external_target_scope(graph, original_sizes):
+    """Describe an unseen graph relative to the original four-family library."""
+    families = set(graph["families"])
+    if not families or not families <= {"regular", "er", "ba", "sbm", "ws", "rgg"}:
+        raise ValueError("External targets must belong to the six adopted graph families.")
+    if families <= {"ws", "rgg"}:
+        return "external_family_transfer"
+    if original_sizes is None:
+        raise ValueError("Original graph sizes are required for existing-family transfer.")
+    return "independent_holdout" if graph["n"] in original_sizes else "external_size_transfer"
+
+
 def prepare_transfer_batch(output, original_b1_batch, new_library_path, b2_fit_paths,
-                           b4_fits_directory, b5_fits_directory):
-    """Freeze new-family references, B1 restarts and existing B2--B5 starts together.
+                           b4_fits_directory, b5_fits_directory, *, b3_rules=None):
+    """Freeze new held-out references, B1 restarts and existing B2--B5 starts together.
 
     Only inference is performed here. Reference pools and all optimizations use
     the ordinary worker later; every warm condition receives one L-BFGS-B run.
@@ -2128,10 +2163,11 @@ def prepare_transfer_batch(output, original_b1_batch, new_library_path, b2_fit_p
     if (original["library_id"] == library["library_id"] or
             original["library_id"] not in library.get("excluded_library_ids", []) or
             not library["graphs"] or any(g["tier"] != 2 or g["graph_split"] != "evaluation"
-                or not set(g["families"]) or not set(g["families"]) <= {"ws", "rgg"}
+                or not set(g["families"])
                 for g in library["graphs"])):
-        raise ValueError("Transfer needs a separate WS/RGG library excluding the original, entirely held out.")
-    result = prepare_shot_starts([original, library], b2_fit_paths, b4_fits_directory, b5_fits_directory)
+        raise ValueError("Transfer needs a separate library excluding the original, entirely held out.")
+    result = prepare_shot_starts([original, library], b2_fit_paths, b4_fits_directory, b5_fits_directory,
+                                 depths=baseline["config"]["depths"], b3_rules=b3_rules)
     starts = [row for row in result["starts"] if row["target_library_id"] == library["library_id"]]
     used = {row["source_id"] for row in starts}
     prepared = {"version": "frozen-family-transfer-v1", "library_id": library["library_id"],
@@ -2139,11 +2175,12 @@ def prepare_transfer_batch(output, original_b1_batch, new_library_path, b2_fit_p
         "source": source_identity(), "starts": starts,
         "sources": [row for row in result["sources"] if row["source_id"] in used],
         "timing": result["timing"], "timing_scope": "Reading frozen models and preparing original plus external starts"}
+    prepared["original_b1"]["graph_sizes"] = sorted({graph["n"] for graph in original["graphs"]})
     prepared["preparation_id"] = digest(prepared)
     config = deepcopy(baseline["config"])
     for key in ("epsilon", "design"):
         config.pop(key, None)
-    config.update(kind="transfer", purpose="Frozen B1--B5 angle comparison on held-out WS/RGG",
+    config.update(kind="transfer", purpose="Frozen B1--B5 angle comparison on held-out graphs",
         success_metric=resolve_success_metric(), require_full_design=False, require_split_coverage=False,
         expected_library={"graphs": len(library["graphs"]), "tier2": len(library["graphs"]),
                           "training": 0, "evaluation": len(library["graphs"])})
@@ -2176,9 +2213,10 @@ def build_transfer_tasks(library, config, prepared):
     if any(config[key] != prepared["original_b1"]["config"][key] for key in inherited):
         raise ValueError("Transfer must retain the original B1 optimizer, references and restart budget.")
     graphs = {graph["iso_class_id"]: graph for graph in library["graphs"]}
-    if not graphs or any(g["tier"] != 2 or g["graph_split"] != "evaluation"
-                        or not g["families"] or not set(g["families"]) <= {"ws", "rgg"} for g in graphs.values()):
-        raise ValueError("Transfer graphs must be held-out WS/RGG targets.")
+    if not graphs or any(g["tier"] != 2 or g["graph_split"] != "evaluation" for g in graphs.values()):
+        raise ValueError("Transfer graphs must be held-out targets.")
+    scopes_by_graph = {identity: _external_target_scope(graph, prepared["original_b1"].get("graph_sizes"))
+                       for identity, graph in graphs.items()}
     sources = {row["source_id"]: row for row in prepared["sources"]}
     if len(sources) != len(prepared["sources"]):
         raise ValueError("Duplicate transfer source identity.")
@@ -2189,7 +2227,7 @@ def build_transfer_tasks(library, config, prepared):
         method = start["initialization"]
         spec = method, start["variant"], start["feature_group"], start["shuffle_seed"]
         if (key[0] not in graphs or key[1] not in config["depths"] or method not in ("B2", "B3", "B4", "B5")
-                or start["target_library_id"] != library["library_id"] or start["target_scope"] != "external_family_transfer"
+                or start["target_library_id"] != library["library_id"] or start["target_scope"] != scopes_by_graph.get(key[0])
                 or start["regime"] != "random" or start["fold"] is not None
                 or start["source_id"] not in sources or spec in coverage[key]
                 or start["start_id"] != digest({k: v for k, v in start.items() if k != "start_id"})
@@ -2220,21 +2258,26 @@ def build_transfer_tasks(library, config, prepared):
     return sorted(tasks, key=lambda task: task["task_id"])
 
 
-def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_directory, *, depths=(1, 2)):
-    """Reuse all frozen B2--B5 angle rules on held-out and new-family graphs.
+def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_directory, *, depths=(1, 2),
+                        graph_ids=None, initializations=("B2", "B3", "B4", "B5"), b3_rules=None):
+    """Reuse selected frozen angle rules without changing source libraries or splits.
 
-    The first library owns the original split and fitted models. Later WS/RGG
+    The first library owns the original split and fitted models. Later
     libraries must exclude the earlier libraries; they receive only original
-    random-split models, as external-family transfer. No reference set, success
+    random-split models, with family/size transfer recorded. No reference set, success
     head, fitting routine or quantum device is used to choose these starts.
     """
     from .features import b4_feature_row
     from .learning import b3_initialization, predict_b4_model, predict_b5_model, select_b2_graphs
 
     started = perf_counter()
-    if not libraries or not depths or len(set(depths)) != len(depths) or any(type(p) is not int or p not in (1, 2) for p in depths):
-        raise ValueError("Shot starts require a source library and distinct depths 1/2.")
+    _validate_depths(depths)
+    if not libraries:
+        raise ValueError("Shot starts require a source library.")
+    if len(set(initializations)) != len(initializations) or not set(initializations) <= {"B2", "B3", "B4", "B5"}:
+        raise ValueError("Use distinct supported warm-start initializations.")
     original = libraries[0]
+    original_sizes = {graph["n"] for graph in original["graphs"]}
     prior, graphs, graph_libraries, external = set(), {}, {}, []
     for index, library in enumerate(libraries):
         identity = library["library_id"]
@@ -2247,24 +2290,37 @@ def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_dire
                 raise ValueError("Shot libraries contain duplicate graph identities.")
             graphs[key], graph_libraries[key] = graph, identity
             if index and graph["tier"] == 2 and graph["graph_split"] == "evaluation":
-                if not graph["families"] or not set(graph["families"]) <= {"ws", "rgg"}:
-                    raise ValueError("External shot targets must belong to WS/RGG.")
+                _external_target_scope(graph, original_sizes)
                 external.append(graph)
     external.sort(key=lambda graph: graph["iso_class_id"])
     original_targets = select_b2_graphs(original, "random", None, "evaluation")
     if not original_targets:
         raise ValueError("Shot starts require the original held-out evaluation graphs.")
+    selected_ids = {graph["iso_class_id"] for graph in original_targets + external}
+    if graph_ids is not None:
+        if not graph_ids or len(set(graph_ids)) != len(graph_ids) or not set(graph_ids) <= selected_ids:
+            raise ValueError("Graph selection must contain distinct held-out evaluation graph IDs.")
+        selected_ids = set(graph_ids)
+        original_targets = [graph for graph in original_targets if graph["iso_class_id"] in selected_ids]
+        external = [graph for graph in external if graph["iso_class_id"] in selected_ids]
     split_digest = digest(original["split_summary"])
-    b2 = [read_b2_fit(path) for path in b2_fit_paths]
-    loaded = {"B4": read_b4_fits(b4_fits_directory), "B5": read_b5_fits(b5_fits_directory)}
-    cases = {(fit["regime"], fit["fold"]) for fit in b2}
-    if len(cases) != len(b2) or ("random", None) not in cases:
+    b2 = [read_b2_fit(path) for path in (b2_fit_paths or ())] if "B2" in initializations else []
+    loaded = {}
+    for method, path, reader in (("B4", b4_fits_directory, read_b4_fits), ("B5", b5_fits_directory, read_b5_fits)):
+        if method in initializations:
+            if path is None:
+                raise ValueError(f"{method} initialization requires its frozen fits.")
+            loaded[method] = reader(path)
+    cases = {(fit["regime"], fit["fold"]) for fit in b2} if b2 else None
+    if "B2" in initializations and (not b2 or len(cases) != len(b2) or ("random", None) not in cases):
         raise ValueError("Shot starts require unique B2 fitting scopes including random.")
     for fit in [*b2, *(item["manifest"] for item in loaded.values())]:
         if fit["library_id"] != original["library_id"] or fit["split_digest"] != split_digest:
             raise ValueError("Shot angle models must use the original library and frozen split.")
     for item in loaded.values():
         declared = {(case["regime"], case["fold"]) for case in item["manifest"]["settings"]["comparison_cases"]}
+        if cases is None:
+            cases = declared
         if declared != cases:
             raise ValueError("B2, B4 and B5 must cover the same complete fitting scopes.")
     timing = {"model_read_seconds": perf_counter() - started, "feature_seconds": 0.,
@@ -2284,7 +2340,8 @@ def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_dire
         return identity
 
     def targets(regime, fold):
-        return select_b2_graphs(original, regime, fold, "evaluation") + (external if regime == "random" else [])
+        return [graph for graph in select_b2_graphs(original, regime, fold, "evaluation")
+                if graph["iso_class_id"] in selected_ids] + (external if regime == "random" else [])
 
     def append(graph, p, method, theta, identity, *, regime="random", fold=None,
                variant=None, group=None, shuffle_seed=None, diagnostics=None):
@@ -2292,7 +2349,8 @@ def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_dire
             "variant": variant, "regime": regime, "fold": fold, "feature_group": group,
             "shuffle_seed": shuffle_seed, "theta0": list(theta), "source_id": identity,
             "target_library_id": graph_libraries[graph["iso_class_id"]],
-            "target_scope": "original_evaluation" if graph_libraries[graph["iso_class_id"]] == original["library_id"] else "external_family_transfer"}
+            "target_scope": "original_evaluation" if graph_libraries[graph["iso_class_id"]] == original["library_id"]
+                            else _external_target_scope(graph, original_sizes)}
         if np.shape(theta) != (2 * p,) or not np.isfinite(theta).all():
             raise ValueError("Shot angle initialization must contain 2p finite coordinates.")
         key = tuple(row[name] for name in ("iso_class_id", "p", "initialization", "variant", "regime", "fold", "feature_group", "shuffle_seed"))
@@ -2305,6 +2363,8 @@ def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_dire
         starts.append(row)
 
     for fit in b2:
+        if not set(map(str, depths)) <= set(fit["fits"]):
+            raise ValueError("B2 requires newly fitted angles at every requested depth; p1/p2 fits cannot initialize deeper circuits.")
         identity = source_row(fit, "B2")
         for graph in targets(fit["regime"], fit["fold"]):
             for p in depths:
@@ -2312,9 +2372,9 @@ def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_dire
                     append(graph, p, "B2", fit["fits"][str(p)][field]["theta"], identity,
                            regime=fit["regime"], fold=fit["fold"], variant=variant)
     begin = perf_counter()
-    for graph in original_targets + external:
+    for graph in (original_targets + external if "B3" in initializations else []):
         for p in depths:
-            point = b3_initialization(graph_from_record(graph), p)
+            point = b3_initialization(graph_from_record(graph), p, rules=b3_rules)
             identity = digest({"p": p, "rule": point["provenance"]})
             sources[identity] = {"source_id": identity, "initialization": "B3", "p": p,
                 "rule_id": point["rule_id"], "rule": point["provenance"], "training_graph_ids": []}
@@ -2332,7 +2392,7 @@ def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_dire
             if identity in features and features[identity] != row:
                 raise ValueError("B4/B5 frozen topology feature rows disagree.")
             features[identity] = row
-    for graph in external:
+    for graph in (external if loaded else []):
         features[graph["iso_class_id"]] = {**b4_feature_row(graph_from_record(graph)),
             "iso_class_id": graph["iso_class_id"], "topology_hash": digest({"n": graph["n"], "edges": graph["edges"]})}
     timing["feature_seconds"] = perf_counter() - begin
@@ -2343,6 +2403,8 @@ def prepare_shot_starts(libraries, b2_fit_paths, b4_fits_directory, b5_fits_dire
                 continue
             identity = source_row(model, method, item["manifest"]["fit_set_id"])
             selected = targets(model["regime"], model["fold"])
+            if not selected:
+                continue
             inputs = [features[graph["iso_class_id"]] for graph in selected]
             predictions = (predict_b4_model(model, inputs) if method == "B4" else
                            predict_b5_model(model, item["boosters"][index], inputs))

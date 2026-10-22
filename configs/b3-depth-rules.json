@@ -1,0 +1,81 @@
+{
+  "3": {
+    "rule_id": "mean-degree-arctan-infinite-angle-p3-v1",
+    "raw_gamma": [0.3297, 0.5688, 0.6406],
+    "gamma_multiplier": 2.0,
+    "beta": [0.5500, 0.3675, 0.2109],
+    "source_primary": "Basso et al., arXiv:2110.14206v3, Appendix C Table 4",
+    "sources": [
+      {
+        "paper": "https://arxiv.org/html/2110.14206v3#A3",
+        "location": "Eq. (2.3), Appendix C Table 4, p=3",
+        "code": "https://github.com/benjaminvillalonga/large-girth-maxcut-qaoa/blob/b5bbc23ad4309af12a95666862cd082bddcac0e3/data.csv",
+        "commit": "b5bbc23ad4309af12a95666862cd082bddcac0e3",
+        "sha256": "39b1b0d82d4f8040b68b9e0d1870e0edd4e8e6b3529b7216e1ca4cb173ba8030"
+      },
+      {
+        "paper": "https://arxiv.org/html/2305.15201v3#S6.SS1",
+        "location": "Section 6.1 Eq. (87), unit weights and actual mean degree"
+      }
+    ],
+    "scaling": "gamma_i = 2 * raw_gamma_i * atan(1 / sqrt(mean_degree - 1)); beta unchanged",
+    "convention": "H_author=-sum(ZZ)/sqrt(D); C_project=(m-sum(ZZ))/2; beta unchanged",
+    "precision": "printed four-decimal paper constants define this rule exactly",
+    "status": "finite-graph initialization heuristic",
+    "notes": "The scaling paper numerically studies p=1,2,3; performance on the project's six graph families is evaluated separately.",
+    "external_optimization_cost": "not measured in this project"
+  },
+  "4": {
+    "rule_id": "mean-degree-arctan-infinite-angle-p4-v1",
+    "raw_gamma": [0.2949, 0.5144, 0.5586, 0.6429],
+    "gamma_multiplier": 2.0,
+    "beta": [0.5710, 0.4176, 0.3028, 0.1729],
+    "source_primary": "Basso et al., arXiv:2110.14206v3, Appendix C Table 4",
+    "sources": [
+      {
+        "paper": "https://arxiv.org/html/2110.14206v3#A3",
+        "location": "Eq. (2.3), Appendix C Table 4, p=4",
+        "code": "https://github.com/benjaminvillalonga/large-girth-maxcut-qaoa/blob/b5bbc23ad4309af12a95666862cd082bddcac0e3/data.csv",
+        "commit": "b5bbc23ad4309af12a95666862cd082bddcac0e3",
+        "sha256": "39b1b0d82d4f8040b68b9e0d1870e0edd4e8e6b3529b7216e1ca4cb173ba8030"
+      },
+      {
+        "paper": "https://arxiv.org/html/2305.15201v3#S6.SS1",
+        "location": "Section 6.1 Eq. (87), unit weights and actual mean degree"
+      }
+    ],
+    "source_discrepancy": {"coefficient": "raw_gamma[0]", "paper": 0.2949, "pinned_csv": 0.2950, "selected": "paper"},
+    "scaling": "gamma_i = 2 * raw_gamma_i * atan(1 / sqrt(mean_degree - 1)); beta unchanged",
+    "convention": "H_author=-sum(ZZ)/sqrt(D); C_project=(m-sum(ZZ))/2; beta unchanged",
+    "precision": "printed four-decimal paper constants define this rule exactly",
+    "status": "finite-graph initialization heuristic",
+    "notes": "Extends the same scaling recipe to p=4 using published p=4 constants; the scaling paper's numerical study covers p=1,2,3.",
+    "external_optimization_cost": "not measured in this project"
+  },
+  "5": {
+    "rule_id": "mean-degree-arctan-infinite-angle-p5-v1",
+    "raw_gamma": [0.2705, 0.4804, 0.5074, 0.5646, 0.6397],
+    "gamma_multiplier": 2.0,
+    "beta": [0.5899, 0.4492, 0.3559, 0.2643, 0.1486],
+    "source_primary": "Basso et al., arXiv:2110.14206v3, Appendix C Table 4",
+    "sources": [
+      {
+        "paper": "https://arxiv.org/html/2110.14206v3#A3",
+        "location": "Eq. (2.3), Appendix C Table 4, p=5",
+        "code": "https://github.com/benjaminvillalonga/large-girth-maxcut-qaoa/blob/b5bbc23ad4309af12a95666862cd082bddcac0e3/data.csv",
+        "commit": "b5bbc23ad4309af12a95666862cd082bddcac0e3",
+        "sha256": "39b1b0d82d4f8040b68b9e0d1870e0edd4e8e6b3529b7216e1ca4cb173ba8030"
+      },
+      {
+        "paper": "https://arxiv.org/html/2305.15201v3#S6.SS1",
+        "location": "Section 6.1 Eq. (87), unit weights and actual mean degree"
+      }
+    ],
+    "scaling": "gamma_i = 2 * raw_gamma_i * atan(1 / sqrt(mean_degree - 1)); beta unchanged",
+    "convention": "H_author=-sum(ZZ)/sqrt(D); C_project=(m-sum(ZZ))/2; beta unchanged",
+    "precision": "printed four-decimal paper constants define this rule exactly",
+    "status": "finite-graph initialization heuristic",
+    "notes": "Extends the same scaling recipe to p=5 using published p=5 constants; the scaling paper's numerical study covers p=1,2,3.",
+    "external_optimization_cost": "not measured in this project"
+  }
+}

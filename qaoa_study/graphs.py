@@ -25,6 +25,7 @@ def validate_graph(graph: nx.Graph) -> None:
 
 WL_SETTINGS = {"iterations": 3, "digest_size": 16, "node_attr": None,
                "edge_attr": None, "networkx_version": nx.__version__}
+STUDY_SIZES = (12, 14, 16, 18, 20, 22, 24)
 
 
 def graph_from_record(record: dict) -> nx.Graph:
@@ -299,7 +300,7 @@ def _generation_cells(config):
             if set(cell) != {"n", "family", "generation_group", "parameters"}:
                 raise ValueError("Explicit cells require n, family, generation_group and parameters only.")
             n, family, parameters = cell["n"], cell["family"], cell["parameters"]
-            if n not in (12, 16, 20, 24) or not cell["generation_group"]:
+            if n not in STUDY_SIZES or not cell["generation_group"]:
                 raise ValueError("New cells require a supported size and a generation group.")
             if family == "ws":
                 if (set(parameters) != {"k", "rewiring_probability"}
@@ -317,8 +318,8 @@ def _generation_cells(config):
             raise ValueError("Duplicate explicit generation cells.")
         return cells
     sizes, families, bands = config["sizes"], config["families"], config["degree_bands"]
-    if not sizes or not set(sizes) <= {12, 16, 20, 24}:
-        raise ValueError("Generation sizes must be selected from 12, 16, 20, 24.")
+    if not sizes or not set(sizes) <= set(STUDY_SIZES):
+        raise ValueError(f"Generation sizes must be selected from {STUDY_SIZES}.")
     if not families or not set(families) <= {"regular", "er", "ba", "sbm"}:
         raise ValueError("Generation requires the Plan A graph families.")
     if not bands or not set(bands) <= {3, 5}:
@@ -338,9 +339,14 @@ def generate_library(config: dict, *, excluded_libraries=()) -> dict:
     deduplicated before filling quotas; a cap means shortfall, not exhaustion.
     Only the newly generated records receive splits. Cross-library duplicates
     remain in draw logs, with links to the unchanged prior representative.
+    compact_disconnected_rgg_log omits coordinates only for disconnected RGG
+    draws; their seeds and geometry remain sufficient for exact generator replay.
     """
     config = deepcopy(config)
     definitions = _generation_cells(config)
+    compact_rgg = config.get("compact_disconnected_rgg_log", False)
+    if type(compact_rgg) is not bool:
+        raise ValueError("compact_disconnected_rgg_log must be a boolean.")
     excluded_libraries = tuple(excluded_libraries)
     if config.get("require_excluded_library") and not excluded_libraries:
         raise ValueError("This extension requires prior libraries for cross-library exclusion.")
@@ -385,6 +391,8 @@ def generate_library(config: dict, *, excluded_libraries=()) -> dict:
             if not nx.is_connected(graph):
                 stats["rejected_disconnected"] += 1
                 log.update(status="rejected_disconnected", components=nx.number_connected_components(graph))
+                if family == "rgg" and compact_rgg:
+                    log["parameters"] = {key: value for key, value in parameters.items() if key != "positions"}
             else:
                 record, is_new, candidate_hash = _add_candidate(
                     {"graph": graph, "provenance": source}, records, buckets, config["dataset_namespace"],

@@ -63,12 +63,52 @@ def _joint(circuit, theta):
             "seconds": perf_counter() - started, "tracker_totals": dict(tracker.totals)}
 
 
+def verify_shots(backend, depths):
+    """Check exact scores and sampled moments on a four-vertex graph at each depth."""
+    from qaoa_study.qaoa import make_qaoa_sampler, cut_sample_statistics
+
+    graph = nx.cycle_graph(4)
+    graph.add_edge(0, 2)
+    shots, cases = 32768, []
+    bits = (np.arange(16)[:, None] >> np.arange(3, -1, -1)) & 1
+    cuts = sum((bits[:, u] != bits[:, v]).astype(float) for u, v in graph.edges)
+    for p in depths:
+        theta = random_angles(p, 45191 + p)
+        state = np.ones(16, dtype=complex) / 4
+        for layer in range(p):
+            state *= np.exp(-1j * theta[layer] * cuts)
+            cosine, sine = np.cos(theta[p + layer]), np.sin(theta[p + layer])
+            for wire in range(4):
+                pairs = state.reshape(2 ** wire, 2, -1)
+                zero, one = pairs[:, 0, :].copy(), pairs[:, 1, :].copy()
+                pairs[:, 0, :] = cosine * zero - 1j * sine * one
+                pairs[:, 1, :] = cosine * one - 1j * sine * zero
+        probability = np.abs(state) ** 2
+        mean = float(probability @ cuts)
+        variance = float(probability @ (cuts - mean) ** 2)
+        fourth = float(probability @ (cuts - mean) ** 4)
+        exact = float(make_qaoa(graph, p, backend=backend)(theta))
+        sampler = make_qaoa_sampler(graph, p, shots=shots, seed=45191 + p, backend=backend)
+        observed = cut_sample_statistics(graph, sampler(theta))
+        mean_bound = 6 * np.sqrt(variance / shots) + 1e-10
+        variance_bound = 6 * np.sqrt(max(0., fourth - (shots - 3) / (shots - 1) * variance ** 2) / shots) + 1e-10
+        errors = {"exact": abs(exact - mean), "sample_mean": abs(observed["C_mean"] - mean),
+                  "sample_variance": abs(observed["sample_variance"] - variance)}
+        passed = errors["exact"] <= 1e-9 and errors["sample_mean"] <= mean_bound and errors["sample_variance"] <= variance_bound
+        cases.append({"p": p, "n": 4, "errors": errors, "mean_bound": mean_bound,
+                      "variance_bound": variance_bound, "passed": bool(passed)})
+    return {"backend": backend, "depths": list(depths), "shots": shots, "cases": cases,
+            "passed": bool(cases) and all(case["passed"] for case in cases),
+            "scope": "Independent dense-state numerical check on n=4; no production timing claim."}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--shot-check", action="store_true", help="Check finite-shot moments against an independent small dense-state calculation")
     parser.add_argument("--backend", choices=("default.qubit", "lightning.gpu"), default="lightning.gpu")
     parser.add_argument("--sizes", type=int, nargs="+", default=[4, 6])
-    parser.add_argument("--depths", type=int, nargs="+", choices=(1, 2), default=[1, 2])
+    parser.add_argument("--depths", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--seed", type=int, default=45191)
     parser.add_argument("--config", default="configs/optimize-development.json")
     parser.add_argument("--output", type=Path)
@@ -78,6 +118,21 @@ def main(argv=None):
     parser.add_argument("--cpu-restart", action="store_true",
                         help="Also time a full CPU restart when verifying GPU; fixed CPU comparisons always run.")
     args = parser.parse_args(argv)
+    if any(p < 1 for p in args.depths) or len(set(args.depths)) != len(args.depths):
+        parser.error("--depths requires distinct positive integers")
+    if args.shot_check:
+        if not args.execute:
+            print(json.dumps({"execute": False, "shot_check": True, "backend": args.backend, "depths": args.depths}))
+            return 0
+        if args.output is None:
+            parser.error("--execute requires a fresh --output JSON path")
+        if args.output.exists():
+            raise FileExistsError(args.output)
+        report = verify_shots(args.backend, args.depths)
+        report.update(source=source_identity(), created_utc=datetime.now(timezone.utc).isoformat())
+        write_once_json(args.output, report)
+        print(json.dumps({"output": str(args.output), "passed": report["passed"]}))
+        return int(not report["passed"])
     if any(n < 4 or n % 2 for n in args.sizes):
         parser.error("sizes must be even and at least 4 for the fixed 3-regular verification graph")
     config = read_json(args.config)
@@ -91,7 +146,8 @@ def main(argv=None):
             "restart_backends": list(dict.fromkeys([args.backend] + (["default.qubit"] if args.cpu_restart else []))),
             "sizes": args.sizes, "depths": args.depths, "graph": "3-regular, graph seed = seed+n",
             "seed": args.seed, "settings": {str(p): asdict(value) for p, value in by_depth.items()},
-            "fixed_parameters": {"1": [0.37, 0.21], "2": [0.37, -0.81, 0.21, 0.46]},
+            "fixed_parameters": {str(p): ({1: [0.37, 0.21], 2: [0.37, -0.81, 0.21, 0.46]}[p] if p in (1, 2) else
+                random_angles(p, args.seed + p).tolist()) for p in args.depths},
             "score_atol": 1e-9, "gradient_atol": 1e-6, "gradient_rtol": 1e-5}
     if not args.execute:
         print(json.dumps(plan, indent=2))

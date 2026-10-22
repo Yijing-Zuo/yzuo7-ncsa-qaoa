@@ -8,7 +8,8 @@ import numpy as np
 import pennylane as qml
 from scipy.optimize import minimize
 
-from .qaoa import cut_sample_statistics, make_qaoa, make_qaoa_sampler, qaoa_loss_and_gradient
+from .qaoa import (cut_sample_statistics, make_qaoa, make_qaoa_sampler,
+                   qaoa_loss_and_gradient, validate_depth)
 
 
 @dataclass(frozen=True)
@@ -31,8 +32,7 @@ class OptimizerSettings:
 
 def random_angles(p: int, seed: int) -> np.ndarray:
     """Draw one reproducible B1 start, gamma in [0,2pi), beta in [0,pi)."""
-    if p not in (1, 2):
-        raise ValueError("This study implements p=1 and p=2 only.")
+    p = validate_depth(p)
     rng = np.random.default_rng(seed)
     return np.concatenate((rng.uniform(0, 2 * np.pi, p), rng.uniform(0, np.pi, p)))
 
@@ -183,6 +183,7 @@ def optimize_qaoa(graph, p: int, theta0, settings: OptimizerSettings, *,
     caller owns that correspondence. Its device is used without reconstruction,
     while each call creates fresh optimizer state, counters and trace.
     """
+    p = validate_depth(p)
     if np.shape(theta0) != (2 * p,):
         raise ValueError(f"Expected {2 * p} angles in [gamma..., beta...] order.")
     try:
@@ -204,7 +205,12 @@ def optimize_qaoa(graph, p: int, theta0, settings: OptimizerSettings, *,
 
 @dataclass(frozen=True)
 class ShotOptimizerSettings:
-    """Candidate finite-shot settings; validation has a separate shot budget."""
+    """Candidate finite-shot settings; validation has a separate shot budget.
+
+    The historical ``cobyla_rhobeg`` and ``cobyla_tol`` names set the initial
+    and final trust-region radii for both COBYLA and COBYQA. Keeping these
+    names preserves the serialized settings of existing experiments.
+    """
 
     shots_per_evaluation: int = 1024
     total_shots: int = 32768
@@ -242,13 +248,15 @@ def _run_shot_optimizer(objective, theta0, settings, method, perturbation_seed,
     theta = np.asarray(theta0, dtype=np.float64).copy()
     if theta.ndim != 1 or not np.all(np.isfinite(theta)):
         raise ValueError("theta0 must be a finite one-dimensional vector.")
-    if method not in ("COBYLA", "SPSA", "fixed"):
-        raise ValueError("method must be COBYLA, SPSA or fixed.")
+    if method not in ("COBYLA", "COBYQA", "SPSA", "fixed"):
+        raise ValueError("method must be COBYLA, COBYQA, SPSA or fixed.")
     if evaluation_mode not in ("finite_shots", "exact_control"):
         raise ValueError("evaluation_mode must be finite_shots or exact_control.")
     batch_shots = settings.shots_per_evaluation if evaluation_mode == "finite_shots" else 0
     limit = settings.total_shots // settings.shots_per_evaluation
-    if method != "fixed" and limit < (len(theta) + 2 if method == "COBYLA" else 2):
+    initial_calls = {"COBYLA": len(theta) + 2, "COBYQA": 2 * len(theta) + 1,
+                     "SPSA": 2, "fixed": 0}[method]
+    if limit < initial_calls:
         raise ValueError("Shot budget is too small for this optimizer's initial evaluations.")
     trace, raw, error, updates = [], None, None, 0
     started = perf_counter()
@@ -284,10 +292,12 @@ def _run_shot_optimizer(objective, theta0, settings, method, perturbation_seed,
         theta = np.asarray(point, dtype=np.float64).copy()
 
     try:
-        if method == "COBYLA":
-            result = minimize(evaluate, theta, method="COBYLA", callback=remember,
-                              options={"maxiter": limit, "rhobeg": settings.cobyla_rhobeg,
-                                       "tol": settings.cobyla_tol})
+        if method in ("COBYLA", "COBYQA"):
+            options = ({"maxiter": limit, "rhobeg": settings.cobyla_rhobeg,
+                        "tol": settings.cobyla_tol} if method == "COBYLA" else
+                       {"maxfev": limit, "initial_tr_radius": settings.cobyla_rhobeg,
+                        "final_tr_radius": settings.cobyla_tol})
+            result = minimize(evaluate, theta, method=method, callback=remember, options=options)
             remember(result.x)
             raw = {"status": int(result.status), "success": bool(result.success),
                    "message": str(result.message), "nfev": int(result.nfev), "fun": float(result.fun)}
@@ -340,16 +350,15 @@ def optimize_qaoa_shots(graph, p: int, theta0, settings: ShotOptimizerSettings, 
     Invalid input/configuration raises before execution; device failures are
     retained in the returned record with any completed work.
     """
-    if (isinstance(p, (bool, np.bool_)) or not isinstance(p, (int, np.integer))
-            or p not in (1, 2) or np.shape(theta0) != (2 * p,)):
-        raise ValueError("Expected p=1 or p=2 and angles in [gamma..., beta...] order.")
-    if backend not in ("default.qubit", "lightning.qubit"):
-        raise ValueError("sampled backend must be default.qubit or lightning.qubit.")
+    p = validate_depth(p)
+    if np.shape(theta0) != (2 * p,):
+        raise ValueError(f"Expected {2 * p} angles in [gamma..., beta...] order.")
+    if backend not in ("default.qubit", "lightning.qubit", "lightning.gpu"):
+        raise ValueError("sampled backend must be default.qubit, lightning.qubit or lightning.gpu.")
     seeds = (measurement_seed, perturbation_seed, validation_seed)
     if any(isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)) or seed < 0
            for seed in seeds):
         raise ValueError("Seeds must be nonnegative integers.")
-    p = int(p)
     measurement_seed, perturbation_seed, validation_seed = map(int, seeds)
     if measurement_seed == validation_seed:
         raise ValueError("Measurement and validation seeds must differ.")
@@ -368,7 +377,7 @@ def optimize_qaoa_shots(graph, p: int, theta0, settings: ShotOptimizerSettings, 
     def exact_score(theta, phase):
         nonlocal exact_circuit
         if exact_circuit is None:
-            exact_circuit = make_qaoa(graph, p, backend="default.qubit")
+            exact_circuit = make_qaoa(graph, p, backend=backend)
         score = float(execute(exact_circuit, theta, phase))
         if not np.isfinite(score):
             raise ValueError("Nonfinite exact score.")
@@ -386,7 +395,7 @@ def optimize_qaoa_shots(graph, p: int, theta0, settings: ShotOptimizerSettings, 
 
     result = _run_shot_optimizer(objective, theta0, settings, method, perturbation_seed, evaluation_mode)
     result.update(p=p, n=len(graph), backend=backend, angle_order="gamma_then_beta_radians",
-                  audit_backend="default.qubit", exact_control_backend="default.qubit",
+                  audit_backend=backend, exact_control_backend=backend,
                   seeds={"measurement": measurement_seed, "perturbation": perturbation_seed,
                          "validation": validation_seed}, validation=None, validation_error=None,
                   exact_audit=None, exact_audit_error=None)

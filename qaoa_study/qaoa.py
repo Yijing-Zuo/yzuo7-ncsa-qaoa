@@ -14,10 +14,16 @@ from pennylane import numpy as pnp
 from qaoa_study.graphs import validate_graph
 
 
+def validate_depth(p: int) -> int:
+    """Return a positive integer circuit depth without rounding user input."""
+    if isinstance(p, (bool, np.bool_)) or not isinstance(p, (int, np.integer)) or p < 1:
+        raise ValueError("Expected p to be a positive integer.")
+    return int(p)
+
+
 def _circuit_graph(graph, p):
     validate_graph(graph)
-    if p not in (1, 2):
-        raise ValueError("This study implements p=1 and p=2 only.")
+    validate_depth(p)
     nodes = tuple(graph.nodes)
     if not nodes:
         raise ValueError("A QAOA circuit requires at least one node.")
@@ -40,11 +46,11 @@ def _apply_qaoa(theta, p, n, edges):
 
 
 def make_qaoa(graph: nx.Graph, p: int, *, backend: str = "default.qubit") -> qml.QNode:
-    """Build the study's p=1 or p=2 exact-expectation QNode once for a graph.
+    """Build an exact-expectation QNode at any positive integer depth.
 
     Node insertion order determines the internal wires; graph labels may be any
     hashable objects. The edge list is captured at construction, so later graph
-    mutations do not change this circuit. Both supported backends use a
+    mutations do not change this circuit. All supported backends use a
     complex128 state, float64 angles, Autograd and adjoint first derivatives.
     ``lightning.gpu`` requires a separately prepared GPU environment; device
     construction errors propagate and never select a different backend.
@@ -54,12 +60,12 @@ def make_qaoa(graph: nx.Graph, p: int, *, backend: str = "default.qubit") -> qml
     or full measurement Jacobian is needed for this scalar first derivative.
     """
     n, edges = _circuit_graph(graph, p)
-    if backend not in ("default.qubit", "lightning.gpu"):
-        raise ValueError("backend must be default.qubit or lightning.gpu.")
+    if backend not in ("default.qubit", "lightning.qubit", "lightning.gpu"):
+        raise ValueError("backend must be default.qubit, lightning.qubit or lightning.gpu.")
     coefficients = [len(edges) / 2] + [-0.5] * len(edges)
     observables = [qml.Identity(0)] + [qml.Z(u) @ qml.Z(v) for u, v in edges]
     cut_operator = qml.Hamiltonian(coefficients, observables)
-    options = {"c_dtype": np.complex128} if backend == "lightning.gpu" else {}
+    options = {"c_dtype": np.complex128} if backend.startswith("lightning.") else {}
     device = qml.device(backend, wires=n, shots=None, **options)
 
     @qml.qnode(device, interface="autograd", diff_method="adjoint", device_vjp=True)
@@ -82,16 +88,17 @@ def make_qaoa_sampler(graph: nx.Graph, p: int, *, shots: int, seed: int,
     with the same seed reproduces the call sequence; no derivative or gate noise
     is used. Topology is captured at construction as in ``make_qaoa``. At least
     two shots are required to estimate whole-cut variance. Backend errors
-    propagate; Lightning GPU sampling is not yet validated by this workflow.
+    propagate. GPU sampling requires the user-run backend verification before
+    a research pool; it never silently selects a CPU implementation.
     """
     n, edges = _circuit_graph(graph, p)
     if isinstance(shots, (bool, np.bool_)) or not isinstance(shots, (int, np.integer)) or shots < 2:
         raise ValueError("shots must be an integer of at least 2.")
     if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, (int, np.integer)) or seed < 0:
         raise ValueError("seed must be a nonnegative integer.")
-    if backend not in ("default.qubit", "lightning.qubit"):
-        raise ValueError("sampled backend must be default.qubit or lightning.qubit.")
-    options = {"c_dtype": np.complex128} if backend == "lightning.qubit" else {}
+    if backend not in ("default.qubit", "lightning.qubit", "lightning.gpu"):
+        raise ValueError("sampled backend must be default.qubit, lightning.qubit or lightning.gpu.")
+    options = {"c_dtype": np.complex128} if backend.startswith("lightning.") else {}
     device = qml.device(backend, wires=n, seed=int(seed), **options)
 
     @qml.set_shots(shots=int(shots))

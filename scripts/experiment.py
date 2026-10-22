@@ -699,7 +699,7 @@ def _summarize_learning_batch(batch, attempts_directory, b1_batch, b1_attempts, 
     original_training = {(r["iso_class_id"], r["p"]): r for f in fits for r in f["reference_binding"]["references"]}
     if any(original_training.get((r["iso_class_id"], r["p"])) != r for r in prepared["training_binding"]["references"]):
         raise ValueError("B4 and B2 disagree on shared original training references.")
-    training_costs = _b3_training_costs(baseline, baseline_tasks, b1_attempts, fits, [1, 2])
+    training_costs = _b3_training_costs(baseline, baseline_tasks, b1_attempts, fits, manifest["config"]["depths"])
     summary.update(batch_id=manifest["batch_id"], execution_id=execution["execution_id"] if execution else None,
         preparation_id=prepared["preparation_id"], fit_set_id=prepared["fit_set_id"], reference_binding_digest=digest(binding),
         b1_batch_id=baseline["batch_id"], b1_execution_id=b1_execution["execution_id"] if b1_execution else None,
@@ -767,6 +767,7 @@ def main(argv=None):
     for option in ("output", "b1-batch", "library", "b4-fits", "b5-fits"):
         transfer.add_argument("--" + option, required=True)
     transfer.add_argument("--b2-fit", action="append", required=True)
+    transfer.add_argument("--b3-rules", help="JSON mapping of higher depths to sourced B3 coefficients")
     for command in ("fit-b2", "plan-b2"):
         sub = commands.add_parser(command, help="Fit or freeze B2 using complete original training references")
         for option in ("batch", "attempts", "references", "output"):
@@ -774,6 +775,7 @@ def main(argv=None):
         if command == "fit-b2":
             sub.add_argument("--regime", choices=("random", "lofo"), default="random")
             sub.add_argument("--fold", choices=("regular", "er", "ba", "sbm"))
+            sub.add_argument("--depths", type=int, nargs="+", help="Fit selected source depths; default: all source batch depths")
         else:
             sub.add_argument("--fit", required=True)
             sub.add_argument("--config", required=True)
@@ -857,7 +859,7 @@ def main(argv=None):
             print(json.dumps({"complete": summary["complete"], "comparisons": len(summary["comparisons"])}))
             return 0 if summary["complete"] else 2
         if args.command == "fit-b2":
-            fit = save_b2_fit(args.output, args.batch, args.references, args.attempts, regime=args.regime, fold=args.fold)
+            fit = save_b2_fit(args.output, args.batch, args.references, args.attempts, regime=args.regime, fold=args.fold, depths=args.depths)
             print(json.dumps({"fit_id": fit["fit_id"], "training_graphs": len(fit["training_graph_ids"])}))
             return 0
         if args.command == "plan-b2":
@@ -872,7 +874,8 @@ def main(argv=None):
         if args.command == "plan-transfer":
             from qaoa_study.experiments import prepare_transfer_batch
             manifest = prepare_transfer_batch(args.output, args.b1_batch, args.library,
-                                               args.b2_fit, args.b4_fits, args.b5_fits)
+                                               args.b2_fit, args.b4_fits, args.b5_fits,
+                b3_rules=read_json(args.b3_rules) if args.b3_rules else None)
             print(json.dumps({key: manifest[key] for key in ("batch_id", "task_count", "counts", "issues")}, indent=2))
             return 2 if manifest["issues"] else 0
         if args.command == "plan":

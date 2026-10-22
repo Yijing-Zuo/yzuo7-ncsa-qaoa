@@ -486,7 +486,7 @@ def build_transfer_summary(library, tasks, selected, references, *, settings=Non
             continue
         method, p, identity = task["method"], task["p"], task["iso_class_id"]
         if (identity not in graphs or task["library_id"] != library["library_id"]
-                or task["graph_split"] != "evaluation" or task["kind"] != "optimization" or p not in (1, 2)):
+                or task["graph_split"] != "evaluation" or task["kind"] != "optimization" or type(p) is not int or p < 1):
             raise ValueError("Transfer task and graph/depth identities disagree.")
         if method == "B1":
             if task["experiment_role"] != "evaluation":
@@ -494,7 +494,8 @@ def build_transfer_summary(library, tasks, selected, references, *, settings=Non
             baseline[identity, p].append(task)
         elif (method in ("B2", "B3", "B4", "B5") and task["experiment_role"] == "warm_start"
               and task.get("regime") == "random" and task.get("fold") is None and task["restart_id"] == 0
-              and task.get("target_scope") == "external_family_transfer" and task.get("start_id")
+              and task.get("target_scope") in ("external_family_transfer", "external_size_transfer", "independent_holdout")
+              and task.get("start_id")
               and task.get("source_id")):
             groups[tuple(task.get(name) for name in fields)].append(task)
         else:
@@ -531,8 +532,9 @@ def build_transfer_summary(library, tasks, selected, references, *, settings=Non
         if (len(group) != len(graphs) or {task["iso_class_id"] for task in group} != set(graphs)
                 or len({task["source_id"] for task in group}) != 1):
             raise ValueError("Each frozen transfer model case must cover every graph exactly once.")
+        scopes = {task["target_scope"] for task in group}
         metadata.update(source_id=group[0]["source_id"], regime="random", fold=None,
-                        target_scope="external_family_transfer")
+                        target_scope=next(iter(scopes)) if len(scopes) == 1 else "mixed_external_targets")
         strata = defaultdict(list)
         for task in sorted(group, key=lambda row: row["iso_class_id"]):
             identity = task["iso_class_id"]
@@ -544,9 +546,13 @@ def build_transfer_summary(library, tasks, selected, references, *, settings=Non
             restarts.append(warm)
             b1, other = pools[identity, p], _b3_pool([warm], method)
             source = next(row for row in graph["provenance"] if row["cell_id"] == graph["representative_cell"])
-            dimensions = {"family": source["family"], "n": graph["n"],
-                          "generation_group": source["generation_group"]}
-            row = {**metadata, **dimensions, "library_id": library["library_id"], "iso_class_id": identity,
+            dimensions = {"family": source["family"], "n": graph["n"]}
+            if "target_degree" in source:
+                dimensions["degree_band"] = source["target_degree"]
+            else:
+                dimensions["generation_group"] = source["generation_group"]
+            row = {**metadata, **dimensions, "target_scope": task["target_scope"],
+                   "library_id": library["library_id"], "iso_class_id": identity,
                    "reference_id": reference.get("reference_id") if reference else None,
                    "B1": b1, method: other, "budget": task["budget"],
                    "complete": b1["complete"] and other["complete"],
@@ -555,9 +561,13 @@ def build_transfer_summary(library, tasks, selected, references, *, settings=Non
             strata["all", "all"].append(row)
             for dimension, value in dimensions.items():
                 strata[dimension, value].append(row)
+            if len(scopes) > 1:
+                strata["target_scope", task["target_scope"]].append(row)
             strata["cell", source["cell_id"]].append(row)
         for (dimension, value), pairs in sorted(strata.items(), key=lambda item: repr(item[0])):
+            pair_scopes = {row["target_scope"] for row in pairs}
             comparisons.append({**metadata, "dimension": dimension, "value": value,
+                "target_scope": next(iter(pair_scopes)) if len(pair_scopes) == 1 else "mixed_external_targets",
                 "stratum_interpretation": "representative-owner strata; descriptive, no density adjustment",
                 **_warm_comparison(pairs, settings, warm_method=method,
                                    metrics_names=(*_WARM_METRICS, "objective_calls"))})
@@ -802,7 +812,7 @@ def build_b3_summary(library: dict, tasks: list[dict], selected: dict, reference
     depths = {task["p"] for task in tasks}
     lookup = {(task["iso_class_id"], task["p"]): task for task in tasks}
     identities = {task["task_id"] for task in tasks}
-    if (not depths or not depths <= {1, 2} or len(lookup) != len(tasks) or len(identities) != len(tasks)
+    if (not depths or any(type(p) is not int or p < 1 for p in depths) or len(lookup) != len(tasks) or len(identities) != len(tasks)
             or set(selected) - identities or identities & {row["task_id"] for row in warm["restarts"]}
             or set(lookup) != {(identity, p) for identity in graphs for p in depths}):
         raise ValueError("B3 requires exactly one global task per evaluation graph/depth and distinct planned identities.")
@@ -941,7 +951,7 @@ def _build_learning_summary(library, tasks, selected, references, *, b1_tasks, b
         if resolve_success_metric(model.get("success_metric", LEGACY_SUCCESS_METRIC)) != settings["success_metric"]:
             raise ValueError("Success-model metric differs from analysis; use matching re-scored labels and fits.")
         key = (model["regime"], model["fold"], model["p"], model["group"], model["shuffle_seed"])
-        if (key in models or model["head"] != "success" or model["p"] not in (1, 2)
+        if (key in models or model["head"] != "success" or (type(model["p"]) is not int or model["p"] < 1)
                 or model["group"] not in ("L", "U", "F", "J+U", "J+U+S")
                 or not _finite(model["training_mean"]) or not 0 <= model["training_mean"] <= 1
                 or (model["shuffle_seed"] is not None and
