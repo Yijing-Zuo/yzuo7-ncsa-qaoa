@@ -1635,7 +1635,7 @@ def _save_learning_fits(output, batch, references_directory, attempts_directory,
                     raise ValueError("B4 fitting directory contains unbound files.")
             save_artifact(output / "setup.json", setup)
         if tree and (output / "models").exists():
-            _discard_b5_stages(output / "models")
+            _discard_b5_stages(output / "models", 4 * max(spec["p"] for spec in specs))
         if (output / "manifest.json").exists():
             return reader(output)
         feature_path = output / "features.json"
@@ -2043,7 +2043,7 @@ def _write_b5_group(path, model, payloads):
     return timings
 
 
-def _discard_b5_stages(directory):
+def _discard_b5_stages(directory, max_scalar_count):
     """Remove only this writer's unpublished flat stages after resume identity checks."""
     directory = Path(directory).resolve()
     for stage in directory.glob(".fit-*"):
@@ -2052,7 +2052,7 @@ def _discard_b5_stages(directory):
                 or stage.resolve().parent != directory
                 or len(stage.name) != 13 or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in stage.name[5:])
                 or any(not p.is_file() or p.is_symlink() or p.is_junction()
-                       or not (p.name in {"model.json", *(f"scalar-{i}.ubj" for i in range(8))}
+                       or not (p.name in {"model.json", *(f"scalar-{i}.ubj" for i in range(max_scalar_count))}
                                or record_temporary(p.name)) for p in members)):
             raise ValueError("Unexpected B5 unpublished stage; inspect its path before cleanup.")
         for member in members:

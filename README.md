@@ -471,6 +471,11 @@ trust-region radii for both COBYLA and COBYQA.
 The circuit, gradients, B1 references, B2 fitting, angle models and shot
 planner accept positive integer depths. Each depth needs `2*p` angles ordered
 `[gamma..., beta...]`, its own reference and matching fitted initialization.
+Depths are independent: a configuration containing only `[3]` needs no p1/p2
+results. Training p3 shared angles or learned models uses p3 training labels.
+Graph sizes, family generators and method choices retain their separately
+declared study scope; adding a new family or initialization method requires
+its generator or method implementation.
 For a new B1 configuration, set increasing `depths` (for example `[3]`) and an explicit
 `optimizer["3"]` budget. At `p>=2`, references use independent optimization
 restarts; `reference.restarts_by_depth` optionally sets their counts per depth,
