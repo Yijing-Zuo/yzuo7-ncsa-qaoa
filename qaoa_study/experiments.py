@@ -5,7 +5,7 @@ is explicit; each worker reuses a QNode per (graph, depth). No scheduler or
 optimizer checkpoint is implemented here.
 """
 
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 import csv
@@ -34,7 +34,7 @@ from .records import (execution_failed, read_json, read_library, read_run, save_
 
 TASK_VERSION = "plan-a-tasks-v1"
 ATTEMPT_RULE = "first nonfault attempt ordered by attempt_number,started_utc,attempt_id; else first fault"
-ENTRY_FILES = ("build_library.py", "experiment.py", "verify_backend.py", "snapshot.py", "shot_benchmark.py")
+ENTRY_FILES = ("build_library.py", "experiment.py", "verify_backend.py", "snapshot.py", "shot_benchmark.py", "run_study.py")
 PARTITIONED_LAYOUT = "graph-role-v1"
 
 
@@ -97,11 +97,31 @@ def environment(backend):
                          for row in csv.reader(query.stdout.splitlines()) if row]
             identity["gpu_inventory"] = inventory
             visible = identity["visibility"]["CUDA_VISIBLE_DEVICES"]
+            allocated = identity["visibility"]["NVIDIA_VISIBLE_DEVICES"] or ""
+            allocated = allocated.split(",") if allocated.startswith(("GPU-", "MIG-")) else []
+            if visible is None and allocated:
+                visible = ",".join(allocated)
             selected = inventory
             if visible is not None:
                 selected = []
                 for token in visible.split(","):
                     token = token.strip()
+                    if token.isdecimal() and int(token) < len(allocated):
+                        token = allocated[int(token)]
+                    if token.startswith("MIG-"):
+                        import ctypes
+                        from .parallel import NvmlMemory
+
+                        instance = NvmlMemory(token)
+                        try:
+                            parent, uuid = ctypes.c_void_p(), ctypes.create_string_buffer(96)
+                            instance._call("nvmlDeviceGetDeviceHandleFromMigDeviceHandle", instance.handle,
+                                           ctypes.byref(parent))
+                            instance._call("nvmlDeviceGetUUID", parent, uuid, ctypes.c_uint(len(uuid)))
+                            identity.setdefault("mig_parent_uuids", {})[token] = uuid.value.decode()
+                            token = uuid.value.decode()
+                        finally:
+                            instance.close()
                     if token.isdecimal() and len({(row["name"], row["driver_version"]) for row in inventory}) != 1:
                         raise ValueError("Numeric CUDA ordinals are ambiguous on heterogeneous GPUs; use GPU UUIDs.")
                     matches = [row for row in inventory if row["index"] == token
@@ -116,7 +136,7 @@ def environment(backend):
             if not model or not driver or any(value in ("N/A", "[N/A]") for value in (model, driver)):
                 raise ValueError("GPU model or driver version is unavailable.")
             gpu.update(model=model, driver_version=driver)
-        except (OSError, subprocess.SubprocessError, ValueError) as error:
+        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as error:
             gpu["unknown"].append("gpu_model_or_driver")
             identity["gpu_query_error"] = f"{type(error).__name__}: {error}"
         gpu["unknown"] += [name for name in gpu_packages if packages[name] is None]
@@ -924,6 +944,155 @@ def _execute_work(manifest, library, work, output, execution, attempts, report, 
     return report
 
 
+_parallel_circuit = {}
+
+
+def _compute_parallel_task(item):
+    """Compute one whole attempt; the parent owns all immutable record writes."""
+    task, record = item["task"], item["graph"]
+    started, preparation, constructing = perf_counter(), 0.0, False
+    try:
+        key = record["iso_class_id"], task["p"], item["backend"]
+        if _parallel_circuit.get("key") != key:
+            _parallel_circuit.clear()
+            graph = graph_from_record(record)
+            before = perf_counter()
+            constructing = task["kind"] != "p1_grid"
+            circuit = make_qaoa(graph, task["p"], backend=item["backend"]) if constructing else None
+            constructing = False
+            preparation = perf_counter() - before
+            _parallel_circuit.update(key=key, graph=graph, circuit=circuit)
+        elif task["kind"] != "p1_grid" and _parallel_circuit["circuit"] is None:
+            before, constructing = perf_counter(), True
+            _parallel_circuit["circuit"] = make_qaoa(_parallel_circuit["graph"], task["p"], backend=item["backend"])
+            constructing = False
+            preparation = perf_counter() - before
+        result = _execute_task(task, _parallel_circuit["graph"], _parallel_circuit["circuit"])
+    except Exception as error:
+        settings = OptimizerSettings(**task["budget"]) if task["kind"] == "optimization" else OptimizerSettings()
+        result = failure_record(task["theta0"] or [], settings, error, p=task["p"],
+            stop_reason="numerical_error" if isinstance(error, FloatingPointError)
+                        else "evaluation_error" if constructing else "program_error")
+        result["elapsed_seconds"] = perf_counter() - started
+    message = "".join(c for c in str(result.get("error") or "").lower() if c.isalnum())
+    resource = any(token in message for token in (
+        "outofmemory", "memoryallocation", "allocfailed", "badalloc", "devicesarebusy", "deviceisbusy"))
+    if resource:
+        _parallel_circuit.clear()
+    return {"result": result, "preparation_seconds": preparation, "worker_pid": os.getpid(),
+            "resource_error": resource}
+
+
+def _execute_parallel_work(manifest, library, work, output, execution, attempts, report, *,
+                           backend, device_identity, max_tasks, parallel, should_stop, progress):
+    """Interleave graphs, admit bounded attempts and drain them before stopping."""
+    from .parallel import ParallelSettings, estimate_statevector_bytes, run_tasks
+
+    parallel = parallel or ParallelSettings()
+    output.mkdir(parents=True, exist_ok=True)
+    if not (output / "manifest.json").exists():
+        write_once_json(output / "manifest.json", execution)
+    selected, prior, by_graph = select_attempts(attempts), defaultdict(list), defaultdict(deque)
+    graphs = {row["iso_class_id"]: row for row in library["graphs"]}
+    for row in attempts:
+        prior[row["task_id"]].append(row)
+    for task in work:
+        chosen = selected.get(task["task_id"])
+        if (chosen is None or execution_failed(chosen)) and len(prior[task["task_id"]]) < manifest["config"]["max_attempts"]:
+            by_graph[task["iso_class_id"]].append(task)
+    retry_queue, active, admitted = deque(), {}, 0
+    report.update(active_tasks=[], workers_requested=parallel.workers, stopped=False,
+                  resource_failures=0, resource_retries=0)
+
+    def pending():
+        queues = deque(by_graph.values())
+        while queues:
+            queue = queues.popleft()
+            task = queue.popleft()
+            if queue:
+                queues.append(queue)
+            yield {"task": task, "graph": graphs[task["iso_class_id"]], "backend": backend}
+
+    def submitted(item):
+        nonlocal admitted
+        if max_tasks is not None and admitted >= max_tasks:
+            return False
+        task = item["task"]
+        identity = {**task, "batch_id": manifest["batch_id"], "execution_id": execution["execution_id"],
+            "task_digest": digest(task), "attempt_id": uuid4().hex,
+            "attempt_number": len(prior[task["task_id"]]) + 1,
+            "started_utc": datetime.now(timezone.utc).isoformat(), "device_identity": device_identity}
+        identity["receipt_id"] = digest(identity)
+        item["identity"] = identity
+        write_once_json(output / f"{task['task_id']}--{identity['attempt_id']}.started.json", identity)
+        admitted += 1
+        active[task["task_id"]] = {key: task[key] for key in ("task_id", "iso_class_id", "p", "experiment_role")}
+        report["active_tasks"] = list(active.values())
+        if progress:
+            progress(dict(report))
+
+    def resources(snapshot):
+        report["resources"] = snapshot
+        if progress:
+            progress(dict(report))
+
+    for item, computed in run_tasks(_compute_parallel_task, pending(), settings=parallel,
+            backend=backend, should_stop=should_stop, on_submit=submitted, on_resources=resources,
+            retry_queue=retry_queue,
+            resource_history=lambda item: sum(row.get("resource_error", False) for row in prior[item["task"]["task_id"]]),
+            memory_bytes=lambda item: estimate_statevector_bytes(
+                item["graph"]["n"], state_copies=parallel.state_copies,
+                worker_overhead_mib=parallel.worker_overhead_mib)):
+        task, identity, result = item["task"], item["identity"], computed["result"]
+        result.pop("edges", None)
+        result.update(identity, preparation_seconds=computed["preparation_seconds"],
+            completed_utc=datetime.now(timezone.utc).isoformat(), worker_pid=computed["worker_pid"],
+            resource_error=computed["resource_error"],
+            execution_resources={"workers_requested": parallel.workers,
+                "timing_scope": "Per-attempt elapsed time while sharing compute resources."})
+        try:
+            validate_attempt(task, result, manifest, execution)
+            json.dumps(result, allow_nan=False)
+        except Exception as error:
+            result = _invalid_result_failure(result, task, error, result["elapsed_seconds"])
+            result.update(identity, preparation_seconds=computed["preparation_seconds"],
+                          completed_utc=datetime.now(timezone.utc).isoformat())
+            validate_attempt(task, result, manifest, execution)
+        before = perf_counter()
+        name = f"{task['task_id']}--{identity['attempt_id']}"
+        save_run(output / (name + ".json"), result)
+        write_once_json(output / (name + ".io.json"),
+                        {"attempt_id": identity["attempt_id"], "save_seconds": perf_counter() - before})
+        metadata = _attempt_metadata(result)
+        attempts.append(metadata)
+        prior[task["task_id"]].append(metadata)
+        previous = selected.get(task["task_id"])
+        if previous is None or execution_failed(previous):
+            selected[task["task_id"]] = metadata
+        failed = execution_failed(result)
+        report["compute_started"] = True
+        report["executed"] += 1
+        report["execution_faults"] += int(failed)
+        report["resource_failures"] += int(computed["resource_error"])
+        report["resource_retries"] += int(any(row.get("resource_error") for row in prior[task["task_id"]][:-1]))
+        report["completed"] = len(selected)
+        report["valid_completed"] += int(not failed and (previous is None or execution_failed(previous)))
+        report["missing_tasks"] -= int(previous is None)
+        report["unresolved_execution_faults"] += int(failed and previous is None) - int(
+            not failed and previous is not None and execution_failed(previous))
+        active.pop(task["task_id"], None)
+        report["active_tasks"] = list(active.values())
+        if failed and len(prior[task["task_id"]]) < manifest["config"]["max_attempts"]:
+            retry_queue.append({key: item[key] for key in ("task", "graph", "backend")})
+        if progress:
+            progress(dict(report))
+    report["stopped"] = bool(should_stop and should_stop())
+    _completion(report, work, attempts)
+    if progress:
+        progress(dict(report))
+    return report
+
+
 @contextmanager
 def _writer_lock(directory):
     """One writer per partitioned output; the OS releases the lock on process exit."""
@@ -959,11 +1128,13 @@ def _completion(report, work, attempts):
 
 
 def run_worker(batch_directory, output, *, backend="default.qubit", execute=False,
-               shard_index=0, shard_count=1, max_tasks=None, roles=None, partitioned=False, graph_ids=None):
+               shard_index=0, shard_count=1, max_tasks=None, roles=None, partitioned=False, graph_ids=None,
+               parallel=None, should_stop=None, progress=None):
     """Resume verified attempts; optionally seal complete graph/role scopes losslessly.
 
     Partitioned execution has one writer. Graph selection limits record reads,
     not task identity, budgets or seeds; reports explicitly describe that scope.
+    Explicit parallel settings interleave whole attempts across graphs in flat storage.
     """
     header = (read_json(Path(batch_directory) / "manifest.json")
               if partitioned and graph_ids is not None and len(graph_ids) == 1 else None)
@@ -982,6 +1153,9 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
         raise ValueError("max_tasks must be positive when provided.")
     if partitioned and (shard_index != 0 or shard_count != 1):
         raise ValueError("Partitioned output uses graph selection and one writer, not task shards.")
+    concurrent = parallel is not None or should_stop is not None or progress is not None
+    if partitioned and concurrent:
+        raise ValueError("Parallel execution uses flat attempt storage; leave partitioned disabled.")
     work = sorted((task for task in shard_tasks(tasks, shard_index, shard_count)
                    if (roles is None or task["experiment_role"] in roles)
                    and (graph_ids is None or task["iso_class_id"] in graph_ids)),
@@ -1021,7 +1195,7 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
                              "shard_index": shard_index, "shard_count": shard_count},
               "coverage": manifest["coverage"], "executed": 0, "execution_faults": 0, "compute_started": False}
     output = _record_directory(output)
-    with _writer_lock(output) if execute and partitioned else nullcontext():
+    with _writer_lock(output) if execute and (partitioned or concurrent) else nullcontext():
         old = read_json(output / "manifest.json") if (output / "manifest.json").exists() else None
         if old is not None:
             _validate_execution(manifest, old)
@@ -1030,10 +1204,17 @@ def run_worker(batch_directory, output, *, backend="default.qubit", execute=Fals
         if execute and issues:
             raise ValueError(f"Incomplete or incompatible batch: {issues}")
         if not partitioned:
+            if execute and concurrent and old is None:
+                write_once_json(output / "manifest.json", execution)
+                old = execution
             attempts, _ = (_load_flat_attempts(manifest, tasks, output, metadata_only=True, execution=old)
                             if old is None or old.get("storage_layout", "flat") == "flat" else
                             load_attempts(manifest, tasks, output, metadata_only=True))
             _completion(report, work, attempts)
+            if execute and concurrent:
+                return _execute_parallel_work(manifest, library, work, output, execution, attempts, report,
+                    backend=backend, device_identity=device_identity, max_tasks=max_tasks, parallel=parallel,
+                    should_stop=should_stop, progress=progress)
             return (_execute_work(manifest, library, work, output, execution, attempts, report,
                                   backend=backend, device_identity=device_identity, max_tasks=max_tasks)
                     if execute else report)

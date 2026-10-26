@@ -664,3 +664,73 @@ its external dependencies must name canonical B1/B2/B3/B4 archives.
 The full research fits and optimization pools are explicit user operations.
 Development tests use small declared grids and graphs; they establish software
 correctness, not B5 efficacy or readiness of an untested Linux/GPU environment.
+
+## Matched depth and COBYQA study
+
+`scripts/run_study.py` runs the complete study in
+`configs/depth-noise-study.json`. It selects 480 evaluation graphs: Regular,
+ER, BA, SBM, WS and RGG, with 20 graphs per family at each of n=12,14,16,18.
+Each family-size cell includes ten graphs from each existing setting. WS uses
+k=4 with rewiring probabilities 0.1/0.5; RGG uses the saved degree-3/5 target
+ensembles. The other four families retain their original k3/k5 generator bands.
+Selection uses graph identities and a fixed seed, independent of QAOA outcomes.
+
+B2 uses 148 historical n12/n16 training graphs for its new p3 fit. All 300
+historical training identities are excluded from evaluation. This study computes
+only p3; existing local p1/p2 results supply the historical comparison. The study
+creates its own library while preserving the historical libraries and results.
+
+The stages run automatically in this order:
+
+| Stage | Tasks | Settings |
+| --- | ---: | --- |
+| References | 12,560 | All 628 graphs; 20 independent p3 restarts each |
+| B1 | 4,800 | 10 random p3 starts per evaluation graph |
+| B2 | 960 | Medoid and aligned median, fitted at p3 |
+| B3 | 480 | Graph-derived starts with the explicit p3 rule |
+| COBYQA | 26,400 | Matched finite-shot/exact controls and fixed warm-start controls |
+| Total | 45,200 | Counts are recorded optimization and control runs |
+
+Noiseless p3 L-BFGS-B uses a 300-evaluation cap and a 225-iteration cap; report
+actual cost alongside quality. COBYQA uses 1,024 shots per query,
+a 131,072 optimization-shot cap (128 queries), 8,192 independent endpoint
+shots and five repetitions. Its exact-feedback control has the same query cap.
+The final exact quality audit and sampled endpoint estimate are saved separately.
+
+Install this Git checkout into the existing compatible GPU environment with
+`python -m pip install -e .`. From the checkout, first start with:
+
+```bash
+python scripts/run_study.py start --data-root /path/to/old-qaoa/data/manual \
+  --root /path/to/old-qaoa/data/manual/p3-cobyqa-480-v1 --workers 4
+```
+
+`--data-root` supplies the existing B1, old WS, new WS and degree-3/5 RGG
+libraries, plus `size-original4-v2/generated.json`. The command records the
+selected IDs and source configuration in `plan.json` before computation.
+Use `plan` in place of `start` to inspect counts without launching computation.
+
+```bash
+# Resume: use the same checkout and output root.
+python scripts/run_study.py start --root /path/to/old-qaoa/data/manual/p3-cobyqa-480-v1
+# Monitor from another terminal; Ctrl+C closes this monitor.
+python scripts/run_study.py status --root /path/to/old-qaoa/data/manual/p3-cobyqa-480-v1 --watch 10
+# Finish active attempts and pause further work.
+python scripts/run_study.py stop --root /path/to/old-qaoa/data/manual/p3-cobyqa-480-v1
+```
+
+Both scientific branches admit independent tasks from multiple graphs on the
+allocated GPU/MIG instance. The default is at most four workers, limited by
+CPU affinity, with 15% or 2 GiB memory headroom (whichever is larger) and an
+85% utilization admission ceiling when that measurement is available. MIG
+allocations without utilization readings use memory admission. Allocation
+failures retain their attempts, reduce concurrency and retry within the frozen
+attempt limit. A normal optimizer stop or success-threshold miss is a result.
+Concurrent elapsed times describe shared-resource execution; use objective
+calls and shots for method cost comparisons.
+
+Results live under the new study root: `baseline-attempts`, `references`,
+`b2-fit.json`, `b2-attempts`, `b3-attempts`, `shot-plan.json` and `shot-attempts`.
+The status line shows completed/total, phase, active tasks and execution faults.
+The original data directories are read-only inputs. Update the Git checkout
+between studies; an interrupted study resumes with its frozen source and settings.

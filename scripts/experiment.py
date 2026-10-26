@@ -806,6 +806,10 @@ def main(argv=None):
     run.add_argument("--shard-count", type=int, default=1)
     run.add_argument("--max-tasks", type=int, help="Maximum actual attempts during this invocation")
     run.add_argument("--roles", nargs="+", choices=("tier1", "reference", "evaluation", "gradient_diagnostic", "warm_start"))
+    from qaoa_study.parallel import ParallelSettings
+    for name, field in ParallelSettings.__dataclass_fields__.items():
+        run.add_argument("--" + name.replace("_", "-"), default=argparse.SUPPRESS,
+                         type=str if field.default is None else type(field.default))
     for command in ("freeze", "summarize"):
         sub = commands.add_parser(command, help="Read existing attempts; no QAOA/solver/grid execution")
         sub.add_argument("--batch", required=True)
@@ -883,10 +887,13 @@ def main(argv=None):
             print(json.dumps({key: manifest[key] for key in ("batch_id", "task_count", "counts", "issues", "coverage")}, indent=2))
             return 2 if manifest["issues"] else 0
         if args.command == "run":
+            parallel_options = {name: getattr(args, name) for name in ParallelSettings.__dataclass_fields__
+                                if hasattr(args, name)}
             report = run_worker(args.batch, args.output, backend=args.backend, execute=args.execute,
                                 shard_index=args.shard_index, shard_count=args.shard_count,
                                 max_tasks=args.max_tasks, roles=args.roles,
-                                partitioned=args.partitioned, graph_ids=args.graph_ids)
+                                partitioned=args.partitioned, graph_ids=args.graph_ids,
+                                parallel=ParallelSettings(**parallel_options) if parallel_options else None)
             print(json.dumps(report, indent=2))
             return 1 if report.get("unresolved_execution_faults") else 2 if report["issues"] else 0
         if args.command == "freeze":
