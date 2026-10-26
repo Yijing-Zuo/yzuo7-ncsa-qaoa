@@ -635,6 +635,11 @@ def _lifecycle(args):
     if args.command == "status":
         while True:
             state = _status(root)
+            if state["state"] == "not_started" and not state["active_lock"]:
+                print(json.dumps(state, indent=2) if args.json else
+                      f"Not started: no run status exists in {root}. "
+                      "Run start first; status only monitors an existing run.", flush=True)
+                return
             resources = state.get("resources", {})
             waiting = [name for name in ("memory", "utilization") if resources.get("waiting_for_" + name)]
             print(json.dumps(state,indent=2) if args.json else
@@ -644,9 +649,14 @@ def _lifecycle(args):
                 + (f'  limit={resources["worker_limit"]}' if "worker_limit" in resources else "")
                 + (f'  waiting={"+".join(waiting)}' if waiting else "")
                 + (f'  {state["error"]}' if state.get("error") else ""), flush=True)
-            if args.watch <= 0:
+            if args.watch <= 0 or not state["active_lock"]:
+                if args.watch > 0 and not args.json and state["state"] != "complete":
+                    print("Monitoring ended: no active runner. Use start to launch or resume.", flush=True)
                 return
-            time.sleep(args.watch)
+            try:
+                time.sleep(args.watch)
+            except KeyboardInterrupt:
+                return
     if args.command == "stop":
         if _status(root)["active_lock"]:
             (root / "stop.request").touch()

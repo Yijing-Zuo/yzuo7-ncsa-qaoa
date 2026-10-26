@@ -732,5 +732,12 @@ calls and shots for method cost comparisons.
 Results live under the new study root: `baseline-attempts`, `references`,
 `b2-fit.json`, `b2-attempts`, `b3-attempts`, `shot-plan.json` and `shot-attempts`.
 The status line shows completed/total, phase, active tasks and execution faults.
+Monitoring exits with an explicit message if the study has not started or its
+runner has stopped. A successful start prints a background PID; the monitor
+then shows the preparation phase and the known task total.
+If Git reports `dubious ownership` for a checkout you just cloned, trust that
+specific directory with `git config --global --add safe.directory "$(pwd -P)"`
+from inside it, then rerun pull, installation and start. A failed Git command
+in a `set -e` startup block exits before the computation is launched.
 The original data directories are read-only inputs. Update the Git checkout
 between studies; an interrupted study resumes with its frozen source and settings.
