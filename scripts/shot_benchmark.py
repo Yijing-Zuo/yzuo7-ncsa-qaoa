@@ -163,6 +163,72 @@ def plan_benchmark(b1_batch, b2_fits, b4_fits, b5_fits, output, *,
     return manifest
 
 
+def replan_benchmark(parent_path, output, *, depth=2, sizes=(12, 16), per_cell=4,
+                     selection_seed=20261026):
+    """Create an independent COBYQA plan from archived B1-B3 inputs and references.
+
+    Frozen starts and the seed policy are inherited. Only the new plan binds
+    current execution code; the parent's source identity remains in provenance.
+    """
+    parent = _read_plan(parent_path)
+    if depth not in parent["config"]["depths"] or type(per_cell) is not int or per_cell < 1:
+        raise ValueError("Use an archived depth and a positive per-cell graph count.")
+    families = ("regular", "er", "ba", "sbm", "ws", "rgg")
+    pools = defaultdict(list)
+    for graph in parent["graphs"]:
+        family = graph["provenance"][0]["family"]
+        if family in families and graph["n"] in sizes:
+            pools[graph["representative_cell"]].append(graph)
+    cells = Counter((rows[0]["provenance"][0]["family"], rows[0]["n"]) for rows in pools.values())
+    if cells != Counter({(family, n): 2 for family in families for n in sizes}):
+        raise ValueError("Archived inputs must cover both settings of every requested family and size.")
+    selected = []
+    for cell, rows in sorted(pools.items()):
+        if len(rows) < per_cell:
+            raise ValueError(f"{cell}: need {per_cell} archived evaluation graphs; found {len(rows)}.")
+        selected.append(sorted(rows, key=lambda g: digest([selection_seed, cell, g["iso_class_id"]]))[:per_cell])
+    graphs = [rows[i] for i in range(per_cell) for rows in selected]
+    order = {g["iso_class_id"]: i for i, g in enumerate(graphs)}
+    starts = [s for s in parent["starts"] if s["iso_class_id"] in order and s["p"] == depth
+              and s["regime"] == "random" and s["initialization"] in ("B1", "B2", "B3")
+              and (s["initialization"] != "B2" or s["variant"] in ("medoid", "aligned_median"))]
+    for graph_id in order:
+        kinds = Counter((s["initialization"], s["variant"] if s["initialization"] == "B2" else None)
+                        for s in starts if s["iso_class_id"] == graph_id)
+        if kinds != Counter({("B1", None): 1, ("B2", "medoid"): 1,
+                             ("B2", "aligned_median"): 1, ("B3", None): 1}):
+            raise ValueError(f"Archived B1-B3 starts are incomplete for {graph_id}.")
+    starts.sort(key=lambda s: (order[s["iso_class_id"]], s["initialization"], s["variant"]))
+    refs = [r for r in parent["references"] if r["iso_class_id"] in order and r["p"] == depth]
+    if len(refs) != len(graphs) or not all(r["complete"] for r in refs):
+        raise ValueError("Selected graphs require complete archived scoring references.")
+    manifest = deepcopy(parent)
+    manifest.pop("plan_id")
+    manifest.update(graphs=graphs, starts=starts, references=refs, source=source_identity(),
+                    parent_plan={"plan_id": parent["plan_id"], "source": parent["source"]},
+                    selection={"sizes": list(sizes), "per_cell": per_cell, "seed": selection_seed})
+    config = manifest["config"]
+    config.update(depths=[depth], optimizers=["COBYQA"], initializations=["B1", "B2", "B3"],
+                  evaluation_modes=["finite_shots", "exact_control"], study_role="archived_start_cobyqa_comparison")
+    settings = ShotOptimizerSettings(**config["optimizer"])
+    if settings.total_shots // settings.shots_per_evaluation < 4 * depth + 1:
+        raise ValueError("Archived query budget is too small to initialize COBYQA.")
+    optimized = len(starts) * config["repetitions"]
+    tasks = optimized * 2 + 3 * len(graphs) * config["repetitions"]
+    manifest["budget"] = {"graphs": len(graphs), "starts": len(starts), "tasks": tasks,
+        "by_initialization": dict(Counter(s["initialization"] for s in starts)),
+        "optimization_shots_cap": optimized * settings.total_shots,
+        "validation_shots_cap": tasks * settings.validation_shots,
+        "scope": "New COBYQA runs; all selected references and starting angles are inherited."}
+    manifest["plan_id"] = digest(manifest)
+    if Path(output).exists():
+        if _read_plan(output) != manifest:
+            raise ValueError("A different plan already exists at the output path.")
+    else:
+        write_once_json(output, manifest)
+    return manifest
+
+
 def iter_tasks(plan, graph_ids=None):
     """Generate tasks lazily; large repetition counts do not expand the plan file."""
     config = plan["config"]
@@ -727,6 +793,13 @@ def main(argv=None):
     reference = commands.add_parser("reference-plan", help="Prepare only the new library's inherited reference recipe")
     for option in ("b1-batch", "library", "output"):
         reference.add_argument("--" + option, required=True)
+    replan = commands.add_parser("replan", help="Plan independent COBYQA runs using archived B1-B3 starts and references")
+    replan.add_argument("--from-plan", required=True)
+    replan.add_argument("--output", required=True)
+    replan.add_argument("--depth", type=int, default=2)
+    replan.add_argument("--sizes", nargs="+", type=int, default=[12, 16])
+    replan.add_argument("--per-cell", type=int, default=4)
+    replan.add_argument("--selection-seed", type=int, default=20261026)
     plan = commands.add_parser("plan", help="Freeze declared graphs and B1–B5 initialization conditions")
     for option in ("b1-batch", "output"):
         plan.add_argument("--" + option, required=True)
@@ -766,6 +839,9 @@ def main(argv=None):
     if args.command == "reference-plan":
         manifest = plan_references(args.b1_batch, args.library, args.output)
         result = {k: manifest[k] for k in ("batch_id", "counts", "issues")}
+    elif args.command == "replan":
+        result = replan_benchmark(args.from_plan, args.output, depth=args.depth, sizes=args.sizes,
+                                 per_cell=args.per_cell, selection_seed=args.selection_seed)["budget"]
     elif args.command == "plan":
         settings = ShotOptimizerSettings(**{name: getattr(args, name) for name in ShotOptimizerSettings.__dataclass_fields__})
         result = plan_benchmark(args.b1_batch, args.b2_fit, args.b4_fits, args.b5_fits, args.output,

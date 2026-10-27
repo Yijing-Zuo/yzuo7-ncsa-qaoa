@@ -208,8 +208,9 @@ def plan_study(root, config_path=None, data_root=None, library_path=None):
     references = sum(1 if p == 1 else exp._reference_restarts(config["baseline"], p) for p in depths)
     tasks = {"references": count * references,
              "b1": evaluation * len(depths) * config["baseline"]["evaluation_restarts"],
-             "b2": evaluation * len(depths) * 2, "b3": evaluation * len(depths),
-             "shots": evaluation * len(depths) * config["repetitions"] * 11}
+             "b2": evaluation * len(depths) * 2, "b3": evaluation * len(depths)}
+    if config.get("include_shots", True):
+        tasks["shots"] = evaluation * len(depths) * config["repetitions"] * 11
     plan = {"version": "depth-noise-study-v1", "config": config, "source": exp.source_identity(),
             "input_config_digest": input_config_digest,
             "library": library, "roster": roster, "training": training, "evaluation": evaluation,
@@ -350,16 +351,17 @@ def run_study(root, parallel):
         if not execute("b3", lambda callback: exp.run_worker(
                 b3, root / "b3-attempts", progress=callback, **common)):
             return False
-        shot_plan = root / "shot-plan.json"
-        if not shot_plan.exists():
-            shot._stamp(root, phase="plan-shots")
-            shot.plan_benchmark(baseline, [fit], None, None, shot_plan, references=[refs],
-                depths=config["depths"], repetitions=config["repetitions"], settings=ShotOptimizerSettings(**config["shot"]),
-                methods=["COBYQA"], backend=config["backend"], seed=config["shot_seed"],
-                initializations=["B1", "B2", "B3"], b3_rules=config["b3_rules"])
-        if not execute("shots", lambda callback: shot.run_benchmark(shot_plan, root / "shot-attempts",
-                execute=True, retry_interrupted=True, parallel=parallel, should_stop=stopped, progress=callback), sampled=True):
-            return False
+        if "shots" in counts:
+            shot_plan = root / "shot-plan.json"
+            if not shot_plan.exists():
+                shot._stamp(root, phase="plan-shots")
+                shot.plan_benchmark(baseline, [fit], None, None, shot_plan, references=[refs],
+                    depths=config["depths"], repetitions=config["repetitions"], settings=ShotOptimizerSettings(**config["shot"]),
+                    methods=["COBYQA"], backend=config["backend"], seed=config["shot_seed"],
+                    initializations=["B1", "B2", "B3"], b3_rules=config["b3_rules"])
+            if not execute("shots", lambda callback: shot.run_benchmark(shot_plan, root / "shot-attempts",
+                    execute=True, retry_interrupted=True, parallel=parallel, should_stop=stopped, progress=callback), sampled=True):
+                return False
     shot._stamp(root, state="complete", phase="complete", completed=total, active_tasks=[])
     return True
 

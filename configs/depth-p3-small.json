@@ -1,0 +1,126 @@
+{
+  "version": "depth-p3-small-v1",
+  "selection": {
+    "per_cell": 2,
+    "seed": 20261026
+  },
+  "backend": "lightning.gpu",
+  "depths": [
+    3
+  ],
+  "baseline": {
+    "protocol_version": "weekly-depth-noise-v1",
+    "purpose": "compact_p3_noiseless_B1_B3",
+    "production_frozen": true,
+    "seed_namespace": "plan-a-independent-pools-v1",
+    "seed": 20270003,
+    "depths": [
+      3
+    ],
+    "success_metric": {
+      "kind": "normalized_gap",
+      "tolerance": 0.01
+    },
+    "tier1_restarts": 1,
+    "reference": {
+      "p2_candidate": "best_seen_valid_execution",
+      "restarts_by_depth": {
+        "3": 10
+      }
+    },
+    "evaluation_restarts": 10,
+    "gradient_samples": 1,
+    "max_attempts": 2,
+    "optimizer": {
+      "3": {
+        "max_evaluations": 300,
+        "maxiter": 225,
+        "maxls": 20,
+        "ftol": 1e-10,
+        "gtol": 1e-07
+      }
+    },
+    "require_full_design": false,
+    "analysis": {
+      "success_metric": {
+        "kind": "normalized_gap",
+        "tolerance": 0.01
+      },
+      "evaluation_restarts": 10,
+      "cluster_threshold": 0.05,
+      "cluster_sensitivity": [
+        0.025,
+        0.1
+      ],
+      "energy_bins": 20
+    },
+    "require_split_coverage": false
+  },
+  "b2": {
+    "kind": "b2",
+    "protocol_version": "plan-a-b2-single-start-v2",
+    "purpose": "Matched held-out depth comparison",
+    "production_frozen": true,
+    "depths": [
+      3
+    ],
+    "success_metric": {
+      "kind": "normalized_gap",
+      "tolerance": 0.01
+    },
+    "variants": [
+      "medoid",
+      "aligned_median"
+    ],
+    "seed_namespace": "plan-a-b2-fixed-start-v1",
+    "seed": 20260912,
+    "analysis": {
+      "success_metric": {
+        "kind": "normalized_gap",
+        "tolerance": 0.01
+      },
+      "bootstrap_seed": 20260912,
+      "bootstrap_samples": 2000
+    }
+  },
+  "b3": {
+    "kind": "b3",
+    "protocol_version": "plan-a-b3-single-start-v2",
+    "purpose": "Matched held-out depth comparison",
+    "production_frozen": true,
+    "depths": [
+      3
+    ],
+    "success_metric": {
+      "kind": "normalized_gap",
+      "tolerance": 0.01
+    },
+    "seed_namespace": "plan-a-b3-graph-start-v1",
+    "seed": 20260919,
+    "analysis": {
+      "success_metric": {
+        "kind": "normalized_gap",
+        "tolerance": 0.01
+      },
+      "bootstrap_seed": 20260912,
+      "bootstrap_samples": 2000
+    },
+    "comparison_cases": [
+      {
+        "regime": "random",
+        "fold": null
+      }
+    ]
+  },
+  "shot": {
+    "shots_per_evaluation": 1024,
+    "total_shots": 131072,
+    "validation_shots": 8192,
+    "cobyla_rhobeg": 0.5,
+    "cobyla_tol": 0.001
+  },
+  "repetitions": 5,
+  "shot_seed": 20261026,
+  "b3_rules_file": "configs/b3-depth-rules.json",
+  "include_shots": false
+}

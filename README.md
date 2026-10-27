@@ -741,3 +741,57 @@ from inside it, then rerun pull, installation and start. A failed Git command
 in a `set -e` startup block exits before the computation is launched.
 The original data directories are read-only inputs. Update the Git checkout
 between studies; an interrupted study resumes with its frozen source and settings.
+
+## Compact, separate depth and optimizer studies
+
+The compact configuration has 8,968 total tasks in two independent runs. Run
+the COBYQA study first to reuse completed p2 references and starting angles;
+start the noiseless p3 study after it releases the GPU. Both runs use B1,
+B2 medoid/aligned median and B3, and each has its own progress and resume root.
+
+| Study | Evaluation graphs | New tasks |
+| --- | --- | ---: |
+| Noiseless p3 | Six families, n=12/14/16/18, two graphs per setting: 96 | 3,688 |
+| Finite-shot COBYQA at p2 | Six families, n=12/16, four graphs per setting: 96 | 5,280 |
+
+The p3 study retains the 148 original training graphs at n12/n16. It uses ten
+reference starts per graph (2,440 tasks), ten B1 starts per evaluation graph
+(960), two B2 variants (192), and one B3 start (96). It ends after B3, with no
+shot phase. Existing p1/p2 outcomes support same-graph depth comparisons on
+64 of the 96 graphs; the original four families at n14/n18 have no archived
+p1/p2 outcomes. Report quality and reference-search budgets with success rates.
+
+The COBYQA study inherits the archived B1-B3 inputs, complete p2 references,
+five repetitions, 1,024 shots per query, 131,072 optimization shots and 8,192
+endpoint shots. Its new plan records the parent plan and source identity.
+The 5,280 tasks comprise 1,920 sampled optimization runs, 1,920 matched exact
+controls and 1,440 fixed-start controls. No new reference search or fit is run.
+Graph order cycles through all family-size-setting cells for early coverage.
+
+Use a separate Git checkout for these new runs so the stopped larger run can
+retain its frozen source. From the new checkout in the existing GPU environment:
+
+```bash
+DATA=/path/to/old-qaoa/data/manual
+python scripts/shot_benchmark.py replan \
+  --from-plan "$DATA/shot-b123-v1/plan.json" \
+  --output "$DATA/cobyqa-p2-96-v1/plan.json"
+python scripts/shot_benchmark.py start \
+  --plan "$DATA/cobyqa-p2-96-v1/plan.json" \
+  --root "$DATA/cobyqa-p2-96-v1" --workers 4
+python scripts/shot_benchmark.py status --root "$DATA/cobyqa-p2-96-v1" --watch 10
+```
+
+After that run has finished or been stopped, launch p3 separately:
+
+```bash
+python scripts/run_study.py start --data-root "$DATA" \
+  --config configs/depth-p3-small.json \
+  --root "$DATA/p3-96-v1" --workers 4
+python scripts/run_study.py status --root "$DATA/p3-96-v1" --watch 10
+```
+
+Resume either run with its entry point's `start --root PATH`; stop with
+`stop --root PATH`. Stop requests finish and save admitted work. Task counts
+exclude device checks and failed/interrupted attempts. The smaller task count
+does not by itself predict completion time.
