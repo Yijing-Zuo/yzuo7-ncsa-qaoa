@@ -873,7 +873,10 @@ Monitor from another terminal, or request a graceful stop:
 
 Adaptive concurrency starts at four and can grow to 32, using allocated GPU/MIG
 memory, available utilization telemetry, CPU/RAM pressure and measured
-throughput. Memory headroom is the larger of 15% or 2 GiB. MIG utilization
+throughput. Adaptive GPU workers may exceed the CPU quota: the requested worker
+count is the ceiling, while measured throughput determines useful concurrency.
+CPU execution retains its CPU-capacity ceiling. Memory headroom is the larger
+of 15% or 2 GiB. MIG utilization
 `N/A` is treated as unavailable, so memory and throughput guide admission.
 Temporary allocation or worker-loss faults retain their attempt records and
 reduce concurrency before bounded retry. Normal optimizer stops and threshold
@@ -885,3 +888,37 @@ The new root contains a self-contained `shot-plan.json`, immutable
 the completed repetition quota, main-comparison flag, active-time usage and
 resource telemetry. Summaries can target a completed quota:
 `summarize_benchmark(plan, attempts, max_repetitions=10)`.
+
+### Updating a running p3 noise study
+
+The execution-only upgrade from `be44c08` preserves frozen plans, task IDs,
+saved attempts and cumulative active time. `configs/execution-upgrade.json`
+lists the exact reviewed old/new source hashes; numerical code and experiment
+settings must match. Each new attempt records its actual `execution_source_id`,
+with a full source receipt alongside `shot-attempts/execution.json`. The original
+execution identity remains the shared frozen-plan identity.
+
+When ready to update, this command requests a stop, waits for admitted work to
+be saved, pulls the update and resumes the same study:
+
+```bash
+(
+set -e
+cd "$HOME/qaoa-noise"
+"$HOME/qaoa/.venv/bin/python" -B scripts/run_study.py stop \
+  --root "$HOME/qaoa/data/manual/p3-noise-v1"
+"$HOME/qaoa/.venv/bin/python" -B - <<'PY'
+from pathlib import Path
+import time
+from scripts.shot_benchmark import _status
+root = Path.home() / "qaoa/data/manual/p3-noise-v1"
+print("Waiting for active tasks to save...", flush=True)
+while _status(root)["active_lock"]:
+    time.sleep(2)
+print("Stopped. Updating code.", flush=True)
+PY
+git -c safe.directory="$HOME/qaoa-noise" pull --ff-only
+"$HOME/qaoa/.venv/bin/python" -B scripts/run_study.py start \
+  --root "$HOME/qaoa/data/manual/p3-noise-v1" --workers 32
+)
+```

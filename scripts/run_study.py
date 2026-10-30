@@ -307,8 +307,7 @@ def run_shot_study(root, parallel, hours=None):
     """Run balanced repetition blocks within a cumulative active-time budget."""
     root = Path(root).resolve()
     plan = _read_plan(root)
-    if exp.source_identity() != plan["source"]:
-        raise ValueError("The checkout changed after planning. Resume with its frozen checkout.")
+    actual_source = shot.execution_source(plan["source"])
     sampled = shot._read_plan(root / "shot-plan.json")
     if sampled["plan_id"] != plan["shot_plan_id"]:
         raise ValueError("The shot plan differs from the study's frozen inputs.")
@@ -326,7 +325,7 @@ def run_shot_study(root, parallel, hours=None):
     elapsed = lambda: spent + time.monotonic() - session_start
     stopped = lambda: (root / "stop.request").exists() or elapsed() >= budget
     shot._stamp(root, state="running", phase="verify", pid=os.getpid(), error=None,
-                active_tasks=[], hours_budget=budget / 3600)
+                active_tasks=[], hours_budget=budget / 3600, execution_source_id=actual_source["source_id"])
     faults, reached = previous.get("execution_failures", 0), previous.get("repetitions_completed", 0)
     admitted_quota = previous.get("repetitions_target", first)
     recent_rate = previous.get("tasks_per_second", 0)
@@ -336,7 +335,8 @@ def run_shot_study(root, parallel, hours=None):
             probe = NvmlMemory(parallel.gpu_device)
             stack.callback(probe.close)
             stack.enter_context(_worker_environment(probe.uuid, False))
-        verification = root / "backend-verification.json"
+        verification = root / ("backend-verification.json" if actual_source == plan["source"] else
+                               f'backend-verification-{actual_source["source_id"][:12]}.json')
         if not verification.exists() and not stopped():
             from scripts.verify_backend import verify_shots
             checked = verify_shots(config["backend"], [3])

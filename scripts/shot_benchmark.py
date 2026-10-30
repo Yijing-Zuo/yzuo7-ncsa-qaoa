@@ -400,6 +400,27 @@ def _read_plan(path):
     return plan
 
 
+def execution_source(frozen):
+    """Accept the reviewed execution-only upgrade without changing frozen tasks."""
+    current = source_identity()
+    if current == frozen:
+        return current
+    policy_name = "configs/execution-upgrade.json"
+    policy = read_json(Path(__file__).resolve().parents[1] / policy_name)
+    before, after = frozen.get("files", {}), current["files"]
+    changes = policy["files"]
+    allowed = {"qaoa_study/parallel.py", "scripts/run_study.py",
+               "scripts/shot_benchmark.py", "README.md"}
+    if (frozen["source_id"] != policy["from_source_id"]
+            or digest(before) != frozen["source_id"]
+            or set(changes) - allowed or set(after) != set(before) | {policy_name}
+            or any(before.get(name) != hashes["before"] or after.get(name) != hashes["after"]
+                   for name, hashes in changes.items())
+            or any(after[name] != value for name, value in before.items() if name not in changes)):
+        raise ValueError("Source changes exceed the reviewed execution upgrade; use the frozen checkout or a new study.")
+    return current
+
+
 def run_path(output, task):
     return Path(output) / digest(task["iso_class_id"]) / (task["task_id"] + ".json")
 
@@ -447,7 +468,8 @@ def _execute_shot_task(item):
         evaluation_mode=task["evaluation_mode"], measurement_seed=task["seeds"]["measurement"],
         perturbation_seed=task["seeds"]["perturbation"], validation_seed=task["seeds"]["validation"],
         backend=config["backend"], audit_exact=True)
-    result.update(task=task, execution_id=item["execution_id"], run_completed=True,
+    result.update(task=task, execution_id=item["execution_id"],
+        execution_source_id=item.get("execution_source_id"), run_completed=True,
         attempt_number=item["attempt_number"], previous_interrupted_attempts=item.get("previous_interrupted_attempts", 0),
         previous_resource_failures=item.get("previous_resource_failures", 0),
         device_identity=item["device_identity"], worker_pid=os.getpid(),
@@ -477,6 +499,7 @@ def _worker_failure(item, error):
     else:
         saved = {"record_type": "worker_failure", "record_version": 1, "run_completed": True,
             "task": item["task"], "execution_id": item["execution_id"],
+            "execution_source_id": item.get("execution_source_id"),
             "attempt_number": item["attempt_number"], "stop_reason": "program_error",
             "error": f"{type(error).__name__}: {error}", "trace": [], "exact_audit": None,
             "counts": {}, "elapsed_seconds": 0.0, "cost_unknown": True,
@@ -519,8 +542,7 @@ def _run_benchmark(plan_path, output, *, execute=False, max_tasks=None, graph_id
                   max_repetitions=None):
     """Resume immutable records; optional callbacks report progress and stop between tasks."""
     plan, output = _read_plan(plan_path), Path(output)
-    if source_identity() != plan["source"]:
-        raise ValueError("Working source/configuration changed since planning; create a new plan.")
+    actual_source = execution_source(plan["source"])
     if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 1):
         raise ValueError("max_tasks must be a positive integer.")
     config = plan["config"]
@@ -537,6 +559,15 @@ def _run_benchmark(plan_path, output, *, execute=False, max_tasks=None, graph_id
         if output.exists() and any(p.name != ".run.lock" for p in output.iterdir()):
             raise ValueError("Refusing an unrecognized nonempty output directory.")
         write_once_json(execution_path, execution)
+    if execute:
+        source_path = output / ("execution-source-" + actual_source["source_id"] + ".json")
+        receipt = {"execution_id": execution["execution_id"], "plan_source_id": plan["source"]["source_id"],
+                   "source": actual_source, "scope": "Actual execution source; frozen task identity is retained."}
+        if source_path.exists():
+            if read_json(source_path) != receipt:
+                raise ValueError("Execution source receipt changed.")
+        else:
+            write_once_json(source_path, receipt)
     graphs = {g["iso_class_id"]: g for g in plan["graphs"]}
     selected = budget_tasks(plan, graph_ids, max_repetitions)["tasks"]
     report = {"planned": plan["budget"]["tasks"], "selected": selected, "completed": 0,
@@ -591,6 +622,7 @@ def _run_benchmark(plan_path, output, *, execute=False, max_tasks=None, graph_id
                 continue
             yield {"task": task, "graph": graphs[task["iso_class_id"]], "config": config,
                    "execution_id": execution["execution_id"], "device_identity": device_identity,
+                   "execution_source_id": actual_source["source_id"],
                    "attempt_number": attempt_number, "marker": str(marker), "output": str(output),
                    "previous_interrupted_attempts": interrupted, "previous_resource_failures": resource_failures,
                    "parallel_workers": parallel.workers}
@@ -602,6 +634,7 @@ def _run_benchmark(plan_path, output, *, execute=False, max_tasks=None, graph_id
         task = item["task"]
         write_once_json(item["marker"], {"task_id": task["task_id"],
             "execution_id": execution["execution_id"], "attempt_number": item["attempt_number"],
+            "execution_source_id": actual_source["source_id"],
             "started_utc": datetime.now(timezone.utc).isoformat()})
         admitted += 1
         active[task["task_id"]] = {k: task[k] for k in
@@ -802,16 +835,16 @@ def _background_work(root, lock_fd):
             if (root / "stop.request").exists():
                 _stamp(root, state="paused", phase="work", stopped=True)
                 return
-            if source_identity() != plan["source"]:
-                raise ValueError("The checkout differs from this plan. Create a new plan for updated code.")
+            actual_source = execution_source(plan["source"])
             parallel = ParallelSettings(**options["parallel"])
             with ExitStack() as stack:
                 if plan["config"]["backend"] == "lightning.gpu":
                     probe = NvmlMemory(parallel.gpu_device)
                     stack.callback(probe.close)
                     stack.enter_context(_worker_environment(probe.uuid, False))
-                receipt = root / "backend-verification.json"
-                expected = {"source_id": plan["source"]["source_id"], "backend": plan["config"]["backend"],
+                receipt = root / ("backend-verification.json" if actual_source == plan["source"] else
+                                  f'backend-verification-{actual_source["source_id"][:12]}.json')
+                expected = {"source_id": actual_source["source_id"], "backend": plan["config"]["backend"],
                             "depths": plan["config"]["depths"]}
                 if receipt.exists():
                     saved = read_json(receipt)

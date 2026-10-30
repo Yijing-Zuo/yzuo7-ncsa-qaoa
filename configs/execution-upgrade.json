@@ -1,0 +1,24 @@
+{
+  "version": "reviewed-execution-upgrade-v1",
+  "from_commit": "be44c08347c92257812a968878b208094a0aff9a",
+  "from_source_id": "0f8a3858329f7dd3b0af6919c6dc45abff865120751693e23d69e15c6c648cbe",
+  "scope": "Adaptive GPU concurrency and actual execution provenance only; frozen numerical inputs and tasks remain unchanged.",
+  "files": {
+    "qaoa_study/parallel.py": {
+      "before": "f4416a537548314e291ea0d850565c173785392430b172debb2b9175a7acf1db",
+      "after": "bbe42565a4acf24bbdc7431afcc1a87340f950a5c732ef0b7300c7649776e2a0"
+    },
+    "scripts/run_study.py": {
+      "before": "0d2206f8b071143873b8f0bb1f1b10e20144662a1b98a645ade015d49ad9fab5",
+      "after": "80c8ce8092f4bc61c80809320649c7e34caf9180e73888ba18491722b5e6c04b"
+    },
+    "scripts/shot_benchmark.py": {
+      "before": "9021c5e26c6ed0544c49a8f1b99c6c16631f9e367d65824a86ba92ff6b0247f9",
+      "after": "f4ab4323ab52a0459865d7cfe2458b205c0c5f429027eccda9fbcd71c9b19cae"
+    },
+    "README.md": {
+      "before": "8274d07e4f447fa1c77008a6fd1c07e4d02e037756f9d8d0a4c44df22d115bb8",
+      "after": "bf836569657161f2868022df6f9fc24ee9fd4d7815887eecdabc3d801a9db7b5"
+    }
+  }
+}

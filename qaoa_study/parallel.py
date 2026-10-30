@@ -277,7 +277,9 @@ def run_tasks(worker, items, *, settings=None, backend="default.qubit", memory_b
     retry_queue = deque() if retry_queue is None else retry_queue
     cpus = (_host_resources()["cpu_capacity"] if settings.adaptive else
             len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1)
-    workers = min(settings.workers, cpus)
+    # GPU workers alternate host work with device calls. CPU quota is telemetry,
+    # while measured throughput decides whether more adaptive workers help.
+    workers = settings.workers if settings.adaptive and backend == "lightning.gpu" else min(settings.workers, cpus)
     if backend == "lightning.gpu" and memory_bytes is None:
         raise ValueError("GPU admission requires a memory_bytes estimate for each task.")
     probe = NvmlMemory(settings.gpu_device) if backend == "lightning.gpu" else None
