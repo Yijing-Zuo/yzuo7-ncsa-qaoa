@@ -409,14 +409,24 @@ def execution_source(frozen):
     policy = read_json(Path(__file__).resolve().parents[1] / policy_name)
     before, after = frozen.get("files", {}), current["files"]
     changes = policy["files"]
+    expected = {name: hashes["before"] for name, hashes in changes.items()}
+    predecessor = frozen["source_id"] == policy["from_source_id"]
+    if not predecessor:
+        previous = next((entry for entry in policy.get("compatible_sources", [])
+                         if entry["source_id"] == frozen["source_id"]), None)
+        if previous:
+            expected = previous["files"]
+            predecessor = before.get(policy_name) == previous["policy_sha256"]
     allowed = {"qaoa_study/parallel.py", "scripts/run_study.py",
                "scripts/shot_benchmark.py", "README.md"}
-    if (frozen["source_id"] != policy["from_source_id"]
+    if (not predecessor
             or digest(before) != frozen["source_id"]
             or set(changes) - allowed or set(after) != set(before) | {policy_name}
-            or any(before.get(name) != hashes["before"] or after.get(name) != hashes["after"]
+            or set(expected) != set(changes)
+            or any(before.get(name) != expected[name] or after.get(name) != hashes["after"]
                    for name, hashes in changes.items())
-            or any(after[name] != value for name, value in before.items() if name not in changes)):
+            or any(after[name] != value for name, value in before.items()
+                   if name not in changes and name != policy_name)):
         raise ValueError("Source changes exceed the reviewed execution upgrade; use the frozen checkout or a new study.")
     return current
 
@@ -830,6 +840,7 @@ def _background_work(root, lock_fd):
         options = read_json(root / "runner.json")
         plan = _read_plan(options["plan"])
         _stamp(root, state="running", phase="verify", pid=os.getpid(), error=None,
+               reason=None, resources={}, tasks_per_second=0, eta_seconds=None,
                planned=plan["budget"]["tasks"], completed=0, active_tasks=[])
         try:
             if (root / "stop.request").exists():
@@ -897,7 +908,11 @@ def _lifecycle(args):
                 if "worker_maximum" in resources:
                     detail += f'/{resources["worker_maximum"]}'
             if resources.get("total_bytes"):
-                detail += f'  GPU={resources["used_bytes"] / 2**30:.1f}/{resources["total_bytes"] / 2**30:.1f}GiB'
+                detail += f'  VRAM={resources["used_bytes"] / 2**30:.1f}/{resources["total_bytes"] / 2**30:.1f}GiB'
+                utilization = resources.get("gpu_utilization_percent")
+                detail += f'  util={utilization}%' if utilization is not None else '  util=N/A'
+            if resources.get("adaptive_decision"):
+                detail += f'  ramp={resources["adaptive_decision"]}'
             rate = state.get("tasks_per_second") or resources.get("tasks_per_second")
             if rate:
                 detail += f'  rate={rate * 60:.1f}/min'

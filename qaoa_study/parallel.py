@@ -207,11 +207,13 @@ class _AdaptiveLimit:
         self.started, self.hold_until = now, now
         self.samples, self.reference, self.stalls = {}, None, 0
         self.tasks_per_second = 0.0
+        self.decision = "warmup"
 
     def backoff(self, now):
         self.limit = max(1, int(self.limit * 0.75))
         self.samples, self.reference, self.stalls = {}, None, 0
         self.started, self.hold_until = now, now + self.settings.recovery_seconds
+        self.decision = "resource_backoff"
 
     def completed(self, key, seconds, now, can_grow=True):
         total, count = self.samples.get(key, (0.0, 0))
@@ -219,8 +221,10 @@ class _AdaptiveLimit:
         count = sum(value[1] for value in self.samples.values())
         elapsed = now - self.started
         self.tasks_per_second = count / max(elapsed, 1e-6)
-        if (now < self.hold_until or elapsed < self.settings.ramp_seconds
-                or count < self.settings.min_completions):
+        if now < self.hold_until:
+            self.decision = "cooldown"
+            return self.limit
+        if elapsed < self.settings.ramp_seconds or count < self.settings.min_completions:
             return self.limit
         if self.reference is not None:
             previous_limit, previous, previous_elapsed = self.reference
@@ -228,6 +232,11 @@ class _AdaptiveLimit:
             # A change of phase/size mix is not evidence of a concurrency gain.
             if (sum(self.samples[key][1] for key in common) < count / 2
                     or sum(previous[key][1] for key in common) < sum(v[1] for v in previous.values()) / 2):
+                # Retire an incomparable baseline instead of waiting indefinitely
+                # for an earlier task class to return. Collect a fresh full window
+                # at this limit before considering the next resource-safe probe.
+                self.reference, self.samples, self.stalls = None, {}, 0
+                self.started, self.decision = now, "workload_refresh"
                 return self.limit
             # Weight both windows by the same per-class cost. This compares
             # completed work per wall second, including CPU/admission stalls.
@@ -236,10 +245,12 @@ class _AdaptiveLimit:
             gain = (current_work / elapsed) / (previous_work / previous_elapsed) - 1
             if gain < self.settings.throughput_gain:
                 self.stalls += 1
+                self.decision = "throughput_hold"
                 if self.stalls >= 2:
                     self.limit = previous_limit
                     self.reference, self.stalls = None, 0
                     self.hold_until = now + max(self.settings.ramp_seconds * 5, self.settings.recovery_seconds)
+                    self.decision = "throughput_backoff"
                 self.samples, self.started = {}, now
                 return self.limit
         if can_grow and self.limit < self.maximum:
@@ -247,6 +258,11 @@ class _AdaptiveLimit:
             self.limit = next(step for step in (4, 8, 12, 16, 24, 32, self.maximum)
                               if step > self.limit and step <= self.maximum)
             self.samples, self.started, self.stalls = {}, now, 0
+            self.decision = "probe"
+        elif self.limit >= self.maximum:
+            self.decision = "maximum"
+        elif not can_grow:
+            self.decision = "resource_wait"
         return self.limit
 
 
@@ -339,6 +355,7 @@ def run_tasks(worker, items, *, settings=None, backend="default.qubit", memory_b
             on_resources({**sample, **host, "active_workers": len(active), "worker_limit": limit,
                 "worker_maximum": workers, "requested_workers": settings.workers,
                 "tasks_per_second": ramp.tasks_per_second if ramp else None,
+                "adaptive_decision": ramp.decision if ramp else None,
                 "wait_reason": reason, "telemetry_error": telemetry_error,
                 "active_estimate_bytes": reserved, "next_estimate_bytes": estimate,
                 "reserve_bytes": safety, "memory_fraction": settings.memory_fraction,

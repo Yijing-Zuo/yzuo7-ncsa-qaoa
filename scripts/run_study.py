@@ -325,6 +325,7 @@ def run_shot_study(root, parallel, hours=None):
     elapsed = lambda: spent + time.monotonic() - session_start
     stopped = lambda: (root / "stop.request").exists() or elapsed() >= budget
     shot._stamp(root, state="running", phase="verify", pid=os.getpid(), error=None,
+                reason=None, resources={}, tasks_per_second=0, eta_seconds=None,
                 active_tasks=[], hours_budget=budget / 3600, execution_source_id=actual_source["source_id"])
     faults, reached = previous.get("execution_failures", 0), previous.get("repetitions_completed", 0)
     admitted_quota = previous.get("repetitions_target", first)
@@ -369,8 +370,9 @@ def run_shot_study(root, parallel, hours=None):
                     planned=reporting_target, block_planned=target, repetitions_target=quota,
                     repetitions_completed=reached, execution_failures=faults,
                     active_tasks=report.get("active_tasks", []), resources=resources,
-                    active_seconds=elapsed(), tasks_per_second=recent_rate,
-                    eta_seconds=(reporting_target - completed) / recent_rate if recent_rate > 0 else None)
+                    active_seconds=elapsed(), tasks_per_second=recent_rate if duration >= 10 and completed > phase_before else 0,
+                    eta_seconds=(reporting_target - completed) / recent_rate
+                        if duration >= 10 and completed > phase_before and recent_rate > 0 else None)
 
             report = shot.run_benchmark(root / "shot-plan.json", root / "shot-attempts",
                 execute=True, retry_interrupted=True, max_repetitions=quota,
@@ -594,7 +596,8 @@ def main(argv=None):
         if sys.platform != "linux":
             raise ValueError("Background start requires Linux; use run for foreground validation.")
         with (root / "console.log").open("ab", buffering=0) as log:
-            shot._stamp(root, state="running", phase="starting", error=None)
+            shot._stamp(root, state="running", phase="starting", error=None, reason=None,
+                        resources={}, tasks_per_second=0, eta_seconds=None, active_tasks=[])
             child = subprocess.Popen([sys.executable, "-B", "-u", str(Path(__file__).resolve()),
                 "_background", "--root", str(root), "--lock-fd", str(guard.fileno())],
                 cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

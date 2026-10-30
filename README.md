@@ -883,6 +883,14 @@ reduce concurrency before bounded retry. Normal optimizer stops and threshold
 misses remain scientific outcomes. Concurrent wall time measures execution
 throughput; method comparisons use quality versus actual queries and shots.
 
+When consecutive windows contain different task types, the controller refreshes
+its comparison baseline at the current concurrency, then collects a full window
+before probing the next level. It does not wait indefinitely for old task types
+to recur. Status shows `ramp=workload_refresh`, `probe`, `throughput_hold` or
+`throughput_backoff` to explain the latest decision. `VRAM` reports allocated
+device memory; `util` reports compute utilization when available. Resume clears
+the previous stop reason and resource/rate estimates before backend checks.
+
 The new root contains a self-contained `shot-plan.json`, immutable
 `shot-attempts/`, status and backend verification. `--json` on `status` exposes
 the completed repetition quota, main-comparison flag, active-time usage and
@@ -891,7 +899,7 @@ resource telemetry. Summaries can target a completed quota:
 
 ### Updating a running p3 noise study
 
-The execution-only upgrade from `be44c08` preserves frozen plans, task IDs,
+The execution-only upgrades from `be44c08` and `f030087` preserve frozen plans, task IDs,
 saved attempts and cumulative active time. `configs/execution-upgrade.json`
 lists the exact reviewed old/new source hashes; numerical code and experiment
 settings must match. Each new attempt records its actual `execution_source_id`,
