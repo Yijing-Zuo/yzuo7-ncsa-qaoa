@@ -10,6 +10,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
+from itertools import zip_longest
 from pathlib import Path
 import os
 import subprocess
@@ -38,7 +39,8 @@ def plan_benchmark(b1_batch, b2_fits, b4_fits, b5_fits, output, *,
                    settings=None, methods=("COBYLA", "SPSA"),
                    modes=("finite_shots", "exact_control"), backend="default.qubit",
                    seed=20261001, graph_ids=None, initializations=("B1", "B2", "B3", "B4", "B5"),
-                   b3_rules=None):
+                   b3_rules=None, shot_levels=None, query_cap=None, compact_controls=False,
+                   parent_provenance=None):
     """Freeze selected evaluation graphs and initialization rules from intact sources."""
     baseline, original, baseline_tasks = read_batch(b1_batch)
     loaded = [original, *[read_library(path) for path in libraries]]
@@ -61,9 +63,17 @@ def plan_benchmark(b1_batch, b2_fits, b4_fits, b5_fits, output, *,
     if backend not in ("default.qubit", "lightning.qubit", "lightning.gpu"):
         raise ValueError("Unsupported finite-shot backend.")
     settings = settings or ShotOptimizerSettings()
+    expanded = shot_levels is not None or query_cap is not None or compact_controls
+    if expanded:
+        shot_levels = list(shot_levels if shot_levels is not None else [settings.shots_per_evaluation])
+        query_cap = settings.total_shots // settings.shots_per_evaluation if query_cap is None else query_cap
+        if (not shot_levels or len(set(shot_levels)) != len(shot_levels)
+                or any(type(level) is not int or level < 2 for level in shot_levels)
+                or type(query_cap) is not int or query_cap < 1):
+            raise ValueError("Use distinct positive shot levels and a positive integer query cap.")
     required = max(4 * p + 1 if method == "COBYQA" else 2 * p + 2 if method == "COBYLA" else 2
                    for p in depths for method in methods)
-    if settings.total_shots // settings.shots_per_evaluation < required:
+    if (query_cap if expanded else settings.total_shots // settings.shots_per_evaluation) < required:
         raise ValueError("Shot budget cannot initialize every declared optimizer/depth.")
     prior, graphs, source_library = set(), [], {}
     for library in loaded:
@@ -146,10 +156,15 @@ def plan_benchmark(b1_batch, b2_fits, b4_fits, b5_fits, output, *,
               "seed": seed, "seed_namespace": "finite-shot-b1-b5-v2",
               "max_attempts": baseline["config"]["max_attempts"],
               "study_role": "frozen_model_comparison", "success_metric": resolve_success_metric()}
+    if expanded:
+        config.update(shot_levels=shot_levels, query_cap=query_cap, compact_controls=compact_controls,
+                      task_schedule="balanced-repetitions-v1")
     manifest = {"version": "shot-benchmark-v2", "config": config, "success_metric": config["success_metric"],
                 "baseline_batch_id": baseline["batch_id"], "libraries": [lib["library_id"] for lib in loaded],
                 "graphs": graphs, "starts": starts, "preparation": {k: v for k, v in prepared.items() if k != "starts"},
                 "references": [frozen_refs[key] for key in sorted(frozen_refs)], "source": source_identity()}
+    if parent_provenance is not None:
+        manifest["parent_provenance"] = parent_provenance
     optimized = len(starts) * repetitions * len(methods)
     fixed = sum(s["initialization"] != "B1" for s in starts) * repetitions
     tasks = optimized * len(modes) + fixed
@@ -158,6 +173,12 @@ def plan_benchmark(b1_batch, b2_fits, b4_fits, b5_fits, output, *,
         "optimization_shots_cap": optimized * settings.total_shots * int("finite_shots" in modes),
         "validation_shots_cap": tasks * settings.validation_shots,
         "scope": "Full declared evaluation graphs; historical references/models and new reference construction are separate costs."}
+    if expanded:
+        manifest["budget"].update(budget_tasks(manifest))
+        manifest["control_policy"] = (
+            "Exact-feedback controls are shared across shot levels. Deterministic warm-start COBYLA/COBYQA "
+            "and fixed-angle controls run once when compact_controls is enabled; B1 and SPSA controls "
+            "retain each repetition. Shared control IDs are not independent observations.")
     manifest["plan_id"] = digest(manifest)
     write_once_json(output, manifest)
     return manifest
@@ -229,16 +250,22 @@ def replan_benchmark(parent_path, output, *, depth=2, sizes=(12, 16), per_cell=4
     return manifest
 
 
-def iter_tasks(plan, graph_ids=None):
+def iter_tasks(plan, graph_ids=None, max_repetitions=None):
     """Generate tasks lazily; large repetition counts do not expand the plan file."""
     config = plan["config"]
     known = {g["iso_class_id"] for g in plan["graphs"]}
     if graph_ids is not None and not set(graph_ids) <= known:
         raise ValueError("Requested graph is absent from this plan.")
+    repetitions = config["repetitions"] if max_repetitions is None else max_repetitions
+    if type(repetitions) is not int or not 1 <= repetitions <= config["repetitions"]:
+        raise ValueError("Repetition quota must be within the frozen plan.")
+    if config.get("task_schedule") == "balanced-repetitions-v1":
+        yield from _balanced_tasks(plan, graph_ids, repetitions)
+        return
     for start in plan["starts"]:
         if graph_ids is not None and start["iso_class_id"] not in graph_ids:
             continue
-        for repetition in range(config["repetitions"]):
+        for repetition in range(repetitions):
             initial_seed, theta, old_task = None, start["theta0"], None
             if start["initialization"] == "B1":
                 original = start["random_pool"].get(str(repetition))
@@ -258,6 +285,92 @@ def iter_tasks(plan, graph_ids=None):
                 task["seeds"]["perturbation"] = _seed(config, start["start_id"], repetition, method, "perturbation")
                 task["task_id"] = digest(task)
                 yield task
+
+
+def _shot_task(start, config, repetition, method, mode, level=None):
+    """Bind shot-specific feedback while pairing starts and SPSA perturbations."""
+    initial_seed, theta, old_task = None, start["theta0"], None
+    if start["initialization"] == "B1":
+        original = start["random_pool"].get(str(repetition))
+        initial_seed = original["seed"] if original else _seed(
+            config, start["iso_class_id"], start["p"], repetition, "initialization")
+        theta = original["theta0"] if original else random_angles(start["p"], initial_seed).tolist()
+        old_task = original["source_task_id"] if original else None
+    key = [start["start_id"], repetition, method, mode, level]
+    task = {name: start.get(name) for name in ("iso_class_id", "p", "initialization", "variant",
+        "regime", "fold", "feature_group", "shuffle_seed", "target_scope", "source_id", "start_id")}
+    task.update(repetition=repetition, method=method, evaluation_mode=mode, theta0=theta,
+        initialization_seed=initial_seed, original_B1_task_id=old_task, shot_level=level,
+        query_cap=0 if method == "fixed" else config["query_cap"],
+        seeds={role: _seed(config, *key, role) for role in ("measurement", "validation")})
+    task["seeds"]["perturbation"] = _seed(config, start["start_id"], repetition, method, "perturbation")
+    if mode == "finite_shots" and method != "fixed":
+        warm = start["initialization"] != "B1"
+        control_rep = 0 if config["compact_controls"] and warm and method != "SPSA" else repetition
+        if "exact_control" in config["evaluation_modes"]:
+            task["exact_control_task_id"] = _shot_task(
+                start, config, control_rep, method, "exact_control")["task_id"]
+        if warm:
+            fixed_rep = 0 if config["compact_controls"] else repetition
+            task["fixed_control_task_id"] = _shot_task(
+                start, config, fixed_rep, "fixed", "finite_shots")["task_id"]
+    task["task_id"] = digest(task)
+    return task
+
+
+def _balanced_tasks(plan, graph_ids, repetitions):
+    config = plan["config"]
+    cells = defaultdict(list)
+    for graph in plan["graphs"]:
+        if graph_ids is None or graph["iso_class_id"] in graph_ids:
+            cells[graph["representative_cell"]].append(graph["iso_class_id"])
+    graph_order = [identity for row in zip_longest(*(cells[key] for key in sorted(cells)))
+                   for identity in row if identity is not None]
+    by_graph = defaultdict(list)
+    for start in plan["starts"]:
+        by_graph[start["iso_class_id"]].append(start)
+    starts = [start for identity in graph_order for start in by_graph[identity]]
+
+    def conditions(start, repetition):
+        warm = start["initialization"] != "B1"
+        for method in config["optimizers"]:
+            if "exact_control" in config["evaluation_modes"] and (
+                    not config["compact_controls"] or not warm or method == "SPSA" or repetition == 0):
+                yield _shot_task(start, config, repetition, method, "exact_control")
+            if "finite_shots" in config["evaluation_modes"]:
+                for level in config["shot_levels"]:
+                    yield _shot_task(start, config, repetition, method, "finite_shots", level)
+        if warm and (not config["compact_controls"] or repetition == 0):
+            yield _shot_task(start, config, repetition, "fixed", "finite_shots")
+
+    for repetition in range(repetitions):
+        for row in zip_longest(*(conditions(start, repetition) for start in starts)):
+            yield from (task for task in row if task is not None)
+
+
+def budget_tasks(plan, graph_ids=None, max_repetitions=None):
+    """Count admitted repeats without changing the frozen plan or task identities."""
+    config = plan["config"]
+    repetitions = config["repetitions"] if max_repetitions is None else max_repetitions
+    if type(repetitions) is not int or not 1 <= repetitions <= config["repetitions"]:
+        raise ValueError("Repetition quota must be within the frozen plan.")
+    starts = [start for start in plan["starts"] if graph_ids is None or start["iso_class_id"] in graph_ids]
+    warm = sum(start["initialization"] != "B1" for start in starts)
+    methods, modes = config["optimizers"], config["evaluation_modes"]
+    compact = config.get("compact_controls", False)
+    levels = config.get("shot_levels", [config["optimizer"]["shots_per_evaluation"]])
+    counts = {"fixed": warm * (1 if compact else repetitions)}
+    if "finite_shots" in modes:
+        counts["finite_shots"] = len(starts) * repetitions * len(methods) * len(levels)
+    if "exact_control" in modes:
+        counts["exact_control"] = len(starts) * repetitions * len(methods)
+        if compact:
+            counts["exact_control"] -= warm * (repetitions - 1) * sum(method != "SPSA" for method in methods)
+    shots = len(starts) * repetitions * len(methods) * (sum(levels) * config["query_cap"]
+        if "shot_levels" in config else config["optimizer"]["total_shots"]) if "finite_shots" in modes else 0
+    total = sum(counts.values())
+    return {"tasks": total, "by_mode": dict(counts), "optimization_shots_cap": shots,
+            "validation_shots_cap": total * plan["config"]["optimizer"]["validation_shots"]}
 
 
 def plan_references(b1_batch, library_path, output):
@@ -325,8 +438,12 @@ def _attempt_paths(output, task, attempt):
 def _execute_shot_task(item):
     """One process owns one task and writes its complete result before returning."""
     task, config = item["task"], item["config"]
+    settings = dict(config["optimizer"])
+    if "query_cap" in task:
+        settings["shots_per_evaluation"] = task["shot_level"] or settings["shots_per_evaluation"]
+        settings["total_shots"] = task["query_cap"] * settings["shots_per_evaluation"]
     result = optimize_qaoa_shots(graph_from_record(item["graph"]), task["p"], task["theta0"],
-        ShotOptimizerSettings(**config["optimizer"]), method=task["method"],
+        ShotOptimizerSettings(**settings), method=task["method"],
         evaluation_mode=task["evaluation_mode"], measurement_seed=task["seeds"]["measurement"],
         perturbation_seed=task["seeds"]["perturbation"], validation_seed=task["seeds"]["validation"],
         backend=config["backend"], audit_exact=True)
@@ -345,6 +462,32 @@ def _execute_shot_task(item):
     if terminal:
         save_run(run_path(item["output"], task), result)
     return {"failed": _shot_failed(result), "resource_error": resource_error, "terminal": terminal}
+
+
+def _worker_failure(item, error):
+    """Retain a lost worker attempt, or recover its already-published result."""
+    saved = _completed(item["output"], item["task"], {"execution_id": item["execution_id"]})
+    if saved is not None:
+        return {"failed": _shot_failed(saved), "resource_error": _resource_failure(saved), "terminal": True}
+    _, fault = _attempt_paths(item["output"], item["task"], item["attempt_number"])
+    if fault.exists():
+        saved = read_run(fault, require_integrity=True)
+        if saved["task"] != item["task"] or saved["execution_id"] != item["execution_id"]:
+            raise ValueError("Lost worker record has different task or execution provenance.")
+    else:
+        saved = {"record_type": "worker_failure", "record_version": 1, "run_completed": True,
+            "task": item["task"], "execution_id": item["execution_id"],
+            "attempt_number": item["attempt_number"], "stop_reason": "program_error",
+            "error": f"{type(error).__name__}: {error}", "trace": [], "exact_audit": None,
+            "counts": {}, "elapsed_seconds": 0.0, "cost_unknown": True,
+            "cost_note": "The worker exited before publishing its trace; its work and elapsed time are unknown.",
+            "device_identity": item["device_identity"],
+            "previous_resource_failures": item.get("previous_resource_failures", 0)}
+        save_run(fault, saved)
+    terminal = item["attempt_number"] >= item["config"]["max_attempts"]
+    if terminal:
+        save_run(run_path(item["output"], item["task"]), saved)
+    return {"failed": True, "resource_error": True, "terminal": terminal}
 
 
 @contextmanager
@@ -372,7 +515,8 @@ def run_benchmark(plan_path, output, *, execute=False, **options):
 
 
 def _run_benchmark(plan_path, output, *, execute=False, max_tasks=None, graph_ids=None,
-                  retry_interrupted=False, progress=None, should_stop=None, parallel=None):
+                  retry_interrupted=False, progress=None, should_stop=None, parallel=None,
+                  max_repetitions=None):
     """Resume immutable records; optional callbacks report progress and stop between tasks."""
     plan, output = _read_plan(plan_path), Path(output)
     if source_identity() != plan["source"]:
@@ -394,9 +538,7 @@ def _run_benchmark(plan_path, output, *, execute=False, max_tasks=None, graph_id
             raise ValueError("Refusing an unrecognized nonempty output directory.")
         write_once_json(execution_path, execution)
     graphs = {g["iso_class_id"]: g for g in plan["graphs"]}
-    selected = sum(config["repetitions"] * (len(config["optimizers"]) * len(config["evaluation_modes"])
-                   + int(start["initialization"] != "B1")) for start in plan["starts"]
-                   if graph_ids is None or start["iso_class_id"] in graph_ids)
+    selected = budget_tasks(plan, graph_ids, max_repetitions)["tasks"]
     report = {"planned": plan["budget"]["tasks"], "selected": selected, "completed": 0,
               "executed": 0, "interrupted": 0, "retried_interrupted": 0, "execution_failures": 0,
               "resource_failures": 0, "resource_retries": 0,
@@ -409,7 +551,7 @@ def _run_benchmark(plan_path, output, *, execute=False, max_tasks=None, graph_id
     retry_queue = deque()
 
     def pending():
-        for task in iter_tasks(plan, graph_ids):
+        for task in iter_tasks(plan, graph_ids, max_repetitions):
             if should_stop is not None and should_stop():
                 report["stopped"] = True
                 break
@@ -476,6 +618,9 @@ def _run_benchmark(plan_path, output, *, execute=False, max_tasks=None, graph_id
     for item, result in run_tasks(_execute_shot_task, pending(), settings=parallel,
             backend=config["backend"] if execute else "default.qubit", should_stop=should_stop, on_submit=submitted,
             on_resources=resources, retry_queue=retry_queue,
+            on_worker_error=_worker_failure,
+            workload_key=lambda item: (item["graph"]["n"], item["task"]["p"], item["task"]["method"],
+                item["task"]["evaluation_mode"], item["task"]["initialization"], item["task"].get("shot_level")),
             resource_history=lambda item: item["previous_resource_failures"],
             memory_bytes=lambda item: estimate_statevector_bytes(
                 item["graph"]["n"], state_copies=parallel.state_copies,
@@ -513,9 +658,11 @@ SUMMARY_KEYS = ("p", "initialization", "variant", "regime", "fold", "feature_gro
 METRICS = ("C_initial_exact", "C_final_exact", "quality", "quality_gain", "terminal_success")
 
 
-def summarize_benchmark(plan_path, output):
+def summarize_benchmark(plan_path, output, *, max_repetitions=None):
     """Stream attempts into graph means, retaining every planned denominator."""
     plan, output = _read_plan(plan_path), Path(output)
+    selected = budget_tasks(plan, max_repetitions=max_repetitions)["tasks"]
+    summary_keys = SUMMARY_KEYS + (("shot_level",) if "shot_levels" in plan["config"] else ())
     execution = read_json(output / "execution.json")
     if execution["plan_id"] != plan["plan_id"] or digest(
             {k: v for k, v in execution.items() if k != "execution_id"}) != execution["execution_id"]:
@@ -523,16 +670,16 @@ def summarize_benchmark(plan_path, output):
     refs = {(r["iso_class_id"], r["p"]): r for r in plan["references"]}
     graphs = {g["iso_class_id"]: g for g in plan["graphs"]}
     per_graph, total_counts = {}, Counter()
-    retry_counts, retry_attempts, retry_seconds = Counter(), 0, 0.0
+    retry_counts, retry_attempts, retry_seconds, unknown_cost_attempts = Counter(), 0, 0.0, 0
     resource_paths = defaultdict(list)
     for identity in graphs:
         for path in (output / digest(identity) / "resource-faults").glob("*.json"):
             task_id, attempt = path.stem.rsplit(".", 1)
             resource_paths[task_id].append((int(attempt), path))
     failures, completed = 0, 0
-    for task in iter_tasks(plan):
+    for task in iter_tasks(plan, None, max_repetitions):
         graph = graphs[task["iso_class_id"]]
-        context = {k: task.get(k) for k in SUMMARY_KEYS}
+        context = {k: task.get(k) for k in summary_keys}
         context["family"] = graph["provenance"][0]["family"]
         key = (task["iso_class_id"], *context.values())
         row = per_graph.setdefault(key, {**context, "iso_class_id": task["iso_class_id"], "n": graph["n"],
@@ -550,9 +697,11 @@ def summarize_benchmark(plan_path, output):
                 retry_counts.update(failed_attempt["counts"])
                 retry_seconds += failed_attempt["elapsed_seconds"]
                 retry_attempts += 1
+                unknown_cost_attempts += int(failed_attempt.get("cost_unknown", False))
         if result is None:
             continue
         completed += 1
+        unknown_cost_attempts += int(result.get("cost_unknown", False))
         row["completed"] += 1
         opt_failed = bool(result.get("error") or result["stop_reason"] in EXECUTION_FAILURES)
         phase_errors = (result.get("error"), result.get("validation_error"), result.get("exact_audit_error"))
@@ -584,7 +733,7 @@ def summarize_benchmark(plan_path, output):
         row.pop("sums")
         row.pop("available")
         row["counts"] = dict(row["counts"])
-        grouped[tuple(row[k] for k in SUMMARY_KEYS)].append(row)
+        grouped[tuple(row[k] for k in summary_keys)].append(row)
     # Reuse graph-level B1/B3 outcomes on each LOFO's actual target set; a
     # family-wide mean can include multi-family graphs excluded by that LOFO.
     lofo_targets = defaultdict(set)
@@ -596,22 +745,23 @@ def summarize_benchmark(plan_path, output):
             for (p, fold), identities in lofo_targets.items():
                 if row["p"] == p and row["iso_class_id"] in identities:
                     view = {**row, "regime": "lofo", "fold": fold}
-                    grouped[tuple(view[k] for k in SUMMARY_KEYS)].append(view)
+                    grouped[tuple(view[k] for k in summary_keys)].append(view)
     comparisons = []
     for key, rows in sorted(grouped.items(), key=lambda item: repr(item[0])):
-        comparisons.append({**dict(zip(SUMMARY_KEYS, key, strict=True)),
+        comparisons.append({**dict(zip(summary_keys, key, strict=True)),
             "reuses_random_baseline": rows[0]["regime"] == "lofo" and rows[0]["initialization"] in ("B1", "B3"),
             "graphs": len(rows), "planned": sum(r["planned"] for r in rows),
             "completed": sum(r["completed"] for r in rows),
             **{name: float(np.mean([r[name] for r in rows])) if all(r[name] is not None for r in rows) else None
                for name in METRICS}})
     return {"plan_id": plan["plan_id"], "study_role": plan["config"]["study_role"],
-            "complete": completed == plan["budget"]["tasks"],
-            "assessments_complete": completed == plan["budget"]["tasks"] and failures == 0,
-            "planned": plan["budget"]["tasks"], "completed": completed, "execution_failures": failures,
+            "complete": completed == selected,
+            "assessments_complete": completed == selected and failures == 0,
+            "planned": selected, "completed": completed, "execution_failures": failures,
             "counts": dict(total_counts), "comparisons": comparisons, "graph_results": list(per_graph.values()),
             "resource_retry_attempts": retry_attempts, "resource_retry_counts": dict(retry_counts),
             "resource_retry_elapsed_seconds": retry_seconds,
+            "unknown_cost_attempts": unknown_cost_attempts,
             "counts_including_resource_retries": dict(total_counts + retry_counts),
             "weighting": "Repetitions within graph, then equal graph weights; any missing/faulted exact endpoint leaves its group metric null.",
             "scope": "Original evaluation and external-family transfer are separate; LOFO baselines reuse matched graph outcomes. Counts cover completed records; work before an interrupted record is unknown."}
@@ -708,15 +858,30 @@ def _lifecycle(args):
                 return
             resources = state.get("resources", {})
             waiting = [name for name in ("memory", "utilization") if resources.get("waiting_for_" + name)]
+            detail = ""
+            if "worker_limit" in resources:
+                detail += f'  limit={resources["worker_limit"]}'
+                if "worker_maximum" in resources:
+                    detail += f'/{resources["worker_maximum"]}'
+            if resources.get("total_bytes"):
+                detail += f'  GPU={resources["used_bytes"] / 2**30:.1f}/{resources["total_bytes"] / 2**30:.1f}GiB'
+            rate = state.get("tasks_per_second") or resources.get("tasks_per_second")
+            if rate:
+                detail += f'  rate={rate * 60:.1f}/min'
+            if state.get("eta_seconds") is not None:
+                detail += f'  ETA={state["eta_seconds"] / 3600:.1f}h'
+            if resources.get("wait_reason") or waiting:
+                detail += f'  waiting={resources.get("wait_reason") or "+".join(waiting)}'
+            if state.get("reason"):
+                detail += f'  {state["reason"]}'
             print(json.dumps(state,indent=2) if args.json else
                 f'{state.get("completed",0)}/{state.get("planned","?")}  {state["state"]}  '
                 f'{state.get("phase","")}  active={len(state.get("active_tasks",[]))}  '
                 f'faults={state.get("execution_failures",0)}'
-                + (f'  limit={resources["worker_limit"]}' if "worker_limit" in resources else "")
-                + (f'  waiting={"+".join(waiting)}' if waiting else "")
+                + detail
                 + (f'  {state["error"]}' if state.get("error") else ""), flush=True)
             if args.watch <= 0 or not state["active_lock"]:
-                if args.watch > 0 and not args.json and state["state"] != "complete":
+                if args.watch > 0 and not args.json and state["state"] not in ("complete", "budget_complete"):
                     print("Monitoring ended: no active runner. Use start to launch or resume.", flush=True)
                 return
             try:
@@ -770,8 +935,10 @@ def _parallel_arguments(parser, workers=1, *, inherit=False):
     from qaoa_study.parallel import ParallelSettings
     for name, field in ParallelSettings.__dataclass_fields__.items():
         default = workers if name == "workers" else field.default
+        options = {"action": argparse.BooleanOptionalAction} if isinstance(default, bool) else {
+            "type": str if default is None else type(default)}
         parser.add_argument("--"+name.replace("_","-"), default=argparse.SUPPRESS if inherit else default,
-                            type=str if default is None else type(default))
+                            **options)
 
 
 def main(argv=None):
@@ -818,6 +985,9 @@ def main(argv=None):
     plan.add_argument("--modes", nargs="+", choices=("finite_shots", "exact_control"), default=["finite_shots", "exact_control"])
     plan.add_argument("--backend", choices=("default.qubit", "lightning.qubit", "lightning.gpu"), default="default.qubit")
     plan.add_argument("--seed", type=int, default=20261001)
+    plan.add_argument("--shot-levels", nargs="+", type=int)
+    plan.add_argument("--query-cap", type=int)
+    plan.add_argument("--compact-controls", action="store_true")
     for name, field in ShotOptimizerSettings.__dataclass_fields__.items():
         plan.add_argument("--" + name.replace("_", "-"), type=type(field.default), default=field.default)
     for name in ("run", "summarize"):
@@ -830,6 +1000,7 @@ def main(argv=None):
             sub.add_argument("--retry-interrupted", action="store_true",
                              help="After the previous process has stopped, retry interrupted tasks within the frozen attempt cap")
             sub.add_argument("--max-tasks", type=int)
+            sub.add_argument("--max-repetitions", type=int)
             sub.add_argument("--graph-ids", nargs="+", help="Execute/resume only these graph identities")
         else:
             sub.add_argument("--save", required=True, help="New summary JSON path")
@@ -848,11 +1019,12 @@ def main(argv=None):
             libraries=args.library, references=args.references, depths=args.depths, repetitions=args.repetitions,
             settings=settings, methods=args.methods, modes=args.modes, backend=args.backend, seed=args.seed,
             graph_ids=read_json(args.graph_ids_file) if args.graph_ids_file else None,
-            initializations=args.initializations, b3_rules=read_json(args.b3_rules) if args.b3_rules else None)["budget"]
+            initializations=args.initializations, b3_rules=read_json(args.b3_rules) if args.b3_rules else None,
+            shot_levels=args.shot_levels, query_cap=args.query_cap, compact_controls=args.compact_controls)["budget"]
     elif args.command == "run":
         result = run_benchmark(args.plan, args.output, execute=args.execute, max_tasks=args.max_tasks,
                                graph_ids=args.graph_ids, retry_interrupted=args.retry_interrupted,
-                               parallel=_parallel_settings(args))
+                               parallel=_parallel_settings(args), max_repetitions=args.max_repetitions)
     else:
         summary = summarize_benchmark(args.plan, args.output)
         write_once_json(args.save, summary)

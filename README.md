@@ -795,3 +795,93 @@ Resume either run with its entry point's `start --root PATH`; stop with
 `stop --root PATH`. Stop requests finish and save admitted work. Task counts
 exclude device checks and failed/interrupted attempts. The smaller task count
 does not by itself predict completion time.
+
+## P3 shot noise with three optimizers
+
+This study imports the completed `p3-96-v1` graphs, references and B1-B3
+initializations. It runs COBYLA, COBYQA and SPSA at p=3 on the same 96 graphs:
+six families, n=12/14/16/18, two settings and two graphs per cell. The four
+starts are B1, B2 medoid, B2 aligned median and B3. No reference search or
+model fitting is scheduled. Settings are in `configs/p3-shot-noise.json`.
+
+| Shots per query | Query cap | Optimization shots cap |
+| ---: | ---: | ---: |
+| 256 | 128 | 32,768 |
+| 1,024 | 128 | 131,072 |
+| 4,096 | 128 | 524,288 |
+
+Each endpoint has 8,192 independent measurement shots and an exact quality
+audit. Exact controls use the same optimizer, initial angles and query cap.
+Deterministic warm-start exact controls and fixed-start assessments are shared
+across repetitions and shot levels; explicit task IDs link each sampled run
+to its controls. Shared controls are one observation, not independent repeats.
+B1's first ten starts are inherited; extension starts use frozen independent
+seeds. SPSA perturbation seeds match between sampled and exact conditions.
+
+The first five repetitions cover all conditions (21,024 tasks). Ten repetitions
+form the main comparison: 34,560 sampled optimizations, 6,336 exact controls
+and 288 fixed-start assessments, totaling **41,184 tasks**. A frozen maximum
+of twenty repetitions contains 81,504 tasks. After the main comparison, another
+five-repetition block starts only if recent speed predicts it will fit within
+the remaining 72-hour budget with 25% time allowance. Selection depends on
+execution speed, not scientific outcomes. Progress shows the main target first,
+then the admitted extension target. Full task counts exclude backend checks and
+failed or interrupted attempts.
+
+The time budget counts active runner time across pauses and restarts. Stop
+requests and budget expiry stop new admissions and let active tasks finish.
+`budget_complete` means the main comparison finished and no further balanced
+block was admitted; `complete` means all twenty repetitions finished. Saved
+attempts are reused by `start`; `--hours 96` raises the cumulative time budget
+when explicitly requesting more work.
+
+Use a fresh checkout for this experiment and the existing GPU Python environment:
+
+```bash
+(
+set -e
+cd "$HOME"
+if [ ! -d qaoa-noise/.git ]; then
+  git clone https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa.git qaoa-noise
+fi
+cd qaoa-noise
+git -c safe.directory="$HOME/qaoa-noise" pull --ff-only
+"$HOME/qaoa/.venv/bin/python" -m pip install --no-deps -e .
+"$HOME/qaoa/.venv/bin/python" -B scripts/run_study.py start \
+  --from-study "$HOME/qaoa/data/manual/p3-96-v1" \
+  --root "$HOME/qaoa/data/manual/p3-noise-v1" --workers 32
+)
+```
+
+After first launch, use the frozen checkout directly. Resume without pulling
+updated code into an unfinished run:
+
+```bash
+cd "$HOME/qaoa-noise"
+"$HOME/qaoa/.venv/bin/python" -B scripts/run_study.py start \
+  --root "$HOME/qaoa/data/manual/p3-noise-v1"
+```
+
+Monitor from another terminal, or request a graceful stop:
+
+```bash
+"$HOME/qaoa/.venv/bin/python" -B "$HOME/qaoa-noise/scripts/run_study.py" status \
+  --root "$HOME/qaoa/data/manual/p3-noise-v1" --watch 10
+"$HOME/qaoa/.venv/bin/python" -B "$HOME/qaoa-noise/scripts/run_study.py" stop \
+  --root "$HOME/qaoa/data/manual/p3-noise-v1"
+```
+
+Adaptive concurrency starts at four and can grow to 32, using allocated GPU/MIG
+memory, available utilization telemetry, CPU/RAM pressure and measured
+throughput. Memory headroom is the larger of 15% or 2 GiB. MIG utilization
+`N/A` is treated as unavailable, so memory and throughput guide admission.
+Temporary allocation or worker-loss faults retain their attempt records and
+reduce concurrency before bounded retry. Normal optimizer stops and threshold
+misses remain scientific outcomes. Concurrent wall time measures execution
+throughput; method comparisons use quality versus actual queries and shots.
+
+The new root contains a self-contained `shot-plan.json`, immutable
+`shot-attempts/`, status and backend verification. `--json` on `status` exposes
+the completed repetition quota, main-comparison flag, active-time usage and
+resource telemetry. Summaries can target a completed quota:
+`summarize_benchmark(plan, attempts, max_repetitions=10)`.

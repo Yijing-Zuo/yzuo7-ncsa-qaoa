@@ -1,4 +1,4 @@
-"""Run the matched B1–B3 depth and finite-shot COBYQA study from saved graphs.
+"""Run B1-B3 depth studies or shot-noise comparisons from saved p3 inputs.
 
 Use plan to inspect the frozen graph roster, start to launch/resume on ICRN,
 status --watch 10 to monitor, and stop to drain active tasks safely.
@@ -236,6 +236,166 @@ def _directory(destination, build):
         stage.rename(destination)
 
 
+def plan_shot_study(root, parent_root=None, config_path=None):
+    """Import completed depth inputs once; freeze a self-contained shot sweep."""
+    root = Path(root).resolve()
+    if (root / "plan.json").exists():
+        plan = _read_plan(root)
+        if config_path is not None and exp.digest(read_json(config_path)) != plan["input_config_digest"]:
+            raise ValueError("Different settings require a new study root.")
+        return plan
+    if parent_root is None:
+        raise ValueError("A new shot study requires --from-study PATH to the completed p3 study.")
+    parent_root = Path(parent_root).resolve()
+    parent = _read_plan(parent_root)
+    config = read_json(config_path or REPO / "configs/p3-shot-noise.json")
+    first, core, maximum = (config[k] for k in
+                            ("first_repetitions", "core_repetitions", "max_repetitions"))
+    if not (1 <= first <= core <= maximum) or config["repetition_step"] < 1 or config["hours"] <= 0:
+        raise ValueError("Use increasing positive repetition quotas and a positive time budget.")
+    if config["depths"] != [3] or parent["config"]["depths"] != [3]:
+        raise ValueError("This shot-only study imports completed p=3 inputs.")
+    receipts = {}
+    for stage in ("references", "b1", "b2", "b3"):
+        path = parent_root / "completed" / (stage + ".json")
+        receipt = read_json(path)
+        if (receipt["missing_tasks"] or receipt["unresolved_execution_faults"]
+                or receipt["shard_tasks"] != parent["task_counts"][stage]):
+            raise ValueError(f"Finish the parent {stage} stage before importing its inputs.")
+        receipts[stage] = hashlib.sha256(path.read_bytes()).hexdigest()
+    # Cycle through family/size/setting cells before their second graph.
+    cells = defaultdict(list)
+    for graph in parent["library"]["graphs"]:
+        if graph["graph_split"] == "evaluation":
+            cells[graph["representative_cell"]].append(graph["iso_class_id"])
+    rows = [sorted(ids) for _, ids in sorted(cells.items())]
+    graph_ids = [ids[i] for i in range(max(map(len, rows))) for ids in rows if i < len(ids)]
+    provenance = {"plan_id": parent["plan_id"], "source": parent["source"],
+                  "configuration_digest": exp.digest(config),
+                  "completed_receipts": receipts,
+                  "b2_fit_sha256": hashlib.sha256((parent_root / "b2-fit.json").read_bytes()).hexdigest()}
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "shot-plan.json"
+    if target.exists():
+        sampled = shot._read_plan(target)
+        if sampled.get("parent_provenance") != provenance or sampled["source"] != exp.source_identity():
+            raise ValueError("Interrupted preparation has different parent inputs or source; use a new root.")
+    else:
+        sampled = shot.plan_benchmark(parent_root / "baseline", [parent_root / "b2-fit.json"],
+            None, None, target, references=[parent_root / "references"],
+            depths=[3], repetitions=maximum, settings=ShotOptimizerSettings(**config["shot"]),
+            methods=config["methods"], backend=config["backend"], seed=config["seed"],
+            initializations=["B1", "B2", "B3"], graph_ids=graph_ids,
+            b3_rules=parent["config"]["b3_rules"], shot_levels=config["shot_levels"],
+            query_cap=config["query_cap"], compact_controls=True, parent_provenance=provenance)
+    budgets = {str(r): shot.budget_tasks(sampled, max_repetitions=r) for r in
+               sorted({first, core, maximum, *range(first, maximum + 1, config["repetition_step"])})}
+    plan = {"version": "shot-noise-study-v1", "config": config, "source": sampled["source"],
+            "input_config_digest": exp.digest(config), "parent_study": provenance,
+            "shot_plan_id": sampled["plan_id"], "evaluation": len(sampled["graphs"]),
+            "budgets": budgets, "planned": budgets[str(core)]["tasks"],
+            "maximum_planned": budgets[str(maximum)]["tasks"],
+            "scope": "Inherited p3 graphs, references and B1-B3 starts; new optimizer/shot tasks only."}
+    plan["plan_id"] = exp.digest(plan)
+    write_once_json(root / "plan.json", plan)
+    shot._stamp(root, state="planned", phase="planned", planned=plan["planned"], completed=0,
+                main_planned=plan["planned"], maximum_planned=plan["maximum_planned"], active_seconds=0)
+    return plan
+
+
+def run_shot_study(root, parallel, hours=None):
+    """Run balanced repetition blocks within a cumulative active-time budget."""
+    root = Path(root).resolve()
+    plan = _read_plan(root)
+    if exp.source_identity() != plan["source"]:
+        raise ValueError("The checkout changed after planning. Resume with its frozen checkout.")
+    sampled = shot._read_plan(root / "shot-plan.json")
+    if sampled["plan_id"] != plan["shot_plan_id"]:
+        raise ValueError("The shot plan differs from the study's frozen inputs.")
+    config = plan["config"]
+    previous = read_json(root / "status.json")
+    spent = previous.get("active_seconds", 0)
+    session_start = time.monotonic()
+    budget = 3600 * (config["hours"] if hours is None else hours)
+    if budget <= 0:
+        raise ValueError("hours must be positive.")
+    completed = previous.get("completed", 0)
+    first, core, maximum = (config[k] for k in
+                            ("first_repetitions", "core_repetitions", "max_repetitions"))
+    quotas = sorted({first, core, maximum, *range(first, maximum + 1, config["repetition_step"])})
+    elapsed = lambda: spent + time.monotonic() - session_start
+    stopped = lambda: (root / "stop.request").exists() or elapsed() >= budget
+    shot._stamp(root, state="running", phase="verify", pid=os.getpid(), error=None,
+                active_tasks=[], hours_budget=budget / 3600)
+    faults, reached = previous.get("execution_failures", 0), previous.get("repetitions_completed", 0)
+    admitted_quota = previous.get("repetitions_target", first)
+    recent_rate = previous.get("tasks_per_second", 0)
+    with ExitStack() as stack:
+        if sampled["config"]["backend"] == "lightning.gpu":
+            from qaoa_study.parallel import NvmlMemory, _worker_environment
+            probe = NvmlMemory(parallel.gpu_device)
+            stack.callback(probe.close)
+            stack.enter_context(_worker_environment(probe.uuid, False))
+        verification = root / "backend-verification.json"
+        if not verification.exists() and not stopped():
+            from scripts.verify_backend import verify_shots
+            checked = verify_shots(config["backend"], [3])
+            if not checked["passed"]:
+                raise RuntimeError(f"Backend verification failed: {checked}")
+            write_once_json(verification, checked)
+        for quota in quotas:
+            target = plan["budgets"][str(quota)]["tasks"]
+            if reached >= quota:
+                continue
+            if stopped():
+                break
+            if quota > core and quota > admitted_quota:
+                estimate = (target - completed) / recent_rate if recent_rate > 0 else float("inf")
+                if estimate * 1.25 + 120 > budget - elapsed():
+                    break
+            admitted_quota = quota
+            phase_start, phase_before = time.monotonic(), completed
+            reporting_target = max(plan["planned"], target)
+
+            def progress(report):
+                nonlocal completed, faults, recent_rate
+                completed = max(completed, report["completed"])
+                faults = report["execution_failures"]
+                duration = time.monotonic() - phase_start
+                if duration >= 10 and completed > phase_before:
+                    recent_rate = (completed - phase_before) / duration
+                resources = report.get("resources", {})
+                shot._stamp(root, state="running", phase="shots", completed=completed,
+                    planned=reporting_target, block_planned=target, repetitions_target=quota,
+                    repetitions_completed=reached, execution_failures=faults,
+                    active_tasks=report.get("active_tasks", []), resources=resources,
+                    active_seconds=elapsed(), tasks_per_second=recent_rate,
+                    eta_seconds=(reporting_target - completed) / recent_rate if recent_rate > 0 else None)
+
+            report = shot.run_benchmark(root / "shot-plan.json", root / "shot-attempts",
+                execute=True, retry_interrupted=True, max_repetitions=quota,
+                parallel=parallel, should_stop=stopped, progress=progress)
+            progress(report)
+            if not report["selected_complete"]:
+                break
+            reached = quota
+            if completed > phase_before:
+                recent_rate = (completed - phase_before) / max(time.monotonic() - phase_start, 1e-6)
+            shot._stamp(root, repetitions_completed=reached, tasks_per_second=recent_rate)
+    main_complete = reached >= core and faults == 0
+    state = ("complete" if reached == maximum else "budget_complete") if main_complete else "paused"
+    if (root / "stop.request").exists():
+        state = "paused"
+    reason = ("Stopped by request." if (root / "stop.request").exists() else
+              "Active-time budget reached." if elapsed() >= budget else
+              "Next balanced block exceeds the remaining time budget." if reached >= core and reached < maximum else
+              "Inspect failed or interrupted attempts." if faults or reached < core else None)
+    shot._stamp(root, state=state, phase=state, active_tasks=[], active_seconds=elapsed(),
+                completed=completed, main_complete=main_complete, reason=reason,
+                repetitions_completed=reached, execution_failures=faults)
+    return main_complete
+
+
 def _prepare_library(root, plan, stopped):
     target = root / "library"
     if target.exists():
@@ -366,8 +526,10 @@ def run_study(root, parallel):
     return True
 
 
-def _work(root, parallel):
+def _work(root, parallel, hours=None):
     try:
+        if _read_plan(root)["version"] == "shot-noise-study-v1":
+            return run_shot_study(root, parallel, hours)
         if not run_study(root, parallel):
             shot._stamp(root, state="paused", active_tasks=[])
     except BaseException as error:
@@ -385,8 +547,10 @@ def main(argv=None):
             command.add_argument("--data-root", help="Existing ICRN data/manual directory")
             command.add_argument("--library", help="Use an existing complete library instead of historical selection")
             command.add_argument("--config", help="Defaults to configs/depth-noise-study.json for a new study")
+            command.add_argument("--from-study", help="Import completed p3 inputs for a new shot-only comparison")
         if name in ("start", "run"):
             shot._parallel_arguments(command, workers=4, inherit=True)
+            command.add_argument("--hours", type=float, help="Total active-time budget for the shot-only study, including prior sessions")
         if name == "status":
             command.add_argument("--watch", type=float, default=0)
             command.add_argument("--json", action="store_true")
@@ -399,25 +563,38 @@ def main(argv=None):
         return shot._lifecycle(args)
     if args.command == "_background":
         with os.fdopen(args.lock_fd, "a+b"):
-            return _work(root, ParallelSettings(**read_json(root / "runner.json")["parallel"]))
+            options = read_json(root / "runner.json")
+            return _work(root, ParallelSettings(**options["parallel"]), options.get("hours"))
     if args.command != "plan" and shot._status(root)["active_lock"]:
         print(json.dumps(shot._status(root), indent=2))
         return
-    plan = plan_study(root, args.config, args.data_root, args.library)
+    existing = _read_plan(root) if (root / "plan.json").exists() else None
+    shot_only = bool(args.from_study or (existing and existing["version"] == "shot-noise-study-v1"))
+    plan = (plan_shot_study(root, args.from_study, args.config) if shot_only else
+            plan_study(root, args.config, args.data_root, args.library))
     if args.command == "plan":
-        print(json.dumps({key: plan[key] for key in ("plan_id", "training", "evaluation", "task_counts", "planned")}, indent=2))
+        keys = ("plan_id", "evaluation", "planned", "maximum_planned", "budgets") if shot_only else (
+            "plan_id", "training", "evaluation", "task_counts", "planned")
+        print(json.dumps({key: plan[key] for key in keys}, indent=2))
         return
     path = root / "runner.json"
     previous = read_json(path) if path.exists() else {}
-    parallel = shot._parallel_settings(args, previous.get("parallel"), default_workers=4)
+    defaults = {"adaptive": True} if shot_only else {}
+    parallel = shot._parallel_settings(args, {**defaults, **previous.get("parallel", {})},
+                                       default_workers=32 if shot_only else 4)
+    hours = args.hours if args.hours is not None else previous.get("hours")
+    if hours is not None and hours <= 0:
+        raise ValueError("hours must be positive.")
     with shot.run_lock(root / "runner.lock") as guard:
-        path.write_text(json.dumps({"plan_id": plan["plan_id"], "parallel": asdict(parallel)}, indent=2) + "\n", encoding="utf8")
+        path.write_text(json.dumps({"plan_id": plan["plan_id"], "parallel": asdict(parallel),
+                                   "hours": hours}, indent=2) + "\n", encoding="utf8")
         (root / "stop.request").unlink(missing_ok=True)
         if args.command == "run":
-            return _work(root, parallel)
+            return _work(root, parallel, hours)
         if sys.platform != "linux":
             raise ValueError("Background start requires Linux; use run for foreground validation.")
         with (root / "console.log").open("ab", buffering=0) as log:
+            shot._stamp(root, state="running", phase="starting", error=None)
             child = subprocess.Popen([sys.executable, "-B", "-u", str(Path(__file__).resolve()),
                 "_background", "--root", str(root), "--lock-fd", str(guard.fileno())],
                 cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

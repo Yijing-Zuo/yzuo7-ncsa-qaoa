@@ -1,0 +1,21 @@
+{
+  "version": "p3-shot-noise-v1",
+  "backend": "lightning.gpu",
+  "depths": [3],
+  "methods": ["COBYLA", "COBYQA", "SPSA"],
+  "shot_levels": [256, 1024, 4096],
+  "query_cap": 128,
+  "first_repetitions": 5,
+  "core_repetitions": 10,
+  "max_repetitions": 20,
+  "repetition_step": 5,
+  "hours": 72,
+  "seed": 20261030,
+  "shot": {
+    "shots_per_evaluation": 1024,
+    "total_shots": 131072,
+    "validation_shots": 8192,
+    "cobyla_rhobeg": 0.5,
+    "cobyla_tol": 0.001
+  }
+}
