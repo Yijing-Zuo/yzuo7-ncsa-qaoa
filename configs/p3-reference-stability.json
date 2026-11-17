@@ -1,0 +1,63 @@
+{
+  "protocol_version": "plan-a-p3-reference-stability-20261116-v1",
+  "purpose": "Independent mixed Sobol reference follow-up on 35 selected existing evaluation graphs",
+  "production_frozen": true,
+  "seed_namespace": "plan-a-p3-reference-stability-20261116-v1",
+  "seed": 2026111604,
+  "depths": [
+    3
+  ],
+  "success_metric": {
+    "kind": "normalized_gap",
+    "tolerance": 0.01
+  },
+  "tier1_restarts": 1,
+  "evaluation_restarts": 10,
+  "gradient_samples": 1,
+  "max_attempts": 2,
+  "reference": {
+    "p2_candidate": "best_seen_valid_execution",
+    "restarts_by_depth": {
+      "3": 256
+    }
+  },
+  "optimizer": {
+    "3": {
+      "max_evaluations": 300,
+      "maxiter": 225,
+      "maxls": 20,
+      "ftol": 1e-10,
+      "gtol": 1e-07
+    }
+  },
+  "expected_library": {
+    "graphs": 244,
+    "tier2": 244,
+    "training": 148,
+    "evaluation": 96
+  },
+  "require_full_design": false,
+  "require_split_coverage": false,
+  "reference_search": {
+    "version": "p3-reference-followup-v2",
+    "prefixes": [
+      128,
+      256
+    ],
+    "primary": "old_plus_new",
+    "old_reference_starts": 110,
+    "diagnostic_gap_tolerance": 0.01,
+    "stability_gap_tolerance": 0.001,
+    "stopping_rule": "Complete all 256 new starts per graph; no quality-driven stopping or automatic extension.",
+    "scope": "Only the declared 35 existing evaluation graphs. Preserve the full244 graph library, training roles, old references and evaluation records.",
+    "interpretation": "Targeted post hoc reference improvement with independently generated starts. Scrambled Sobol points within a replica are not independent Bernoulli samples. Known evaluation scores diagnose gaps only."
+  },
+  "reference_start_design": {
+    "kind": "scrambled_sobol_mixture_v1",
+    "replicas": 2,
+    "components": [
+      "global",
+      "low_angle"
+    ]
+  }
+}

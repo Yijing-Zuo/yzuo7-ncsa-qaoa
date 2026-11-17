@@ -1,0 +1,40 @@
+{
+  "protocol_version": "plan-a-p3-independent-reference-20261115-v1",
+  "purpose": "Independent additional p3 reference pool on the existing 96 evaluation graphs",
+  "production_frozen": true,
+  "seed_namespace": "plan-a-p3-independent-reference-20261115-v1",
+  "seed": 2026111503,
+  "depths": [3],
+  "success_metric": {"kind": "normalized_gap", "tolerance": 0.01},
+  "tier1_restarts": 1,
+  "evaluation_restarts": 10,
+  "gradient_samples": 1,
+  "max_attempts": 2,
+  "reference": {
+    "p2_candidate": "best_seen_valid_execution",
+    "restarts_by_depth": {"3": 100}
+  },
+  "optimizer": {
+    "3": {
+      "max_evaluations": 300,
+      "maxiter": 225,
+      "maxls": 20,
+      "ftol": 1e-10,
+      "gtol": 1e-7
+    }
+  },
+  "expected_library": {"graphs": 244, "tier2": 244, "training": 148, "evaluation": 96},
+  "require_full_design": false,
+  "require_split_coverage": false,
+  "reference_search": {
+    "version": "p3-reference-search-v1",
+    "prefixes": [25, 50, 100],
+    "primary": "old_plus_new",
+    "old_reference_starts": 10,
+    "diagnostic_gap_tolerance": 0.01,
+    "stability_gap_tolerance": 0.001,
+    "stopping_rule": "Complete all 100 new starts per graph; prefix and half-pool diagnostics do not trigger early stopping or automatic extension.",
+    "scope": "prepare inserts exact reference_graph_ids; only reference tasks are generated. Existing training graphs, references and evaluation runs are read-only.",
+    "interpretation": "A stronger empirical reference, never a certificate of the global QAOA optimum. Known evaluation scores are diagnostics only, never reference candidates."
+  }
+}

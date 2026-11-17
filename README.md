@@ -1,5 +1,11 @@
 # Shallow MaxCut QAOA
 
+The [source package index](packages/index.json) lists code snapshots and their input requirements for each experiment. Cite the package name together with the Git commit when reporting a result.
+
+The depth-three [reference search](scripts/reference_search.py) supports the [independent 100-start search](configs/p3-reference-search.json) and the two scrambled Sobol follow-ups for [targeted graphs](configs/p3-reference-targeted.json) and [reference stability](configs/p3-reference-stability.json). Run `python scripts/reference_search.py --help` for preparation, execution and scoring commands.
+
+The [statistical analysis](scripts/review_statistics.py) computes graph-paired bootstrap intervals from graph-level outcomes and fits degree-adjusted family comparisons from graph metrics. See `python scripts/review_statistics.py paired --help` and `python scripts/review_statistics.py family --help` for input fields.
+
 Research code for unweighted MaxCut at any positive integer QAOA depth: exact cut
 enumeration, analytic p1 scores, statevector expectations and gradients,
 single-run L-BFGS-B optimization, frozen graph libraries, reproducible B1

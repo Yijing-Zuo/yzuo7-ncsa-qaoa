@@ -34,7 +34,7 @@ from .records import (execution_failed, read_json, read_library, read_run, save_
 
 TASK_VERSION = "plan-a-tasks-v1"
 ATTEMPT_RULE = "first nonfault attempt ordered by attempt_number,started_utc,attempt_id; else first fault"
-ENTRY_FILES = ("build_library.py", "experiment.py", "verify_backend.py", "snapshot.py", "shot_benchmark.py", "run_study.py")
+ENTRY_FILES = ("build_library.py", "experiment.py", "verify_backend.py", "snapshot.py", "shot_benchmark.py", "run_study.py", "reference_search.py")
 PARTITIONED_LAYOUT = "graph-role-v1"
 
 
@@ -178,6 +178,12 @@ def validate_config(config):
     """Validate the small study configuration once at the planning boundary."""
     _validate_depths(config["depths"])
     _success_settings(config)
+    if "reference_graph_ids" in config:
+        identities = config["reference_graph_ids"]
+        if (not isinstance(identities, list) or not identities
+                or any(not isinstance(identity, str) or not identity for identity in identities)
+                or identities != sorted(set(identities))):
+            raise ValueError("reference_graph_ids must be sorted, distinct, nonempty graph IDs.")
     if any(p >= 2 for p in config["depths"]) and config["reference"]["p2_candidate"] != "best_seen_valid_execution":
         raise ValueError("Reference and success definitions must follow this protocol version.")
     counts = [config["tier1_restarts"], config["evaluation_restarts"],
@@ -185,6 +191,14 @@ def validate_config(config):
     counts += [_reference_restarts(config, p) for p in config["depths"] if p >= 2]
     if any(type(count) is not int or count < 1 for count in counts):
         raise ValueError("Pool/sample/attempt counts must be positive integers.")
+    if "reference_start_design" in config:
+        expected = {"kind": "scrambled_sobol_mixture_v1", "replicas": 2,
+                    "components": ["global", "low_angle"]}
+        count = _reference_restarts(config, 3) if config["depths"] == [3] else 0
+        block = count // 4
+        if (config["reference_start_design"] != expected or "reference_graph_ids" not in config
+                or not block or count % 4 or block & (block - 1)):
+            raise ValueError("Sobol reference design requires p3 reference-only scope and four power-of-two blocks.")
     for p in config["depths"]:
         if str(p) not in config["optimizer"]:
             raise ValueError(f"An explicit optimizer budget is required for p={p}.")
@@ -201,6 +215,11 @@ def validate_config(config):
 def design_counts(graph_count, tier2_count, config):
     """Count the requested design without constructing graphs/tasks or circuits."""
     depths = config["depths"]
+    if "reference_graph_ids" in config:
+        count = len(config["reference_graph_ids"])
+        return {"tier1": 0, "reference_grid": count * int(1 in depths),
+                "reference_optimization": count * sum(_reference_restarts(config, p) for p in depths if p >= 2),
+                "evaluation": 0, "gradient_diagnostic": 0}
     return {"tier1": graph_count * len(depths) * config["tier1_restarts"],
             "reference_grid": tier2_count * int(1 in depths),
             "reference_optimization": tier2_count * sum(_reference_restarts(config, p) for p in depths if p >= 2),
@@ -208,18 +227,59 @@ def design_counts(graph_count, tier2_count, config):
             "gradient_diagnostic": tier2_count * len(depths) * config["gradient_samples"]}
 
 
+def _reference_graph_scope(library, config):
+
+    if "reference_graph_ids" not in config:
+        return library["graphs"]
+    wanted = set(config["reference_graph_ids"])
+    selected = [row for row in library["graphs"] if row["iso_class_id"] in wanted]
+    if ({row["iso_class_id"] for row in selected} != wanted
+            or any(row["tier"] != 2 or row["graph_split"] != "evaluation" for row in selected)):
+        raise ValueError("Reference-only targets must exist as Tier2 evaluation graphs in the frozen library.")
+    return selected
+
+
+def _reference_starts(library_id, graph_id, config):
+
+
+
+
+
+    from scipy.stats import qmc
+
+    count = _reference_restarts(config, 3) // 4
+    starts = []
+    boxes = (("global", 2 * np.pi, np.pi / 2), ("low_angle", np.pi / 2, np.pi / 4))
+    for replica in range(2):
+        for component, gamma, beta in boxes:
+            stream = {"namespace": config["seed_namespace"], "master_seed": config["seed"],
+                      "library_id": library_id, "iso_class_id": graph_id,
+                      "kind": "scrambled_sobol_mixture_v1", "replica": replica, "component": component}
+            seed = int(digest(stream)[:32], 16)
+            points = qmc.Sobol(6, scramble=True, seed=np.random.default_rng(seed)).random_base2(count.bit_length() - 1)
+            for index, point in enumerate(points):
+                starts.append(((point * np.array([gamma] * 3 + [beta] * 3)).tolist(),
+                               {"kind": stream["kind"], "replica": replica, "component": component,
+                                "scramble_seed": seed, "point_index": index}))
+    return starts
+
+
 def build_tasks(library, config):
     """Prepare B1/grid/diagnostic tasks from a frozen library, never regenerate it."""
     validate_config(config)
     tasks = []
-    for record in sorted(library["graphs"], key=lambda row: row["iso_class_id"]):
+    reference_only = "reference_graph_ids" in config
+    for record in sorted(_reference_graph_scope(library, config), key=lambda row: row["iso_class_id"]):
+        starts = (_reference_starts(library["library_id"], record["iso_class_id"], config)
+                  if "reference_start_design" in config else None)
         for p in config["depths"]:
-            specifications = [("tier1", "optimization", config["tier1_restarts"])]
+            specifications = [] if reference_only else [("tier1", "optimization", config["tier1_restarts"])]
             if record["tier"] == 2:
                 specifications += [("reference", "p1_grid" if p == 1 else "optimization",
-                                    1 if p == 1 else _reference_restarts(config, p)),
-                                   ("evaluation", "optimization", config["evaluation_restarts"]),
-                                   ("gradient_diagnostic", "gradient", config["gradient_samples"])]
+                                    1 if p == 1 else _reference_restarts(config, p))]
+                if not reference_only:
+                    specifications += [("evaluation", "optimization", config["evaluation_restarts"]),
+                                       ("gradient_diagnostic", "gradient", config["gradient_samples"])]
             for role, kind, count in specifications:
                 for restart_id in range(count):
                     stream = {"namespace": config["seed_namespace"], "master_seed": config["seed"],
@@ -236,6 +296,9 @@ def build_tasks(library, config):
                             "restart_id": restart_id, "seed": seed,
                             "theta0": None if kind == "p1_grid" else random_angles(p, seed).tolist(),
                             "budget": budget, "protocol_version": config["protocol_version"]}
+                    if starts is not None:
+                        task["theta0"], task["start_design"] = starts[restart_id]
+                        task["method"] = "sobol_mixture"
                     task["task_id"] = digest(task)
                     tasks.append(task)
     if len({task["seed"] for task in tasks}) != len(tasks):
@@ -246,7 +309,7 @@ def build_tasks(library, config):
 def library_issues(library, config):
     """Check annotations/design presence, not exact optimality or QAOA scores."""
     issues = []
-    for row in library["graphs"]:
+    for row in _reference_graph_scope(library, config):
         if row.get("exact_status") != "computed" or row.get("C_star") is None or row.get("optimal_cut_side") is None:
             issues.append({"iso_class_id": row["iso_class_id"], "missing": "exact_MaxCut_annotation"})
         if not row.get("features") or "feature_missing" not in row:
@@ -392,6 +455,8 @@ def read_batch(directory):
     for task in tasks:
         if digest({k: v for k, v in task.items() if k != "task_id"}) != task["task_id"]:
             raise ValueError("Task identity mismatch.")
+    if "reference_graph_ids" in manifest["config"] and build_tasks(library, manifest["config"]) != tasks:
+        raise ValueError("Reference-only tasks disagree with their frozen graph scope, seeds or budgets.")
     derived = {"issues": library_issues(library, manifest["config"]),
                "coverage": graph_split_coverage(library["graphs"], library.get("cells")),
                "counts": dict(Counter(task["experiment_role"] for task in tasks)),
@@ -656,7 +721,7 @@ def _check_partition_paths(directory, groups):
             for path in parent.iterdir():
                 if (folder == "sealed" and not path.is_symlink() and path.is_file()
                         and path.name.startswith(".") and path.name.endswith(".tmp")):
-                    continue  # Unpublished interrupted archive; never completion evidence.
+                    continue
                 identity = path.name.removesuffix(suffix) if suffix else path.name
                 if (path.is_symlink() or identity not in allowed or
                     (folder == "active" and not path.is_dir()) or
@@ -880,7 +945,7 @@ def _execute_work(manifest, library, work, output, execution, attempts, report, 
             continue
         if max_tasks is not None and report["executed"] >= max_tasks:
             break
-        # A fixed cap applies to completed execution faults, never normal misses.
+
         for number in range(len(prior) + 1, manifest["config"]["max_attempts"] + 1):
             if max_tasks is not None and report["executed"] >= max_tasks:
                 break
@@ -920,8 +985,8 @@ def _execute_work(manifest, library, work, output, execution, attempts, report, 
                 result.update(identity, preparation_seconds=prep_seconds,
                               completed_utc=datetime.now(timezone.utc).isoformat())
                 validate_attempt(task, result, manifest, execution)
-                # Serialization itself can expose a program error (e.g. NaN in
-                # metadata); retain that failure instead of only a start receipt.
+
+
                 json.dumps(result, allow_nan=False)
             except Exception as error:
                 result = _invalid_result_failure(result, task, error, perf_counter() - start)
@@ -1810,7 +1875,7 @@ def _save_learning_fits(output, batch, references_directory, attempts_directory,
                 raise ValueError("B4 fit resume source/library/configuration changed.")
         else:
             if any(output.iterdir()):
-                # The writer lock may create its own advisory lock file.
+
                 unexpected = [f for f in output.iterdir() if f.name != "writer.lock"]
                 if unexpected:
                     raise ValueError("B4 fitting directory contains unbound files.")
@@ -2129,8 +2194,8 @@ def _build_learning_tasks(library, config, prepared, binding, *, kind):
                 or not 0 <= row["success_probability"] <= 1):
             raise ValueError("B4 prediction geometry/model/schema changed.")
         decoded = b4_decode_angles(row["raw_prediction"], model["model"]["anchor"]["theta"])
-        # The bound JSON bytes stay exact; recomputed libm values may differ by
-        # an ulp across CPU platforms when reading a returned checkpoint.
+
+
         if (any(row.get(k) != decoded[k] for k in ("fallback", "trigger_coordinates"))
                 or np.shape(row["rho"]) != (2 * p,)
                 or not np.allclose(row["rho"], decoded["rho"], rtol=1e-12, atol=1e-15)

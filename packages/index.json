@@ -1,0 +1,78 @@
+{
+  "format": "source-reference-catalog-v1",
+  "date": "2026-11-17",
+  "usage": "Download archives beside this index. Each contains reviewed Python sources and the relevant public numerical configurations. Source formatting and driver paths differ from the operator bundles. Historical execution identities remain bound to the original files. Inspect CLIs with --help in a Python environment containing the repository dependencies.",
+  "packages": [
+    {
+      "archive": "rgg-platform-tail-20261016-source.zip",
+      "sha256": "198a229eba5bc67cc82f78d5ea8695257b82a65e7e4cea3511a97e28bd024562",
+      "scope": "Resume the RGG extension panel.",
+      "entry_points": [
+        "drivers/run_rgg_platform_tail.py"
+      ],
+      "external_inputs": "Matching completed WS/RGG study roots, graph configurations and source-bound records."
+    },
+    {
+      "archive": "ws-rgg-export-20261017-source.zip",
+      "sha256": "d7a98ed27d541a3a91eadcb29d99913a2674d28c75df9e522945336402643463",
+      "scope": "Export completed WS/RGG panel records.",
+      "entry_points": [
+        "drivers/export_ws_rgg_results.py"
+      ],
+      "external_inputs": "Matching completed WS/RGG study roots, graph configurations and source-bound records."
+    },
+    {
+      "archive": "finite-shot-20261017-source.zip",
+      "sha256": "6a3afe216c34d46b7efec0a38827ec9a797433bfa7c1878a13e08066e503693c",
+      "scope": "Finite-shot evaluation of random, shared and graph-derived initializations.",
+      "entry_points": [
+        "drivers/run_shot_b123.py",
+        "scripts/shot_benchmark.py"
+      ],
+      "external_inputs": "Selected graph roster, source-bound graph libraries, saved initializations and references."
+    },
+    {
+      "archive": "p3-reference-independent100-20261115-source.zip",
+      "sha256": "907ef655b09ed2ee16b48a531de236b57d2590a14819d60175b13d0fcfd1b8f5",
+      "scope": "Independent p=3 reference search with 100 new random starts per evaluation graph.",
+      "entry_points": [
+        "scripts/reference_search.py",
+        "configs/p3-reference-search.json"
+      ],
+      "external_inputs": "An exported compact p=3 library with exact objectives, original references, historical task seeds and numerical-source digests."
+    },
+    {
+      "archive": "qaoa-followup-20261116-source.zip",
+      "sha256": "b172b16a7140bb04d7752ff343031fdca5ff8a5401f2da2823a5d209d0e7badb",
+      "scope": "Targeted and stability reference searches, new-graph confirmation, matched-depth comparison, the remaining noise panels and the paired early-stop benchmark.",
+      "entry_points": [
+        "runtime/scripts/reference_search.py",
+        "followup/confirmation/confirmation.py",
+        "followup/depth/matched_depth.py",
+        "followup/noise/resume_noise.py",
+        "followup/earlystop/benchmark.py"
+      ],
+      "external_inputs": "Study-specific graph and restart inputs, frozen models, exclusions, references and exact historical noise runtime. Run follow-up CLIs from runtime/."
+    },
+    {
+      "archive": "serial-launcher-20261117-source.zip",
+      "sha256": "1597bf6d924dd92a8e8a78f2ff34d38a154b557ca266de20d94be1ea1a2f468a",
+      "scope": "Serial coordination of the five follow-up studies.",
+      "entry_points": [
+        "run_all.py"
+      ],
+      "external_inputs": "Place the original extracted operator bundle beside run_all.py. The launcher validates that bundle and uses its outputs for resume."
+    }
+  ],
+  "historical_commits": {
+    "original experiments": "https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa/tree/239b50ac14db78ce9fa7c55af95bde01e67ab54e",
+    "shared initialization": "https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa/tree/f8dd0d6ee775826ebfc96331afd4decf91c8578b",
+    "graph-derived initialization": "https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa/tree/53947f05199b16023815b094799d0822bca82463",
+    "ridge learning": "https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa/tree/f8831f0439e7112eae17d18bc07b1a416113f665",
+    "boosted learning": "https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa/tree/5e0675c7431346814daab6a2e4f04f27e3e66d5d",
+    "normalized metrics": "https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa/tree/dd0384d91b0ffc7c7f0a0fef21270c76198c7460",
+    "extended graphs": "https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa/tree/5284d2cb889381d943346741fac5f549d293ce9f",
+    "compact depth and optimizer studies": "https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa/tree/c8bb05fccecc4ff2fb3cd5531427d4d1e957fc8d",
+    "adaptive finite-shot execution": "https://github.com/Yijing-Zuo/yzuo7-ncsa-qaoa/tree/5398319c7d8d301a2f21153ff66babdd9b05476a"
+  }
+}
